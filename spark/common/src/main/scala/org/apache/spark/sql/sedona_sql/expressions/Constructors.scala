@@ -99,20 +99,6 @@ private[apache] case class ST_GeomFromWKT(inputExpressions: Seq[Expression])
 }
 
 /**
- * Return a Geography from a WKT string
- *
- * @param inputExpressions
- *   This function takes a geometry string and a srid. The string format must be WKT.
- */
-private[apache] case class ST_GeogFromWKT(inputExpressions: Seq[Expression])
-    extends InferredExpression(Constructors.geogFromWKT _) {
-
-  protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]) = {
-    copy(inputExpressions = newChildren)
-  }
-}
-
-/**
  * Return a Geometry from a OGC Extended WKT string
  *
  * @param inputExpressions
@@ -191,7 +177,7 @@ private[apache] case class ST_GeomFromWKB(inputExpressions: Seq[Expression])
     }
   }
 
-  override def dataType: DataType = GeometryUDT
+  override def dataType: DataType = GeometryUDT()
 
   override def inputTypes: Seq[AbstractDataType] = Seq(TypeCollection(StringType, BinaryType))
 
@@ -231,7 +217,7 @@ private[apache] case class ST_GeomFromEWKB(inputExpressions: Seq[Expression])
     }
   }
 
-  override def dataType: DataType = GeometryUDT
+  override def dataType: DataType = GeometryUDT()
 
   override def inputTypes: Seq[AbstractDataType] = Seq(TypeCollection(StringType, BinaryType))
 
@@ -286,7 +272,7 @@ private[apache] case class ST_LineFromWKB(inputExpressions: Seq[Expression])
     }
   }
 
-  override def dataType: DataType = GeometryUDT
+  override def dataType: DataType = GeometryUDT()
 
   override def inputTypes: Seq[AbstractDataType] =
     if (inputExpressions.length == 1) Seq(TypeCollection(StringType, BinaryType))
@@ -343,7 +329,7 @@ private[apache] case class ST_LinestringFromWKB(inputExpressions: Seq[Expression
     }
   }
 
-  override def dataType: DataType = GeometryUDT
+  override def dataType: DataType = GeometryUDT()
 
   override def inputTypes: Seq[AbstractDataType] =
     if (inputExpressions.length == 1) Seq(TypeCollection(StringType, BinaryType))
@@ -400,7 +386,7 @@ private[apache] case class ST_PointFromWKB(inputExpressions: Seq[Expression])
     }
   }
 
-  override def dataType: DataType = GeometryUDT
+  override def dataType: DataType = GeometryUDT()
 
   override def inputTypes: Seq[AbstractDataType] =
     if (inputExpressions.length == 1) Seq(TypeCollection(StringType, BinaryType))
@@ -449,7 +435,7 @@ private[apache] case class ST_GeomFromGeoJSON(inputExpressions: Seq[Expression])
     }
   }
 
-  override def dataType: DataType = GeometryUDT
+  override def dataType: DataType = GeometryUDT()
 
   override def children: Seq[Expression] = inputExpressions
 
@@ -552,6 +538,36 @@ private[apache] case class ST_PolygonFromEnvelope(inputExpressions: Seq[Expressi
   }
 }
 
+/**
+ * Construct a Box2D from two corner points (lower-left, upper-right). Coordinates are taken
+ * verbatim; ordering is not validated.
+ *
+ * @param inputExpressions
+ */
+private[apache] case class ST_MakeBox2D(inputExpressions: Seq[Expression])
+    extends InferredExpression(Constructors.makeBox2D _) {
+
+  protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]) = {
+    copy(inputExpressions = newChildren)
+  }
+}
+
+/**
+ * Convert a Box2D to a closed rectangular polygon Geometry. Equivalent to PostGIS {@code
+ * box2d::geometry}. Exposed as a function rather than a Catalyst implicit cast because UDT-to-UDT
+ * implicit casts require Catalyst-level work; ST_GeomFromBox2D lives alongside the other
+ * ST_GeomFrom* constructors.
+ *
+ * @param inputExpressions
+ */
+private[apache] case class ST_GeomFromBox2D(inputExpressions: Seq[Expression])
+    extends InferredExpression(Constructors.geomFromBox2D _) {
+
+  protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]) = {
+    copy(inputExpressions = newChildren)
+  }
+}
+
 private[apache] trait UserDataGenerator {
   def generateUserData(
       minInputLength: Integer,
@@ -633,6 +649,14 @@ private[apache] case class ST_MPointFromText(inputExpressions: Seq[Expression])
 
 private[apache] case class ST_GeomCollFromText(inputExpressions: Seq[Expression])
     extends InferredExpression(Constructors.geomCollFromText _) {
+
+  protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]) = {
+    copy(inputExpressions = newChildren)
+  }
+}
+
+private[apache] case class ST_GeomFromMySQL(inputExpressions: Seq[Expression])
+    extends InferredExpression(Constructors.geomFromMySQL _) {
 
   protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]) = {
     copy(inputExpressions = newChildren)

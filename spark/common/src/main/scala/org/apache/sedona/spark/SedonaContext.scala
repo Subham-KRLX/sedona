@@ -27,6 +27,7 @@ import org.apache.spark.serializer.KryoSerializer
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkStrategy
+import org.apache.spark.sql.sedona_sql.UDT.TransformNestedUDTParquet
 import org.apache.spark.sql.sedona_sql.optimization._
 import org.apache.spark.sql.sedona_sql.strategy.join.JoinQueryDetector
 import org.apache.spark.sql.sedona_sql.strategy.physical.function.EvalPhysicalFunctionStrategy
@@ -41,10 +42,25 @@ class InternalApi(
 
 object SedonaContext {
 
-  private def customOptimizationsWithSession(sparkSession: SparkSession) =
-    Seq(
+  private def customOptimizationsWithSession(sparkSession: SparkSession) = {
+    val optimizations = Seq(
       new SpatialFilterPushDownForGeoParquet(sparkSession),
       new SpatialTemporalFilterPushDownForStacScan(sparkSession))
+
+    val versionParts =
+      sparkSession.version
+        .split('.')
+        .map(s => scala.util.Try(s.takeWhile(_.isDigit).toInt).getOrElse(0))
+    val major = versionParts.lift(0).getOrElse(0)
+    val minor = versionParts.lift(1).getOrElse(0)
+    if (major < 4 || (major == 4 && minor < 1)) {
+      // SPARK-48942: nested UDTs crash the vectorized Parquet reader on Spark < 4.1.
+      // SPARK-52651 fixes this in Spark 4.1+ by recursively stripping UDTs in ColumnVector.
+      new TransformNestedUDTParquet(sparkSession) +: optimizations
+    } else {
+      optimizations
+    }
+  }
 
   def create(sqlContext: SQLContext): SQLContext = {
     create(sqlContext.sparkSession)

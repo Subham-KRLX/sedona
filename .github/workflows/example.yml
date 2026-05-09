@@ -39,23 +39,32 @@ concurrency:
 
 jobs:
   build:
+    name: 'Spark ${{ matrix.spark }}, Hadoop ${{ matrix.hadoop }}, Sedona ${{ matrix.sedona }}'
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         include:
+          - spark: 4.0.1
+            spark-compat: '4.0'
+            sedona: 1.8.0
+            hadoop: 3.4.2
           - spark: 3.5.0
             spark-compat: '3.5'
-            sedona: 1.5.1
+            sedona: 1.8.0
+            hadoop: 3.3.4
           - spark: 3.4.2
             spark-compat: '3.4'
-            sedona: 1.5.1
+            sedona: 1.8.0
+            hadoop: 3.3.4
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: 'zulu'
-          java-version: '11'
+          java-version: '17'
       - run: sudo apt-get remove scala-library scala
       - run: sudo wget www.scala-lang.org/files/archive/scala-2.12.11.deb
       - run: sudo dpkg -i scala-2.12.11.deb
@@ -65,22 +74,50 @@ jobs:
       - run: sudo apt-get update
       - run: sudo apt-get install sbt
       - name: Cache SBT
-        uses: actions/cache@v4
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.ivy2/cache
             ~/.sbt
           key: ${{ runner.os }}-sbt-${{ hashFiles('**/build.sbt') }}
       - name: Cache Maven packages
-        uses: actions/cache@v4
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ~/.m2
           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: ${{ runner.os }}-m2
-      - env:
+      - name: Test Scala Spark SQL Example
+        env:
           SPARK_VERSION: ${{ matrix.spark }}
           SPARK_LOCAL_IP: 127.0.0.1
           SPARK_COMPAT_VERSION: ${{ matrix.spark-compat }}
           SEDONA_VERSION: ${{ matrix.sedona }}
-        run: (cd examples/spark-sql;mvn clean install -Dspark.version=${SPARK_VERSION} -Dspark.compat.version=${SPARK_COMPAT_VERSION} -Dsedona.version=${SEDONA_VERSION};java -jar target/sedona-spark-example-1.6.0.jar)
-      - run: (cd examples/flink-sql;mvn clean install;java -jar target/sedona-flink-example-1.6.0.jar)
+          HADOOP_VERSION: ${{ matrix.hadoop }}
+        run: |
+          cd examples/spark-sql
+          mvn versions:set -DnewVersion=${SEDONA_VERSION} -DgenerateBackupPoms=false
+          mvn clean test \
+            -Dspark.version=${SPARK_VERSION} \
+            -Dspark.compat.version=${SPARK_COMPAT_VERSION} \
+            -Dsedona.version=${SEDONA_VERSION} \
+            -Dhadoop.version=${HADOOP_VERSION}
+      - name: Test Java Spark SQL Example
+        env:
+          SPARK_VERSION: ${{ matrix.spark }}
+          SPARK_LOCAL_IP: 127.0.0.1
+          SPARK_COMPAT_VERSION: ${{ matrix.spark-compat }}
+          SEDONA_VERSION: ${{ matrix.sedona }}
+          HADOOP_VERSION: ${{ matrix.hadoop }}
+        run: |
+          cd examples/java-spark-sql
+          mvn versions:set -DnewVersion=${SEDONA_VERSION} -DgenerateBackupPoms=false
+          mvn clean test \
+            -Dspark.version=${SPARK_VERSION} \
+            -Dspark.compat.version=${SPARK_COMPAT_VERSION}
+      - name: Test Flink SQL Example
+        env:
+          SEDONA_VERSION: ${{ matrix.sedona }}
+        run: |
+          cd examples/flink-sql
+          mvn versions:set -DnewVersion=${SEDONA_VERSION} -DgenerateBackupPoms=false
+          mvn clean test

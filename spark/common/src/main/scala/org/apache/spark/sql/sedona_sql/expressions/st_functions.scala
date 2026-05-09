@@ -108,6 +108,15 @@ object st_functions {
   def ST_Azimuth(pointA: String, pointB: String): Column =
     wrapExpression[ST_Azimuth](pointA, pointB)
 
+  def ST_ApproximateMedialAxis(geometry: Column): Column =
+    wrapExpression[ST_ApproximateMedialAxis](geometry)
+  def ST_ApproximateMedialAxis(geometry: String): Column =
+    wrapExpression[ST_ApproximateMedialAxis](geometry)
+  def ST_ApproximateMedialAxis(geometry: Column, maxVertices: Column): Column =
+    wrapExpression[ST_ApproximateMedialAxis](geometry, maxVertices)
+  def ST_ApproximateMedialAxis(geometry: String, maxVertices: Int): Column =
+    wrapExpression[ST_ApproximateMedialAxis](geometry, maxVertices)
+
   def ST_Boundary(geometry: Column): Column = wrapExpression[ST_Boundary](geometry)
   def ST_Boundary(geometry: String): Column = wrapExpression[ST_Boundary](geometry)
 
@@ -146,6 +155,9 @@ object st_functions {
 
   def ST_ClosestPoint(a: Column, b: Column): Column = wrapExpression[ST_ClosestPoint](a, b)
   def ST_ClosestPoint(a: String, b: String): Column = wrapExpression[ST_ClosestPoint](a, b)
+
+  def ST_ShortestLine(a: Column, b: Column): Column = wrapExpression[ST_ShortestLine](a, b)
+  def ST_ShortestLine(a: String, b: String): Column = wrapExpression[ST_ShortestLine](a, b)
 
   def ST_Collect(geoms: Column): Column = wrapExpression[ST_Collect](geoms)
   def ST_Collect(geoms: String): Column = wrapExpression[ST_Collect](geoms)
@@ -193,8 +205,16 @@ object st_functions {
   def ST_EndPoint(lineString: Column): Column = wrapExpression[ST_EndPoint](lineString)
   def ST_EndPoint(lineString: String): Column = wrapExpression[ST_EndPoint](lineString)
 
+  def ST_Box2D(geometry: Column): Column = wrapExpression[ST_Box2D](geometry)
+  def ST_Box2D(geometry: String): Column = wrapExpression[ST_Box2D](geometry)
+
   def ST_Envelope(geometry: Column): Column = wrapExpression[ST_Envelope](geometry)
   def ST_Envelope(geometry: String): Column = wrapExpression[ST_Envelope](geometry)
+
+  def ST_Envelope(geography: Column, split: Boolean): Column =
+    wrapExpression[ST_Envelope](geography, split)
+  def ST_Envelope(geography: String, split: Boolean): Column =
+    wrapExpression[ST_Envelope](geography, split)
 
   def ST_Expand(geometry: Column, uniformDelta: Column) =
     wrapExpression[ST_Expand](geometry, uniformDelta)
@@ -232,6 +252,20 @@ object st_functions {
   def ST_GeoHash(geometry: String, precision: Int): Column =
     wrapExpression[ST_GeoHash](geometry, precision)
 
+  def ST_GeoHashNeighbors(geohash: Column): Column =
+    wrapExpression[ST_GeoHashNeighbors](geohash)
+  def ST_GeoHashNeighbors(geohash: String): Column =
+    wrapExpression[ST_GeoHashNeighbors](geohash)
+
+  def ST_GeoHashNeighbor(geohash: Column, direction: Column): Column =
+    wrapExpression[ST_GeoHashNeighbor](geohash, direction)
+  def ST_GeoHashNeighbor(geohash: String, direction: String): Column =
+    wrapExpression[ST_GeoHashNeighbor](geohash, direction)
+  def ST_GeoHashNeighbor(geohash: Column, direction: String): Column =
+    wrapExpression[ST_GeoHashNeighbor](geohash, direction)
+  def ST_GeoHashNeighbor(geohash: String, direction: Column): Column =
+    wrapExpression[ST_GeoHashNeighbor](geohash, direction)
+
   def ST_GeometryN(multiGeometry: Column, n: Column): Column =
     wrapExpression[ST_GeometryN](multiGeometry, n)
   def ST_GeometryN(multiGeometry: String, n: Int): Column =
@@ -262,6 +296,46 @@ object st_functions {
   def ST_H3ToGeom(cellIds: Column): Column = wrapExpression[ST_H3ToGeom](cellIds)
 
   def ST_H3ToGeom(cellIds: Array[Long]): Column = wrapExpression[ST_H3ToGeom](cellIds)
+
+  // Bing Tile functions
+  def ST_BingTile(tileX: Column, tileY: Column, zoomLevel: Column): Column =
+    wrapExpression[ST_BingTile](tileX, tileY, zoomLevel)
+  def ST_BingTile(tileX: Int, tileY: Int, zoomLevel: Int): Column =
+    wrapExpression[ST_BingTile](tileX, tileY, zoomLevel)
+
+  def ST_BingTileAt(longitude: Column, latitude: Column, zoomLevel: Column): Column =
+    wrapExpression[ST_BingTileAt](longitude, latitude, zoomLevel)
+  def ST_BingTileAt(longitude: Double, latitude: Double, zoomLevel: Int): Column =
+    wrapExpression[ST_BingTileAt](longitude, latitude, zoomLevel)
+
+  def ST_BingTilesAround(longitude: Column, latitude: Column, zoomLevel: Column): Column =
+    wrapExpression[ST_BingTilesAround](longitude, latitude, zoomLevel)
+  def ST_BingTilesAround(longitude: Double, latitude: Double, zoomLevel: Int): Column =
+    wrapExpression[ST_BingTilesAround](longitude, latitude, zoomLevel)
+
+  def ST_BingTileZoomLevel(quadKey: Column): Column =
+    wrapExpression[ST_BingTileZoomLevel](quadKey)
+  def ST_BingTileZoomLevel(quadKey: String): Column =
+    wrapExpression[ST_BingTileZoomLevel](quadKey)
+
+  def ST_BingTileX(quadKey: Column): Column = wrapExpression[ST_BingTileX](quadKey)
+  def ST_BingTileX(quadKey: String): Column = wrapExpression[ST_BingTileX](quadKey)
+
+  def ST_BingTileY(quadKey: Column): Column = wrapExpression[ST_BingTileY](quadKey)
+  def ST_BingTileY(quadKey: String): Column = wrapExpression[ST_BingTileY](quadKey)
+
+  def ST_BingTilePolygon(quadKey: Column): Column =
+    wrapExpression[ST_BingTilePolygon](quadKey)
+  def ST_BingTilePolygon(quadKey: String): Column =
+    wrapExpression[ST_BingTilePolygon](quadKey)
+
+  def ST_BingTileCellIDs(geometry: Column, zoomLevel: Column): Column =
+    wrapExpression[ST_BingTileCellIDs](geometry, zoomLevel)
+  def ST_BingTileCellIDs(geometry: String, zoomLevel: Int): Column =
+    wrapExpression[ST_BingTileCellIDs](geometry, zoomLevel)
+
+  def ST_BingTileToGeom(quadKeys: Column): Column =
+    wrapExpression[ST_BingTileToGeom](quadKeys)
 
   def ST_InteriorRingN(polygon: Column, n: Column): Column =
     wrapExpression[ST_InteriorRingN](polygon, n)
@@ -490,6 +564,20 @@ object st_functions {
   def ST_MinimumBoundingRadius(geometry: String): Column =
     wrapExpression[ST_MinimumBoundingRadius](geometry)
 
+  def ST_OrientedEnvelope(geometry: Column): Column =
+    wrapExpression[ST_OrientedEnvelope](geometry)
+  def ST_OrientedEnvelope(geometry: String): Column =
+    wrapExpression[ST_OrientedEnvelope](geometry)
+
+  def ST_OffsetCurve(geometry: Column, distance: Column): Column =
+    wrapExpression[ST_OffsetCurve](geometry, distance)
+  def ST_OffsetCurve(geometry: String, distance: Double): Column =
+    wrapExpression[ST_OffsetCurve](geometry, distance)
+  def ST_OffsetCurve(geometry: Column, distance: Column, quadrantSegments: Column): Column =
+    wrapExpression[ST_OffsetCurve](geometry, distance, quadrantSegments)
+  def ST_OffsetCurve(geometry: String, distance: Double, quadrantSegments: Int): Column =
+    wrapExpression[ST_OffsetCurve](geometry, distance, quadrantSegments)
+
   def ST_IsPolygonCCW(geometry: Column): Column = wrapExpression[ST_IsPolygonCCW](geometry)
   def ST_IsPolygonCCW(geometry: String): Column = wrapExpression[ST_IsPolygonCCW](geometry)
 
@@ -619,6 +707,15 @@ object st_functions {
 
   def ST_StartPoint(lineString: Column): Column = wrapExpression[ST_StartPoint](lineString)
   def ST_StartPoint(lineString: String): Column = wrapExpression[ST_StartPoint](lineString)
+
+  def ST_StraightSkeleton(geometry: Column): Column =
+    wrapExpression[ST_StraightSkeleton](geometry)
+  def ST_StraightSkeleton(geometry: String): Column =
+    wrapExpression[ST_StraightSkeleton](geometry)
+  def ST_StraightSkeleton(geometry: Column, maxVertices: Column): Column =
+    wrapExpression[ST_StraightSkeleton](geometry, maxVertices)
+  def ST_StraightSkeleton(geometry: String, maxVertices: Int): Column =
+    wrapExpression[ST_StraightSkeleton](geometry, maxVertices)
 
   def ST_Snap(input: Column, reference: Column, tolerance: Column): Column =
     wrapExpression[ST_Snap](input, reference, tolerance)
@@ -1033,4 +1130,13 @@ object st_functions {
       selfWeight,
       useSpheroid,
       attributes)
+
+  def barrier(expression: Column, args: Column*): Column = {
+    val allArgs = expression +: args
+    wrapExpression[Barrier](allArgs: _*)
+  }
+  def barrier(expression: String, args: Any*): Column = {
+    val allArgs = expression +: args
+    wrapExpression[Barrier](allArgs: _*)
+  }
 }

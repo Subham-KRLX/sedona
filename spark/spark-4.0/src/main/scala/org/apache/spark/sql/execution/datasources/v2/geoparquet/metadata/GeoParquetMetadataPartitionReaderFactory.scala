@@ -28,7 +28,7 @@ import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, GenericArrayData}
 import org.apache.spark.sql.connector.read.PartitionReader
 import org.apache.spark.sql.execution.datasources.PartitionedFile
-import org.apache.spark.sql.execution.datasources.parquet.GeoParquetMetaData
+import org.apache.spark.sql.execution.datasources.geoparquet.GeoParquetMetaData
 import org.apache.spark.sql.execution.datasources.v2._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.Filter
@@ -84,7 +84,7 @@ object GeoParquetMetadataPartitionReaderFactory {
           val columnMetadataFields: Array[Any] = Array(
             UTF8String.fromString(columnMetadata.encoding),
             new GenericArrayData(columnMetadata.geometryTypes.map(UTF8String.fromString).toArray),
-            new GenericArrayData(columnMetadata.bbox.toArray),
+            columnMetadata.bbox.map(b => new GenericArrayData(b.toArray)).orNull,
             columnMetadata.crs
               .map(projjson => UTF8String.fromString(compact(render(projjson))))
               .getOrElse(UTF8String.fromString("")),

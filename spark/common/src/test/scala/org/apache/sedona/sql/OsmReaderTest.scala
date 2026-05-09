@@ -31,6 +31,7 @@ class OsmReaderTest extends TestBaseScala with Matchers {
   val monacoPath: String = resourceFolder + "osmpbf/monaco-latest.osm.pbf"
   val densePath: String = resourceFolder + "osmpbf/dense.pbf"
   val nodesPath: String = resourceFolder + "osmpbf/nodes.pbf"
+  val planetOsmPath: String = resourceFolder + "osmpbf/planetosm.pbf"
 
   import sparkSession.implicits._
 
@@ -48,6 +49,32 @@ class OsmReaderTest extends TestBaseScala with Matchers {
       assert(cnt > 0)
     }
 
+    it("should be able to process planet osm files") {
+      val numberOfUniques = sparkSession.read
+        .format("osmpbf")
+        .load(planetOsmPath)
+        .dropDuplicates("id")
+        .count
+
+      val numberOfElements = sparkSession.read
+        .format("osmpbf")
+        .load(planetOsmPath)
+        .count
+
+      numberOfUniques shouldBe 64000
+      numberOfElements shouldBe 64000
+
+      val idsToVerify = Seq(64949611, 64955092, 64949580, 64949694, 64949868, 64958096, 64958295)
+
+      val elementsCount = sparkSession.read
+        .format("osmpbf")
+        .load(planetOsmPath)
+        .where($"id".isin(idsToVerify: _*))
+        .count
+
+      elementsCount shouldBe idsToVerify.length
+    }
+
     it("should parse normal nodes") {
       sparkSession.read
         .format("osmpbf")
@@ -62,7 +89,7 @@ class OsmReaderTest extends TestBaseScala with Matchers {
         .collect() should contain theSameElementsAs Array(
         Node(1002, 48.86, 2.35, Map("amenity" -> "cafe", "name" -> "Cafe de Paris")),
         Node(1003, 30.12, 22.23, Map("amenity" -> "bakery", "name" -> "Delicious Pastries")),
-        Node(1001, 52.52, 13.40, Map("amenity" -> "restaurant", "name" -> "Curry 36")))
+        Node(1001, 52.52, 13.41, Map("amenity" -> "restaurant", "name" -> "Curry 36")))
     }
 
     it("should parse dense nodes") {
@@ -79,7 +106,7 @@ class OsmReaderTest extends TestBaseScala with Matchers {
         .collect() should contain theSameElementsAs Array(
         Node(1002, 48.86, 2.35, Map("amenity" -> "cafe", "name" -> "Cafe de Paris")),
         Node(1003, 30.12, 22.23, Map("amenity" -> "bakery", "name" -> "Delicious Pastries")),
-        Node(1001, 52.52, 13.40, Map("amenity" -> "restaurant", "name" -> "Curry 36")))
+        Node(1001, 52.52, 13.41, Map("amenity" -> "restaurant", "name" -> "Curry 36")))
     }
 
     it("should be able to read from osm file on s3") {
@@ -134,9 +161,7 @@ class OsmReaderTest extends TestBaseScala with Matchers {
       osmData
         .selectExpr("min(location.longitude)", "max(location.latitude)")
         .collect()
-        .flatMap(row => Array(row.get(0), row.get(1))) shouldEqual (Array(
-        7.208188056945801,
-        43.759483337402344))
+        .flatMap(row => Array(row.get(0), row.get(1))) shouldEqual (Array(7.2081882, 43.7594835))
 
       osmData
         .where("id == 4098197")
@@ -151,28 +176,28 @@ class OsmReaderTest extends TestBaseScala with Matchers {
         "smoothness" -> "excellent"))
 
       // make sure the nodes match with refs
-      val nodes = osmData.where("kind == 'node'")
-      val ways = osmData.where("kind == 'way'")
-      val relations = osmData.where("kind == 'relation'")
+      val nodes = osmData.where("kind == 'node'").as("n")
+      val ways = osmData.where("kind == 'way'").as("w")
+      val relations = osmData.where("kind == 'relation'").as("rel")
 
       ways
         .selectExpr("explode(refs) AS ref")
-        .alias("w")
-        .join(nodes, col("w.ref") === nodes("id"))
+        .alias("w2")
+        .join(nodes, col("w2.ref") === col("n.id"))
         .count() shouldEqual (47812)
 
       ways
         .selectExpr("explode(refs) AS ref", "id")
-        .alias("w")
-        .join(nodes, col("w.ref") === nodes("id"))
-        .groupBy("w.id")
+        .alias("w2")
+        .join(nodes, col("w2.ref") === col("n.id"))
+        .groupBy("w2.id")
         .count()
         .count() shouldEqual (ways.count())
 
       relations
         .selectExpr("explode(refs) AS ref", "id")
         .alias("r")
-        .join(nodes, col("r.ref") === nodes("id"))
+        .join(nodes, col("r.ref") === col("n.id"))
         .groupBy("r.id")
         .count()
         .count() shouldEqual (162)
@@ -180,7 +205,7 @@ class OsmReaderTest extends TestBaseScala with Matchers {
       relations
         .selectExpr("explode(refs) AS ref", "id")
         .alias("r")
-        .join(ways, col("r.ref") === ways("id"))
+        .join(ways, col("r.ref") === col("w.id"))
         .groupBy("r.id")
         .count()
         .count() shouldEqual (261)
@@ -205,6 +230,150 @@ class OsmReaderTest extends TestBaseScala with Matchers {
 
       relationsList.length shouldEqual (expectedRelationsList.length)
       relationsList should contain theSameElementsAs expectedRelationsList
+    }
+
+    it("should parse metadata fields (changeset, timestamp, uid, user, version)") {
+      val osmData = sparkSession.read
+        .format("osmpbf")
+        .load(monacoPath)
+
+      // All entities should have version, timestamp, changeset populated
+      val totalCount = osmData.count()
+      val withMetadata = osmData
+        .filter("version is not null and timestamp is not null and changeset is not null")
+        .count()
+
+      withMetadata shouldEqual totalCount
+
+      // Verify timestamp values are reasonable (after year 2000, before year 2100)
+      val timestamps = osmData
+        .selectExpr("min(timestamp)", "max(timestamp)")
+        .collect()
+        .head
+
+      val minTimestamp = timestamps.getTimestamp(0)
+      val maxTimestamp = timestamps.getTimestamp(1)
+
+      minTimestamp.after(java.sql.Timestamp.valueOf("2000-01-01 00:00:00")) shouldBe true
+      maxTimestamp.before(java.sql.Timestamp.valueOf("2100-01-01 00:00:00")) shouldBe true
+
+      // Verify version is positive
+      val minVersion = osmData
+        .selectExpr("min(version)")
+        .collect()
+        .head
+        .getInt(0)
+
+      minVersion should be >= 1
+
+      // Verify changeset is non-negative
+      val minChangeset = osmData
+        .selectExpr("min(changeset)")
+        .collect()
+        .head
+        .getLong(0)
+
+      minChangeset should be >= 0L
+
+      // Verify metadata works for each entity kind
+      for (kind <- Seq("node", "way", "relation")) {
+        val kindData = osmData.filter(s"kind == '$kind'")
+        val kindWithMeta = kindData
+          .filter("version is not null and timestamp is not null")
+          .count()
+
+        kindWithMeta shouldEqual kindData.count()
+      }
+    }
+
+    it("should include metadata fields in schema for dense nodes") {
+      val denseData = sparkSession.read
+        .format("osmpbf")
+        .load(densePath)
+
+      // Verify schema includes the new fields
+      val fieldNames = denseData.schema.fieldNames
+      fieldNames should contain("changeset")
+      fieldNames should contain("timestamp")
+      fieldNames should contain("uid")
+      fieldNames should contain("user")
+      fieldNames should contain("version")
+      fieldNames should contain("visible")
+
+      // Verify that at least one dense node has populated metadata values
+      val nodeWithMetadata = denseData
+        .where(col("kind") === "node")
+        .select("changeset", "timestamp", "uid", "user", "version", "visible")
+        .head()
+
+      val changeset = nodeWithMetadata.getAs[Long]("changeset")
+      val timestampValue = nodeWithMetadata.getAs[java.sql.Timestamp]("timestamp")
+      val timestamp = timestampValue.getTime
+      val uid = nodeWithMetadata.getAs[Int]("uid").toLong
+      val user = nodeWithMetadata.getAs[String]("user")
+      val version = nodeWithMetadata.getAs[Int]("version").toLong
+      val visible = nodeWithMetadata.getAs[Boolean]("visible")
+
+      // Basic range/non-null checks to ensure delta-decoded metadata is populated
+      changeset should be >= 0L
+      timestamp should be > 0L
+      // uid can be -1 for anonymous edits
+      uid should be >= -1L
+      version should be > 0L
+      user should not be null
+      (visible == true || visible == false) shouldBe true
+    }
+
+    it("should include metadata fields in schema for normal nodes") {
+      val nodesData = sparkSession.read
+        .format("osmpbf")
+        .load(nodesPath)
+
+      // Verify schema includes the new fields
+      val fieldNames = nodesData.schema.fieldNames
+      fieldNames should contain("changeset")
+      fieldNames should contain("timestamp")
+      fieldNames should contain("uid")
+      fieldNames should contain("user")
+      fieldNames should contain("version")
+      fieldNames should contain("visible")
+    }
+
+    it("should handle file splits where last partition has no block boundary (GH-2781)") {
+      // Force small splits so the last partition starts inside the final PBF block,
+      // where no OSMData header exists. Without the fix, this causes EOFException.
+      withConf(Map("spark.sql.files.maxPartitionBytes" -> "100000")) {
+        val df = sparkSession.read
+          .format("osmpbf")
+          .load(monacoPath)
+
+        assert(df.rdd.getNumPartitions > 1)
+        assert(df.count() > 0)
+      }
+    }
+
+    it("should not lose precision due to float to double conversion") {
+      // Test for accuracy loss bug in NodeExtractor and DenseNodeExtractor
+      val node = sparkSession.read
+        .format("osmpbf")
+        .load(nodesPath)
+        .where("kind == 'node'")
+        .select("location.latitude", "location.longitude")
+        .first()
+
+      val latitude = node.getDouble(0)
+      val longitude = node.getDouble(1)
+
+      // Check that coordinates maintain precision beyond float limits
+      val latAsFloat = latitude.toFloat
+      val lonAsFloat = longitude.toFloat
+
+      // If there's a difference, it indicates potential precision loss from float arithmetic
+      val latDiff = Math.abs(latitude - latAsFloat)
+      val lonDiff = Math.abs(longitude - lonAsFloat)
+
+      // For high-precision coordinates, there should be some difference
+      (latDiff > 1e-10 || lonDiff > 1e-10) shouldBe true
     }
   }
 

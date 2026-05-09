@@ -29,12 +29,22 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.List;
 import org.locationtech.jts.io.ParseException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TestHelper {
 
+  private static final Logger log = LoggerFactory.getLogger(TestHelper.class);
+
   private static final double EPS = 1e-6;
 
-  public static void assertRoundTrip(S2Geography original, EncodeOptions opts) throws IOException {
+  public static void assertRoundTrip(Geography original, EncodeOptions opts) throws IOException {
+    int srid = original.getSRID();
+    assertTrue("SRID must be non-negative", srid >= 0);
+    if (srid == 0) {
+      // If SRID is not set, we set it to a default value for testing purposes
+      original.setSRID(4326);
+    }
     // 1) Encode to bytes
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
     original.encodeTagged(baos, opts);
@@ -42,7 +52,10 @@ public class TestHelper {
 
     // 2) Decode back
     ByteArrayInputStream in = new ByteArrayInputStream(data);
-    S2Geography decoded = original.decodeTagged(in);
+    Geography decoded = Geography.decodeTagged(in);
+
+    assertEquals(original.getSRID(), decoded.getSRID()); // Ensure SRID matches
+    original.setSRID(srid); // Restore original SRID
 
     // 3) Compare kind, shapes, dimension
     assertEquals("Kind should round-trip", original.kind, decoded.kind);
@@ -104,7 +117,7 @@ public class TestHelper {
    * Asserts that the EncodeTag for the given geography honors the includeCovering option; if
    * includeCovering==true, coveringSize should be >0, otherwise it must be zero.
    */
-  public static void assertCovering(S2Geography original, EncodeOptions opts) throws IOException {
+  public static void assertCovering(Geography original, EncodeOptions opts) throws IOException {
     // encode and read only the tag
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
     original.encodeTagged(baos, opts);
@@ -156,20 +169,27 @@ public class TestHelper {
   public static void checkWKBGeography(String wkbHex, String expectedWKT) throws ParseException {
     WKBReader wkbReader = new WKBReader();
     byte[] wkb = WKBReader.hexToBytes(wkbHex);
-    S2Geography geoWKB = wkbReader.read(wkb);
+    Geography geoWKB = wkbReader.read(wkb);
 
     WKTReader wktReader = new WKTReader();
-    S2Geography geoWKT = wktReader.read(expectedWKT);
+    Geography geoWKT = wktReader.read(expectedWKT);
 
-    boolean isEqual = compareTo(geoWKT, geoWKT) == 0;
+    boolean isEqual = compareTo(geoWKB, geoWKT) == 0;
     if (!isEqual) {
-      System.out.println(geoWKB);
-      System.out.println(geoWKT);
+      log.debug("geoWKB: {}", geoWKB);
+      log.debug("geoWKT: {}", geoWKT);
     }
     assertTrue(isEqual);
   }
 
-  public static int compareTo(S2Geography geo1, S2Geography geo2) {
+  public static int compareTo(Geography geo1, Geography geo2) {
+    // Empty geometries of the same runtime subtype are treated as equal, even when the WKB and
+    // WKT readers tag them with different GeographyKind values (e.g. SINGLEPOINT vs POINT for
+    // an empty POINT). This check must come before the kind-based ordering below.
+    if (S2_isEmpty(geo1) && S2_isEmpty(geo2) && geo1.getClass() == geo2.getClass()) {
+      return 0;
+    }
+
     int compare = geo1.kind.getKind() - geo2.kind.getKind();
     if (compare != 0) {
       return compare;
@@ -207,8 +227,16 @@ public class TestHelper {
       if (S2_isEmpty(geo1) && S2_isEmpty(geo2)) return 0;
       assertEquals(geo1.numShapes(), geo2.numShapes());
       for (int i = 0; i < geo1.numShapes(); i++) {
-        S2Geography g1 = (S2Geography) ((GeographyCollection) geo1).features.get(i);
-        S2Geography g2 = (S2Geography) ((GeographyCollection) geo2).features.get(i);
+        Geography g1 = (Geography) ((GeographyCollection) geo1).features.get(i);
+        Geography g2 = (Geography) ((GeographyCollection) geo2).features.get(i);
+        compareTo(g1, g2);
+      }
+    } else if (geo1 instanceof MultiPolygonGeography && geo2 instanceof MultiPolygonGeography) {
+      if (S2_isEmpty(geo1) && S2_isEmpty(geo2)) return 0;
+      assertEquals(geo1.numShapes(), geo2.numShapes());
+      for (int i = 0; i < geo1.numShapes(); i++) {
+        Geography g1 = (Geography) ((MultiPolygonGeography) geo1).features.get(i);
+        Geography g2 = (Geography) ((MultiPolygonGeography) geo2).features.get(i);
         compareTo(g1, g2);
       }
     }

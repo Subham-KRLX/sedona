@@ -22,7 +22,7 @@ import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.connector.read.{Batch, InputPartition, PartitionReaderFactory}
 import org.apache.spark.sql.execution.datasource.stac.TemporalFilter
-import org.apache.spark.sql.execution.datasources.parquet.{GeoParquetSpatialFilter, GeometryFieldMetaData}
+import org.apache.spark.sql.execution.datasources.geoparquet.{GeoParquetSpatialFilter, GeometryFieldMetaData}
 import org.apache.spark.sql.sedona_sql.io.stac.StacUtils.getNumPartitions
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.SerializableConfiguration
@@ -64,6 +64,9 @@ case class StacBatch(
   private var lastReportCount: Int = 0
 
   val mapper = new ObjectMapper()
+
+  // Parse headers from options for authenticated requests
+  private val headers: Map[String, String] = StacUtils.parseHeaders(opts)
 
   /**
    * Sets the maximum number of items left to process.
@@ -168,7 +171,7 @@ case class StacBatch(
       var nextUrl: Option[String] = Some(itemUrl)
       breakable {
         while (nextUrl.isDefined) {
-          val itemJson = StacUtils.loadStacCollectionToJson(nextUrl.get)
+          val itemJson = StacUtils.loadStacCollectionToJson(nextUrl.get, headers)
           val itemRootNode = mapper.readTree(itemJson)
           // Check if there exists a "next" link
           val itemLinksNode = itemRootNode.get("links")
@@ -252,7 +255,7 @@ case class StacBatch(
           collectionBasePath + href
         }
         // Recursively process the linked collection
-        val linkedCollectionJson = StacUtils.loadStacCollectionToJson(childUrl)
+        val linkedCollectionJson = StacUtils.loadStacCollectionToJson(childUrl, headers)
         val nestedCollectionBasePath = StacUtils.getStacCollectionBasePath(childUrl)
         val collectionFiltered =
           filterCollection(linkedCollectionJson, spatialFilter, temporalFilter)
@@ -325,7 +328,7 @@ case class StacBatch(
             val geometryFieldMetaData = GeometryFieldMetaData(
               encoding = "WKB",
               geometryTypes = geometryTypes,
-              bbox = bbox,
+              bbox = Some(bbox),
               crs = None,
               covering = None)
 

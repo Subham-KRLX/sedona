@@ -28,6 +28,8 @@
 /.project
 /.scala-build
 /.settings/
+/.venv/
+/.venv-test/
 /.vscode/
 /bin/
 /conf/
@@ -37,3 +39,20 @@
 __pycache__
 dependency-reduced-pom.xml
 target
+
+# Windows WSL Images copy
+.Identifier
+*:Zone.Identifier
+*.Identifier
+
+# Ignore minified files and source maps
+*.min.css
+*.min.css.map
+*.min.js
+*.min.js.map
+
+# Ignore node_modules in docs-overrides
+docs-overrides/node_modules/
+
+uv.lock
+.env

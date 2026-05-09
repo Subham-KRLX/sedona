@@ -111,7 +111,7 @@ You can add additional Spark runtime config to the config builder. For example, 
 
 ## Initiate SedonaContext
 
-Add the following line after creating Sedona config. If you already have a SparkSession (usually named `spark`) created by AWS EMR/Databricks/Microsoft Fabric, please call `sedona = SedonaContext.create(spark)` instead. For ==Databricks==, the situation is more complicated, please refer to [Databricks setup guide](../setup/databricks.md), but generally you don't need to create SedonaContext.
+Add the following line after creating Sedona config. If you already have a SparkSession (usually named `spark`) created by AWS EMR/Databricks/Microsoft Fabric, please call `sedona = SedonaContext.create(spark)` instead.
 
 === "Scala"
 
@@ -230,7 +230,7 @@ root
 ```
 
 !!!note
-	SedonaSQL provides lots of functions to create a Geometry column, please read [SedonaSQL constructor API](../api/sql/Constructor.md).
+	SedonaSQL provides lots of functions to create a Geometry column, please read [SedonaSQL constructor API](../api/sql/Geometry-Functions.md).
 
 ## Load GeoJSON Data
 
@@ -348,10 +348,6 @@ Sedona supports spatial predicate push-down for GeoParquet files, please refer t
 
 GeoParquet file reader can also be used to read legacy Parquet files written by Apache Sedona 1.3.1-incubating or earlier.
 Please refer to [Reading Legacy Parquet Files](../api/sql/Reading-legacy-parquet.md) for details.
-
-!!!warning
-	GeoParquet file reader does not work on Databricks runtime when Photon is enabled. Please disable Photon when using
-	GeoParquet file reader on Databricks runtime.
 
 See [this page](files/geoparquet-sedona-spark.md) for more information on loading GeoParquet.
 
@@ -790,7 +786,7 @@ WHERE ST_Contains (ST_PolygonFromEnvelope(1.0,100.0,1000.0,1100.0), newcountysha
 ```
 
 !!!note
-	Read [SedonaSQL constructor API](../api/sql/Constructor.md) to learn how to create a Geometry type query window
+	Read [SedonaSQL constructor API](../api/sql/Geometry-Functions.md) to learn how to create a Geometry type query window
 
 ### KNN query
 
@@ -815,14 +811,14 @@ The details of a KNN join query is available here [KNN join query](../api/sql/Ne
 
 ### Other queries
 
-There are lots of other functions can be combined with these queries. Please read [SedonaSQL functions](../api/sql/Function.md) and [SedonaSQL aggregate functions](../api/sql/AggregateFunction.md).
+There are lots of other functions can be combined with these queries. Please read [SedonaSQL functions](../api/sql/Overview.md) and [SedonaSQL aggregate functions](../api/sql/Geometry-Functions.md#aggregate-functions).
 
 ## Visualize query results
 
 Sedona provides `SedonaPyDeck` and `SedonaKepler` wrappers, both of which expose APIs to create interactive map visualizations from SedonaDataFrames in a Jupyter environment.
 
 !!!Note
-	Both SedonaPyDeck and SedonaKepler expect the default geometry order to be lon-lat. If your dataframe has geometries in the lat-lon order, please check out [ST_FlipCoordinates](https://sedona.apache.org/latest-snapshot/api/sql/Function/#st_flipcoordinates)
+	Both SedonaPyDeck and SedonaKepler expect the default geometry order to be lon-lat. If your dataframe has geometries in the lat-lon order, please check out [ST_FlipCoordinates](../api/sql/Geometry-Editors/ST_FlipCoordinates.md)
 
 !!!Note
 	Both SedonaPyDeck and SedonaKepler are designed to work with SedonaDataFrames containing only 1 geometry column. Passing dataframes with multiple geometry columns will cause errors.
@@ -859,7 +855,7 @@ SedonaPyDeck.create_choropleth_map(df=groupedresult, plot_col="AirportCount")
 ![Creating a Choropleth map using SedonaPyDeck](../image/choropleth.gif)
 
 The dataset used is available [here](https://github.com/apache/sedona/tree/b66e768155866a38ba2e3404f1151cac14fad5ea/docs/usecases/data/ne_50m_airports) and
-can also be found in the example notebook available [here](https://github.com/apache/sedona/blob/master/docs/usecases/ApacheSedonaSQL_SpatialJoin_AirportsPerCountry.ipynb)
+can also be found in the example notebook available [here](https://github.com/apache/sedona/blob/master/docs/usecases/legacy/ApacheSedonaSQL_SpatialJoin_AirportsPerCountry.ipynb)
 
 #### Creating a Geometry map using SedonaPyDeck
 
@@ -927,7 +923,7 @@ SedonaKepler.create_map(df=groupedresult, name="AirportCount")
 ![Visualize geospatial data using SedonaKepler](../image/sedona_customization.gif)
 
 The dataset used is available [here](https://github.com/apache/sedona/tree/b66e768155866a38ba2e3404f1151cac14fad5ea/docs/usecases/data/ne_50m_airports) and
-can also be found in the example notebook available [here](https://github.com/apache/sedona/blob/master/docs/usecases/ApacheSedonaSQL_SpatialJoin_AirportsPerCountry.ipynb)
+can also be found in the example notebook available [here](https://github.com/apache/sedona/blob/master/docs/usecases/legacy/ApacheSedonaSQL_SpatialJoin_AirportsPerCountry.ipynb)
 
 Details on all the APIs available by SedonaKepler are listed in the [SedonaKepler API docs](../api/sql/Visualization-SedonaKepler.md)
 

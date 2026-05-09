@@ -65,11 +65,19 @@ rm report.txt
 Make sure the Sedona version in the following files are {{ sedona_create_release.current_version }}.
 
 1. https://github.com/apache/sedona/blob/master/python/sedona/version.py
-2. https://github.com/apache/sedona/blob/master/R/DESCRIPTION
-3. https://github.com/apache/sedona/blob/99239524f17389fc4ae9548ea88756f8ea538bb9/R/R/dependencies.R#L42
-4. https://github.com/apache/sedona/blob/master/zeppelin/package.json
+2. https://github.com/apache/sedona/blob/master/python/pyproject.toml (the `version` field under `[project]`)
+3. https://github.com/apache/sedona/blob/master/R/DESCRIPTION
+4. https://github.com/apache/sedona/blob/99239524f17389fc4ae9548ea88756f8ea538bb9/R/R/dependencies.R#L42
+5. https://github.com/apache/sedona/blob/master/zeppelin/package.json
 
-## 3. Update mkdocs.yml
+!!!warning
+    The `version` field in `python/pyproject.toml` is what `setuptools` uses when building the Python sdist and wheel. If this is not bumped, the PyPI artifact will carry the old version even if `python/sedona/version.py` is correct.
+
+## 3. Update release notes
+
+Before cutting the release candidate, make sure `docs/setup/release-notes.md` has an entry for {{ sedona_create_release.current_version }} summarizing all changes since the previous release. This file is linked directly from the vote email and the announce email, so it must be in place on the release tag.
+
+## 4. Update mkdocs.yml
 
 * Please change the following variables in `mkdocs.yml` to the version you want to publish.
     * `sedona_create_release.current_version`
@@ -79,7 +87,7 @@ Make sure the Sedona version in the following files are {{ sedona_create_release
 * Then compile the website by `mkdocs serve`. This will generate the scripts listed on this page in your local browser.
 * You can also publish this website if needed. See the instruction at bottom.
 
-## 4. Stage and upload release candidates
+## 5. Stage and upload release candidates
 
 ```bash
 #!/bin/bash
@@ -92,10 +100,8 @@ rm -f pom.xml.*
 
 echo "*****Step 1. Stage the Release Candidate to GitHub."
 
-mvn -q -B clean release:prepare -Dtag={{ sedona_create_release.current_git_tag }} -DreleaseVersion={{ sedona_create_release.current_version }} -DdevelopmentVersion={{ sedona_create_release.current_snapshot }} -Dresume=false -Penable-all-submodules -Darguments="-DskipTests"
-mvn -q -B release:clean -Penable-all-submodules
-
-echo "Now the releases are staged. A tag and two commits have been created on Sedona GitHub repo"
+mvn -B clean release:prepare -Dtag={{ sedona_create_release.current_git_tag }} -DreleaseVersion={{ sedona_create_release.current_version }} -DdevelopmentVersion={{ sedona_create_release.current_snapshot }} -Dresume=false -Penable-all-submodules -Darguments="-DskipTests"
+mvn -B release:clean -Penable-all-submodules
 
 echo "*****Step 2: Upload the Release Candidate to https://repository.apache.org."
 
@@ -109,7 +115,9 @@ echo "*****Step 2: Upload the Release Candidate to https://repository.apache.org
 
 # Define repository details
 REPO_URL="https://github.com/apache/sedona.git"
-TAG="{{ sedona_create_release.current_rc }}"
+RC_VERSION="{{ sedona_create_release.current_rc }}"
+SEDONA_VERSION="{{ sedona_create_release.current_version }}"
+TAG="sedona-${RC_VERSION}"
 LOCAL_DIR="sedona-release"
 
 # Remove existing directory if it exists and clone the repository
@@ -119,95 +127,336 @@ rm -rf $LOCAL_DIR && git clone --depth 1 --branch $TAG $REPO_URL $LOCAL_DIR && c
 MAVEN_PLUGIN_VERSION="2.3.2"
 
 # Define Spark and Scala versions
-declare -a SPARK_VERSIONS=("3.3" "3.4" "3.5")
+declare -a SPARK_VERSIONS=("3.4" "3.5" "4.0" "4.1")
 declare -a SCALA_VERSIONS=("2.12" "2.13")
+
+# Function to get Java version for Spark version
+get_java_version() {
+  local spark_version=$1
+  if [[ "$spark_version" == "4."* ]]; then
+    echo "17"
+  else
+    echo "11"
+  fi
+}
+
+# Function to find Maven installation path
+find_maven_path() {
+  # Try different methods to find Maven
+  local mvn_path=""
+
+  # Method 1: Check if mvn is in PATH
+  if command -v mvn >/dev/null 2>&1; then
+    mvn_path=$(command -v mvn)
+  fi
+
+  # Method 2: Check common Homebrew locations
+  if [[ -z "$mvn_path" ]]; then
+    for version_dir in /opt/homebrew/Cellar/maven/*/libexec/bin/mvn; do
+      if [[ -x "$version_dir" ]]; then
+        mvn_path="$version_dir"
+        break
+      fi
+    done
+  fi
+
+  # Method 3: Check /usr/local (older Homebrew installations)
+  if [[ -z "$mvn_path" ]]; then
+    for version_dir in /usr/local/Cellar/maven/*/libexec/bin/mvn; do
+      if [[ -x "$version_dir" ]]; then
+        mvn_path="$version_dir"
+        break
+      fi
+    done
+  fi
+
+  # Method 4: Check system locations
+  if [[ -z "$mvn_path" ]]; then
+    for path in /usr/bin/mvn /usr/local/bin/mvn; do
+      if [[ -x "$path" ]]; then
+        mvn_path="$path"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "$mvn_path" ]]; then
+    echo "ERROR: Could not find Maven installation" >&2
+    echo "Please ensure Maven is installed and available in PATH or in standard locations" >&2
+    exit 1
+  fi
+
+  echo "$mvn_path"
+}
+
+# Function to create Maven wrapper with specific Java version
+create_mvn_wrapper() {
+  local java_version=$1
+  local mvn_wrapper="/tmp/mvn-java${java_version}"
+  local mvn_path=$(find_maven_path)
+
+  echo "Using Maven at: $mvn_path" >&2
+
+  # Create a wrapper script that sets JAVA_HOME and executes Maven
+  cat > "$mvn_wrapper" << EOF
+#!/bin/bash
+JAVA_HOME="\${JAVA_HOME:-\$(/usr/libexec/java_home -v ${java_version})}" exec "${mvn_path}" "\$@"
+EOF
+
+  chmod +x "$mvn_wrapper"
+  echo "$mvn_wrapper"
+}
+
+# Function to verify Java version using Maven wrapper
+verify_java_version() {
+  local mvn_wrapper=$1
+  local expected_java_version=$2
+
+  echo "Verifying Java version with Maven wrapper..."
+  local mvn_java_version=$($mvn_wrapper --version | grep "Java version" | sed 's/.*Java version: \([0-9]*\).*/\1/')
+  if [[ "$mvn_java_version" != "$expected_java_version" ]]; then
+    echo "ERROR: Maven wrapper is using Java $mvn_java_version, but expected Java $expected_java_version"
+    echo "Please ensure the correct Java version is installed"
+    exit 1
+  fi
+  echo "✓ Verified: Maven wrapper is using Java $mvn_java_version"
+}
 
 # Iterate through Spark and Scala versions
 for SPARK in "${SPARK_VERSIONS[@]}"; do
   for SCALA in "${SCALA_VERSIONS[@]}"; do
-    echo "Running release:perform for Spark $SPARK and Scala $SCALA..."
+    # Skip Spark 4.0+ + Scala 2.12 combination as it's not supported
+    if [[ "$SPARK" == "4."* && "$SCALA" == "2.12" ]]; then
+      echo "Skipping Spark $SPARK with Scala $SCALA (not supported)"
+      continue
+    fi
 
-    mvn org.apache.maven.plugins:maven-release-plugin:$MAVEN_PLUGIN_VERSION:perform \
+    JAVA_VERSION=$(get_java_version $SPARK)
+    echo "Running release:perform for Spark $SPARK and Scala $SCALA with Java $JAVA_VERSION..."
+
+    # Create Maven wrapper with appropriate Java version
+    MVN_WRAPPER=$(create_mvn_wrapper $JAVA_VERSION)
+    echo "Created Maven wrapper: $MVN_WRAPPER"
+
+    # Verify Java version
+    verify_java_version $MVN_WRAPPER $JAVA_VERSION
+
+    # Execute Maven with the wrapper
+    $MVN_WRAPPER org.apache.maven.plugins:maven-release-plugin:$MAVEN_PLUGIN_VERSION:perform \
       -DconnectionUrl=scm:git:file://$(pwd) \
       -Dtag=$TAG \
       -Dresume=false \
       -Darguments="-DskipTests -Dspark=$SPARK -Dscala=$SCALA" \
       -Dspark=$SPARK \
       -Dscala=$SCALA
+
+    # Clean up the wrapper
+    rm -f $MVN_WRAPPER
   done
 done
 
 echo "*****Step 3: Upload Release Candidate on ASF SVN: https://dist.apache.org/repos/dist/dev/sedona"
 
-echo "Creating {{ sedona_create_release.current_rc }} folder on SVN..."
+echo "Creating ${RC_VERSION} folder on SVN..."
 
-svn mkdir -m "Adding folder" https://dist.apache.org/repos/dist/dev/sedona/{{ sedona_create_release.current_rc }}
+svn mkdir -m "Adding folder" https://dist.apache.org/repos/dist/dev/sedona/${RC_VERSION}
 
 echo "Creating release files locally..."
 
+# Go back to parent directory for file operations
+cd ../..
+
 echo "Downloading source code..."
 
-wget https://github.com/apache/sedona/archive/refs/tags/{{ sedona_create_release.current_git_tag}}.tar.gz
-tar -xvf {{ sedona_create_release.current_git_tag}}.tar.gz
-mkdir apache-sedona-{{ sedona_create_release.current_version }}-src
-cp -r sedona-{{ sedona_create_release.current_git_tag}}/* apache-sedona-{{ sedona_create_release.current_version }}-src/
-tar czf apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz apache-sedona-{{ sedona_create_release.current_version }}-src
-rm {{ sedona_create_release.current_git_tag}}.tar.gz
-rm -rf sedona-{{ sedona_create_release.current_git_tag}}
+wget https://github.com/apache/sedona/archive/refs/tags/sedona-${RC_VERSION}.tar.gz
+tar -xvf sedona-${RC_VERSION}.tar.gz
+mkdir apache-sedona-${SEDONA_VERSION}-src
+cp -r sedona-sedona-${RC_VERSION}/* apache-sedona-${SEDONA_VERSION}-src/
+tar czf apache-sedona-${SEDONA_VERSION}-src.tar.gz apache-sedona-${SEDONA_VERSION}-src
+rm sedona-${RC_VERSION}.tar.gz
+rm -rf sedona-sedona-${RC_VERSION}
+
+# Create checksums and signatures for source files
+shasum -a 512 apache-sedona-${SEDONA_VERSION}-src.tar.gz > apache-sedona-${SEDONA_VERSION}-src.tar.gz.sha512
+gpg -ab apache-sedona-${SEDONA_VERSION}-src.tar.gz
+
+echo "Uploading source files..."
+
+# Upload source files first
+svn import -m "Adding file" apache-sedona-${SEDONA_VERSION}-src.tar.gz https://dist.apache.org/repos/dist/dev/sedona/${RC_VERSION}/apache-sedona-${SEDONA_VERSION}-src.tar.gz
+svn import -m "Adding file" apache-sedona-${SEDONA_VERSION}-src.tar.gz.asc https://dist.apache.org/repos/dist/dev/sedona/${RC_VERSION}/apache-sedona-${SEDONA_VERSION}-src.tar.gz.asc
+svn import -m "Adding file" apache-sedona-${SEDONA_VERSION}-src.tar.gz.sha512 https://dist.apache.org/repos/dist/dev/sedona/${RC_VERSION}/apache-sedona-${SEDONA_VERSION}-src.tar.gz.sha512
 
 echo "Compiling the source code..."
 
-mkdir apache-sedona-{{ sedona_create_release.current_version }}-bin
+mkdir apache-sedona-${SEDONA_VERSION}-bin
 
-cd apache-sedona-{{ sedona_create_release.current_version }}-src && mvn -q clean install -DskipTests -Dspark=3.3 -Dscala=2.12 && cd ..
-cp apache-sedona-{{ sedona_create_release.current_version }}-src/spark-shaded/target/sedona-*{{ sedona_create_release.current_version}}.jar apache-sedona-{{ sedona_create_release.current_version }}-bin/
-cp apache-sedona-{{ sedona_create_release.current_version }}-src/flink-shaded/target/sedona-*{{ sedona_create_release.current_version}}.jar apache-sedona-{{ sedona_create_release.current_version }}-bin/
-cp apache-sedona-{{ sedona_create_release.current_version }}-src/snowflake/target/sedona-*{{ sedona_create_release.current_version}}.jar apache-sedona-{{ sedona_create_release.current_version }}-bin/
+# Function to get Java version for Spark version
+get_java_version() {
+  local spark_version=$1
+  if [[ "$spark_version" == "4."* ]]; then
+    echo "17"
+  else
+    echo "11"
+  fi
+}
 
-cd apache-sedona-{{ sedona_create_release.current_version }}-src && mvn -q clean install -DskipTests -Dspark=3.3 -Dscala=2.13 && cd ..
-cp apache-sedona-{{ sedona_create_release.current_version }}-src/spark-shaded/target/sedona-*{{ sedona_create_release.current_version}}.jar apache-sedona-{{ sedona_create_release.current_version }}-bin/
+# Function to find Maven installation path
+find_maven_path() {
+  # Try different methods to find Maven
+  local mvn_path=""
 
-cd apache-sedona-{{ sedona_create_release.current_version }}-src && mvn -q clean install -DskipTests -Dspark=3.4 -Dscala=2.12 && cd ..
-cp apache-sedona-{{ sedona_create_release.current_version }}-src/spark-shaded/target/sedona-*{{ sedona_create_release.current_version}}.jar apache-sedona-{{ sedona_create_release.current_version }}-bin/
+  # Method 1: Check if mvn is in PATH
+  if command -v mvn >/dev/null 2>&1; then
+    mvn_path=$(command -v mvn)
+  fi
 
-cd apache-sedona-{{ sedona_create_release.current_version }}-src && mvn -q clean install -DskipTests -Dspark=3.4 -Dscala=2.13 && cd ..
-cp apache-sedona-{{ sedona_create_release.current_version }}-src/spark-shaded/target/sedona-*{{ sedona_create_release.current_version}}.jar apache-sedona-{{ sedona_create_release.current_version }}-bin/
+  # Method 2: Check common Homebrew locations
+  if [[ -z "$mvn_path" ]]; then
+    for version_dir in /opt/homebrew/Cellar/maven/*/libexec/bin/mvn; do
+      if [[ -x "$version_dir" ]]; then
+        mvn_path="$version_dir"
+        break
+      fi
+    done
+  fi
 
-cd apache-sedona-{{ sedona_create_release.current_version }}-src && mvn -q clean install -DskipTests -Dspark=3.5 -Dscala=2.12 && cd ..
-cp apache-sedona-{{ sedona_create_release.current_version }}-src/spark-shaded/target/sedona-*{{ sedona_create_release.current_version}}.jar apache-sedona-{{ sedona_create_release.current_version }}-bin/
+  # Method 3: Check /usr/local (older Homebrew installations)
+  if [[ -z "$mvn_path" ]]; then
+    for version_dir in /usr/local/Cellar/maven/*/libexec/bin/mvn; do
+      if [[ -x "$version_dir" ]]; then
+        mvn_path="$version_dir"
+        break
+      fi
+    done
+  fi
 
-cd apache-sedona-{{ sedona_create_release.current_version }}-src && mvn -q clean install -DskipTests -Dspark=3.5 -Dscala=2.13 && cd ..
-cp apache-sedona-{{ sedona_create_release.current_version }}-src/spark-shaded/target/sedona-*{{ sedona_create_release.current_version}}.jar apache-sedona-{{ sedona_create_release.current_version }}-bin/
+  # Method 4: Check system locations
+  if [[ -z "$mvn_path" ]]; then
+    for path in /usr/bin/mvn /usr/local/bin/mvn; do
+      if [[ -x "$path" ]]; then
+        mvn_path="$path"
+        break
+      fi
+    done
+  fi
 
-tar czf apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz apache-sedona-{{ sedona_create_release.current_version }}-bin
-shasum -a 512 apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz > apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz.sha512
-shasum -a 512 apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz > apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz.sha512
-gpg -ab apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz
-gpg -ab apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz
+  if [[ -z "$mvn_path" ]]; then
+    echo "ERROR: Could not find Maven installation" >&2
+    echo "Please ensure Maven is installed and available in PATH or in standard locations" >&2
+    exit 1
+  fi
 
-echo "Uploading local release files..."
+  echo "$mvn_path"
+}
 
-svn import -m "Adding file" apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz https://dist.apache.org/repos/dist/dev/sedona/{{ sedona_create_release.current_rc }}/apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz
-svn import -m "Adding file" apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz.asc https://dist.apache.org/repos/dist/dev/sedona/{{ sedona_create_release.current_rc }}/apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz.asc
-svn import -m "Adding file" apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz.sha512 https://dist.apache.org/repos/dist/dev/sedona/{{ sedona_create_release.current_rc }}/apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz.sha512
-svn import -m "Adding file" apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz https://dist.apache.org/repos/dist/dev/sedona/{{ sedona_create_release.current_rc }}/apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz
-svn import -m "Adding file" apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz.asc https://dist.apache.org/repos/dist/dev/sedona/{{ sedona_create_release.current_rc }}/apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz.asc
-svn import -m "Adding file" apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz.sha512 https://dist.apache.org/repos/dist/dev/sedona/{{ sedona_create_release.current_rc }}/apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz.sha512
+# Function to create Maven wrapper with specific Java version
+create_mvn_wrapper() {
+  local java_version=$1
+  local mvn_wrapper="/tmp/mvn-java${java_version}"
+  local mvn_path=$(find_maven_path)
+
+  echo "Using Maven at: $mvn_path" >&2
+
+  # Create a wrapper script that sets JAVA_HOME and executes Maven
+  cat > "$mvn_wrapper" << EOF
+#!/bin/bash
+JAVA_HOME="\${JAVA_HOME:-\$(/usr/libexec/java_home -v ${java_version})}" exec "${mvn_path}" "\$@"
+EOF
+
+  chmod +x "$mvn_wrapper"
+  echo "$mvn_wrapper"
+}
+
+# Function to verify Java version using Maven wrapper
+verify_java_version() {
+  local mvn_wrapper=$1
+  local expected_java_version=$2
+
+  echo "Verifying Java version with Maven wrapper..."
+  local mvn_java_version=$($mvn_wrapper --version | grep "Java version" | sed 's/.*Java version: \([0-9]*\).*/\1/')
+  if [[ "$mvn_java_version" != "$expected_java_version" ]]; then
+    echo "ERROR: Maven wrapper is using Java $mvn_java_version, but expected Java $expected_java_version"
+    echo "Please ensure the correct Java version is installed"
+    exit 1
+  fi
+  echo "✓ Verified: Maven wrapper is using Java $mvn_java_version"
+}
+
+# Compile for Spark 3.4 with Java 11
+JAVA_VERSION=$(get_java_version "3.4")
+MVN_WRAPPER=$(create_mvn_wrapper $JAVA_VERSION)
+verify_java_version $MVN_WRAPPER $JAVA_VERSION
+
+echo "Compiling for Spark 3.4 with Scala 2.12 using Java $JAVA_VERSION..."
+cd apache-sedona-${SEDONA_VERSION}-src && $MVN_WRAPPER clean && $MVN_WRAPPER install -DskipTests -Dspark=3.4 -Dscala=2.12 && cd ..
+cp apache-sedona-${SEDONA_VERSION}-src/spark-shaded/target/sedona-*${SEDONA_VERSION}.jar apache-sedona-${SEDONA_VERSION}-bin/
+
+echo "Compiling for Spark 3.4 with Scala 2.13 using Java $JAVA_VERSION..."
+cd apache-sedona-${SEDONA_VERSION}-src && $MVN_WRAPPER clean && $MVN_WRAPPER install -DskipTests -Dspark=3.4 -Dscala=2.13 && cd ..
+cp apache-sedona-${SEDONA_VERSION}-src/spark-shaded/target/sedona-*${SEDONA_VERSION}.jar apache-sedona-${SEDONA_VERSION}-bin/
+
+# Compile for Spark 3.5 with Java 11
+JAVA_VERSION=$(get_java_version "3.5")
+MVN_WRAPPER=$(create_mvn_wrapper $JAVA_VERSION)
+verify_java_version $MVN_WRAPPER $JAVA_VERSION
+
+echo "Compiling for Spark 3.5 with Scala 2.12 using Java $JAVA_VERSION..."
+cd apache-sedona-${SEDONA_VERSION}-src && $MVN_WRAPPER clean && $MVN_WRAPPER install -DskipTests -Dspark=3.5 -Dscala=2.12 && cd ..
+cp apache-sedona-${SEDONA_VERSION}-src/spark-shaded/target/sedona-*${SEDONA_VERSION}.jar apache-sedona-${SEDONA_VERSION}-bin/
+
+echo "Compiling for Spark 3.5 with Scala 2.13 using Java $JAVA_VERSION..."
+cd apache-sedona-${SEDONA_VERSION}-src && $MVN_WRAPPER clean && $MVN_WRAPPER install -DskipTests -Dspark=3.5 -Dscala=2.13 && cd ..
+cp apache-sedona-${SEDONA_VERSION}-src/spark-shaded/target/sedona-*${SEDONA_VERSION}.jar apache-sedona-${SEDONA_VERSION}-bin/
+
+# Compile for Spark 4.0 with Java 17
+JAVA_VERSION=$(get_java_version "4.0")
+MVN_WRAPPER=$(create_mvn_wrapper $JAVA_VERSION)
+verify_java_version $MVN_WRAPPER $JAVA_VERSION
+
+echo "Compiling for Spark 4.0 with Scala 2.13 using Java $JAVA_VERSION..."
+cd apache-sedona-${SEDONA_VERSION}-src && $MVN_WRAPPER clean && $MVN_WRAPPER install -DskipTests -Dspark=4.0 -Dscala=2.13 && cd ..
+cp apache-sedona-${SEDONA_VERSION}-src/spark-shaded/target/sedona-*${SEDONA_VERSION}.jar apache-sedona-${SEDONA_VERSION}-bin/
+
+# Compile for Spark 4.1 with Java 17
+JAVA_VERSION=$(get_java_version "4.1")
+MVN_WRAPPER=$(create_mvn_wrapper $JAVA_VERSION)
+verify_java_version $MVN_WRAPPER $JAVA_VERSION
+
+echo "Compiling for Spark 4.1 with Scala 2.13 using Java $JAVA_VERSION..."
+cd apache-sedona-${SEDONA_VERSION}-src && $MVN_WRAPPER clean && $MVN_WRAPPER install -DskipTests -Dspark=4.1 -Dscala=2.13 && cd ..
+cp apache-sedona-${SEDONA_VERSION}-src/spark-shaded/target/sedona-*${SEDONA_VERSION}.jar apache-sedona-${SEDONA_VERSION}-bin/
+
+# Clean up Maven wrappers
+rm -f /tmp/mvn-java11 /tmp/mvn-java17
+
+tar czf apache-sedona-${SEDONA_VERSION}-bin.tar.gz apache-sedona-${SEDONA_VERSION}-bin
+
+# Create checksums and signatures for binary files
+shasum -a 512 apache-sedona-${SEDONA_VERSION}-bin.tar.gz > apache-sedona-${SEDONA_VERSION}-bin.tar.gz.sha512
+gpg -ab apache-sedona-${SEDONA_VERSION}-bin.tar.gz
+
+echo "Uploading binary files..."
+
+# Upload binary files
+svn import -m "Adding file" apache-sedona-${SEDONA_VERSION}-bin.tar.gz https://dist.apache.org/repos/dist/dev/sedona/${RC_VERSION}/apache-sedona-${SEDONA_VERSION}-bin.tar.gz
+svn import -m "Adding file" apache-sedona-${SEDONA_VERSION}-bin.tar.gz.asc https://dist.apache.org/repos/dist/dev/sedona/${RC_VERSION}/apache-sedona-${SEDONA_VERSION}-bin.tar.gz.asc
+svn import -m "Adding file" apache-sedona-${SEDONA_VERSION}-bin.tar.gz.sha512 https://dist.apache.org/repos/dist/dev/sedona/${RC_VERSION}/apache-sedona-${SEDONA_VERSION}-bin.tar.gz.sha512
 
 echo "Removing local release files..."
 
-rm apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz
-rm apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz.asc
-rm apache-sedona-{{ sedona_create_release.current_version }}-src.tar.gz.sha512
-rm apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz
-rm apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz.asc
-rm apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz.sha512
-rm -rf apache-sedona-{{ sedona_create_release.current_version }}-src
-rm -rf apache-sedona-{{ sedona_create_release.current_version }}-bin
+rm apache-sedona-${SEDONA_VERSION}-src.tar.gz
+rm apache-sedona-${SEDONA_VERSION}-src.tar.gz.asc
+rm apache-sedona-${SEDONA_VERSION}-src.tar.gz.sha512
+rm apache-sedona-${SEDONA_VERSION}-bin.tar.gz
+rm apache-sedona-${SEDONA_VERSION}-bin.tar.gz.asc
+rm apache-sedona-${SEDONA_VERSION}-bin.tar.gz.sha512
+rm -rf apache-sedona-${SEDONA_VERSION}-src
+rm -rf apache-sedona-${SEDONA_VERSION}-bin
 
 ```
 
-## 5. Vote in dev sedona.apache.org
+## 6. Vote in dev sedona.apache.org
 
 ### Vote email
 
@@ -313,7 +562,7 @@ Vote result thread (Permalink from https://lists.apache.org/list.html):
 
 
 Website:
-http://sedona.apache.org/
+https://sedona.apache.org/
 
 Release notes:
 https://github.com/apache/sedona/blob/sedona-{{ sedona_create_release.current_version }}/docs/setup/release-notes.md
@@ -335,7 +584,7 @@ Apache Sedona Team
 If a vote failed, do the following:
 
 1. In the vote email, say that we will create another release candidate.
-2. Restart from Step 3 `Update mkdocs.yml`. Please increment the release candidate ID (e.g., `{{ sedona_create_release.current_version}}-rc2`) and update `sedona_create_release.current_rc` and `sedona_create_release.current_git_tag` in `mkdocs.yml` to generate the script listed on this webpage.
+2. Restart from Step 4 `Update mkdocs.yml`. Please increment the release candidate ID (e.g., `{{ sedona_create_release.current_version}}-rc2`) and update `sedona_create_release.current_rc` and `sedona_create_release.current_git_tag` in `mkdocs.yml` to generate the script listed on this webpage.
 
 ## 8. Release source code and Maven package
 
@@ -371,37 +620,11 @@ rm apache-sedona-{{ sedona_create_release.current_version }}-bin.tar.gz.sha512
 1. Click `Close` on the Sedona staging repo on https://repository.apache.org under `staging repository`
 2. Once the staging repo is closed, click `Release` on this repo.
 
-**NOTICE**: The staging repo will be automatically dropped after 3 days without closing. If you find the staging repo being dropped, you can re-stage the release using the following script.
+## 9. Release Sedona Python
 
-```bash
-#!/bin/bash
+Sedona GitHub CI will automatically publish wheel files to PyPi once a GitHub release is created.
 
-echo "Re-staging releases to https://repository.apache.org"
-
-git checkout master
-git pull
-
-rm -f release.*
-rm -f pom.xml.*
-
-# For Spark 3.3 and Scala 2.12
-mvn -q org.apache.maven.plugins:maven-release-plugin:2.3.2:perform -DconnectionUrl=scm:git:https://github.com/apache/sedona.git -Dtag={{ sedona_create_release.current_git_tag }} -Dresume=false -Darguments="-DskipTests -Dspark=3.3 -Dscala=2.12" -Dspark=3.3 -Dscala=2.12
-
-# For Spark 3.3 and Scala 2.13
-mvn -q org.apache.maven.plugins:maven-release-plugin:2.3.2:perform -DconnectionUrl=scm:git:https://github.com/apache/sedona.git -Dtag={{ sedona_create_release.current_git_tag }} -Dresume=false -Darguments="-DskipTests -Dspark=3.3 -Dscala=2.13" -Dspark=3.3 -Dscala=2.13
-
-# For Spark 3.4 and Scala 2.12
-mvn -q org.apache.maven.plugins:maven-release-plugin:2.3.2:perform -DconnectionUrl=scm:git:https://github.com/apache/sedona.git -Dtag={{ sedona_create_release.current_git_tag }} -Dresume=false -Darguments="-DskipTests -Dspark=3.4 -Dscala=2.12" -Dspark=3.4 -Dscala=2.12
-
-# For Spark 3.4 and Scala 2.13
-mvn -q org.apache.maven.plugins:maven-release-plugin:2.3.2:perform -DconnectionUrl=scm:git:https://github.com/apache/sedona.git -Dtag={{ sedona_create_release.current_git_tag }} -Dresume=false -Darguments="-DskipTests -Dspark=3.4 -Dscala=2.13" -Dspark=3.4 -Dscala=2.13
-```
-
-## 9. Release Sedona Python and Zeppelin
-
-You must have the maintainer privilege of `https://pypi.org/project/apache-sedona/` and `https://www.npmjs.com/package/apache-sedona`
-
-To publish Sedona pythons, you have to use GitHub actions since we release wheels for different platforms. Please use this repo: https://github.com/jiayuasu/sedona-publish-python
+## 10. Release Sedona Zeppelin
 
 ```bash
 #!/bin/bash
@@ -417,7 +640,7 @@ cd apache-sedona-{{ sedona_create_release.current_version }}-src/zeppelin && npm
 rm -rf apache-sedona-{{ sedona_create_release.current_version }}-src
 ```
 
-## 10. Release Sedona R to CRAN.
+## 11. Release Sedona R to CRAN.
 
 ```bash
 #!/bin/bash
@@ -427,7 +650,7 @@ R CMD check --as-cran apache.sedona_*.tar.gz
 
 Then submit to CRAN using this [web form](https://xmpalantir.wu.ac.at/cransubmit/).
 
-## 11. Publish the doc website
+## 12. Publish the doc website
 
 1. Check out the {{ sedona_create_release.current_version }} Git tag on your local repo to a branch namely `branch-{{ sedona_create_release.current_version }}`
 2. Add the download link to [Download page](../download.md).

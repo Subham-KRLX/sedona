@@ -296,6 +296,46 @@ def ST_Azimuth(point_a: ColumnOrName, point_b: ColumnOrName) -> Column:
 
 
 @validate_argument_types
+def ST_ApproximateMedialAxis(
+    geometry: ColumnOrName, max_vertices: Optional[Union[ColumnOrName, int]] = None
+) -> Column:
+    """Compute an approximate medial axis of an areal geometry by computing the straight skeleton
+    and filtering to keep only interior edges. The medial axis provides a centerline representation
+    of polygons that is useful for various spatial analysis tasks.
+
+    :param geometry: Polygon or MultiPolygon geometry column to compute the medial axis for.
+    :type geometry: ColumnOrName
+    :param max_vertices: Optional maximum number of vertices to keep in the input geometry before computing.
+        If the geometry has more vertices, it will be simplified. This improves performance for complex geometries.
+    :type max_vertices: Optional[Union[ColumnOrName, int]]
+    :return: MultiLineString representing the approximate medial axis as a geometry column.
+    :rtype: Column
+    """
+    if max_vertices is not None:
+        return _call_st_function("ST_ApproximateMedialAxis", (geometry, max_vertices))
+    return _call_st_function("ST_ApproximateMedialAxis", geometry)
+
+
+@validate_argument_types
+def barrier(expression: ColumnOrName, *args) -> Column:
+    """Prevent filter pushdown and control predicate evaluation order in complex spatial joins.
+    This function creates an optimization barrier by evaluating boolean expressions at runtime.
+
+    :param expression: Boolean expression string to evaluate
+    :type expression: ColumnOrName
+    :param args: Variable name and value pairs (var_name1, var_value1, var_name2, var_value2, ...)
+    :return: Boolean result of the expression evaluation
+    :rtype: Column
+
+    Example:
+        df.where(barrier('rating > 4.0 AND stars >= 4',
+                        'rating', col('r.rating'),
+                        'stars', col('h.stars')))
+    """
+    return _call_st_function("barrier", (expression,) + args)
+
+
+@validate_argument_types
 def ST_BestSRID(geometry: ColumnOrName) -> Column:
     """Estimates the best SRID (EPSG code) of the geometry.
 
@@ -429,6 +469,20 @@ def ST_ClosestPoint(a: ColumnOrName, b: ColumnOrName) -> Column:
     :rtype: Column
     """
     return _call_st_function("ST_ClosestPoint", (a, b))
+
+
+@validate_argument_types
+def ST_ShortestLine(a: ColumnOrName, b: ColumnOrName) -> Column:
+    """Return the shortest line between two geometries.
+
+    :param a: One geometry column.
+    :type a: ColumnOrName
+    :param b: Other geometry column.
+    :type b: ColumnOrName
+    :return: Shortest LineString connecting the two geometries as a geometry column.
+    :rtype: Column
+    """
+    return _call_st_function("ST_ShortestLine", (a, b))
 
 
 @validate_argument_types
@@ -596,6 +650,20 @@ def ST_EndPoint(line_string: ColumnOrName) -> Column:
 
 
 @validate_argument_types
+def ST_Box2D(geometry: ColumnOrName) -> Column:
+    """Get the planar bounding box (Box2D) of a geometry.
+
+    Returns NULL for null or empty input.
+
+    :param geometry: Geometry column to compute the bounding box of.
+    :type geometry: ColumnOrName
+    :return: Box2D bounding box of the geometry.
+    :rtype: Column
+    """
+    return _call_st_function("ST_Box2D", geometry)
+
+
+@validate_argument_types
 def ST_Envelope(geometry: ColumnOrName) -> Column:
     """Calculate the envelope boundary of a geometry column.
 
@@ -724,6 +792,36 @@ def ST_GeoHash(geometry: ColumnOrName, precision: Union[ColumnOrName, int]) -> C
 
 
 @validate_argument_types
+def ST_GeoHashNeighbors(geohash: ColumnOrName) -> Column:
+    """Return the 8 neighboring geohash cells of the given geohash string.
+
+    The neighbors are returned in the order: [N, NE, E, SE, S, SW, W, NW].
+
+    :param geohash: Geohash string column.
+    :type geohash: ColumnOrName
+    :return: Array of 8 neighboring geohash strings.
+    :rtype: Column
+    """
+    return _call_st_function("ST_GeoHashNeighbors", (geohash,))
+
+
+@validate_argument_types
+def ST_GeoHashNeighbor(
+    geohash: ColumnOrName, direction: Union[ColumnOrName, str]
+) -> Column:
+    """Return the neighboring geohash cell in the specified direction.
+
+    :param geohash: Geohash string column.
+    :type geohash: ColumnOrName
+    :param direction: Compass direction: 'n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'.
+    :type direction: Union[ColumnOrName, str]
+    :return: Neighboring geohash string.
+    :rtype: Column
+    """
+    return _call_st_function("ST_GeoHashNeighbor", (geohash, direction))
+
+
+@validate_argument_types
 def ST_GeometricMedian(
     geometry: ColumnOrName,
     tolerance: Optional[Union[ColumnOrName, float]] = 1e-6,
@@ -845,6 +943,143 @@ def ST_H3ToGeom(cells: Union[ColumnOrName, list]) -> Column:
     :rtype: Geometry
     """
     return _call_st_function("ST_H3ToGeom", cells)
+
+
+# =========================================================================
+# Bing Tile functions
+# =========================================================================
+
+
+@validate_argument_types
+def ST_BingTile(
+    tile_x: Union[ColumnOrName, int],
+    tile_y: Union[ColumnOrName, int],
+    zoom_level: Union[ColumnOrName, int],
+) -> Column:
+    """Create a Bing tile quadkey from XY coordinates and zoom level.
+    :param tile_x: Tile X coordinate
+    :type tile_x: Union[ColumnOrName, int]
+    :param tile_y: Tile Y coordinate
+    :type tile_y: Union[ColumnOrName, int]
+    :param zoom_level: Zoom level (1 to 23)
+    :type zoom_level: Union[ColumnOrName, int]
+    :return: Quadkey string
+    :rtype: Column
+    """
+    args = (tile_x, tile_y, zoom_level)
+    return _call_st_function("ST_BingTile", args)
+
+
+@validate_argument_types
+def ST_BingTileAt(
+    longitude: Union[ColumnOrName, float],
+    latitude: Union[ColumnOrName, float],
+    zoom_level: Union[ColumnOrName, int],
+) -> Column:
+    """Return the Bing tile quadkey containing the given point at the specified zoom level.
+    :param longitude: Longitude (-180 to 180)
+    :type longitude: Union[ColumnOrName, float]
+    :param latitude: Latitude (-85.05112878 to 85.05112878)
+    :type latitude: Union[ColumnOrName, float]
+    :param zoom_level: Zoom level (1 to 23)
+    :type zoom_level: Union[ColumnOrName, int]
+    :return: Quadkey string
+    :rtype: Column
+    """
+    args = (longitude, latitude, zoom_level)
+    return _call_st_function("ST_BingTileAt", args)
+
+
+@validate_argument_types
+def ST_BingTilesAround(
+    longitude: Union[ColumnOrName, float],
+    latitude: Union[ColumnOrName, float],
+    zoom_level: Union[ColumnOrName, int],
+) -> Column:
+    """Return the 3x3 neighborhood of Bing tiles around the tile containing the specified point.
+    :param longitude: Longitude
+    :type longitude: Union[ColumnOrName, float]
+    :param latitude: Latitude
+    :type latitude: Union[ColumnOrName, float]
+    :param zoom_level: Zoom level (1 to 23)
+    :type zoom_level: Union[ColumnOrName, int]
+    :return: Array of quadkey strings
+    :rtype: Column
+    """
+    args = (longitude, latitude, zoom_level)
+    return _call_st_function("ST_BingTilesAround", args)
+
+
+@validate_argument_types
+def ST_BingTileZoomLevel(quad_key: ColumnOrName) -> Column:
+    """Return the zoom level of a Bing tile quadkey.
+    :param quad_key: Quadkey string
+    :type quad_key: ColumnOrName
+    :return: Zoom level
+    :rtype: Column
+    """
+    return _call_st_function("ST_BingTileZoomLevel", quad_key)
+
+
+@validate_argument_types
+def ST_BingTileX(quad_key: ColumnOrName) -> Column:
+    """Return the X coordinate of a Bing tile from its quadkey.
+    :param quad_key: Quadkey string
+    :type quad_key: ColumnOrName
+    :return: Tile X coordinate
+    :rtype: Column
+    """
+    return _call_st_function("ST_BingTileX", quad_key)
+
+
+@validate_argument_types
+def ST_BingTileY(quad_key: ColumnOrName) -> Column:
+    """Return the Y coordinate of a Bing tile from its quadkey.
+    :param quad_key: Quadkey string
+    :type quad_key: ColumnOrName
+    :return: Tile Y coordinate
+    :rtype: Column
+    """
+    return _call_st_function("ST_BingTileY", quad_key)
+
+
+@validate_argument_types
+def ST_BingTilePolygon(quad_key: ColumnOrName) -> Column:
+    """Return the polygon representation of a Bing tile given its quadkey.
+    :param quad_key: Quadkey string
+    :type quad_key: ColumnOrName
+    :return: Tile polygon geometry
+    :rtype: Column
+    """
+    return _call_st_function("ST_BingTilePolygon", quad_key)
+
+
+@validate_argument_types
+def ST_BingTileCellIDs(
+    geometry: ColumnOrName,
+    zoom_level: Union[ColumnOrName, int],
+) -> Column:
+    """Return the minimum set of Bing tile quadkeys that fully cover a given geometry at the specified zoom level.
+    :param geometry: Geometry to cover
+    :type geometry: ColumnOrName
+    :param zoom_level: Zoom level (1 to 23)
+    :type zoom_level: Union[ColumnOrName, int]
+    :return: Array of quadkey strings
+    :rtype: Column
+    """
+    args = (geometry, zoom_level)
+    return _call_st_function("ST_BingTileCellIDs", args)
+
+
+@validate_argument_types
+def ST_BingTileToGeom(quad_keys: Union[ColumnOrName, list]) -> Column:
+    """Convert an array of Bing tile quadkeys to their polygon geometries.
+    :param quad_keys: Array of quadkey strings
+    :type quad_keys: Union[ColumnOrName, list]
+    :return: Array of polygon geometries
+    :rtype: Column
+    """
+    return _call_st_function("ST_BingTileToGeom", quad_keys)
 
 
 @validate_argument_types
@@ -1556,6 +1791,44 @@ def ST_NumInteriorRing(geometry: ColumnOrName) -> Column:
 
 
 @validate_argument_types
+def ST_OrientedEnvelope(geometry: ColumnOrName) -> Column:
+    """Return the minimum rotated rectangle enclosing a geometry.
+
+    :param geometry: Geometry column to compute oriented envelope for.
+    :type geometry: ColumnOrName
+    :return: Minimum area rotated rectangle as a geometry column.
+    :rtype: Column
+    """
+    return _call_st_function("ST_OrientedEnvelope", geometry)
+
+
+@validate_argument_types
+def ST_OffsetCurve(
+    geometry: ColumnOrName,
+    distance: ColumnOrNameOrNumber,
+    quadrant_segments: Optional[Union[ColumnOrName, int]] = None,
+) -> Column:
+    """Return a line at a given offset distance from a linear geometry.
+
+    Positive distance offsets to the left, negative to the right.
+
+    :param geometry: Linear geometry column.
+    :type geometry: ColumnOrName
+    :param distance: Offset distance.
+    :type distance: ColumnOrNameOrNumber
+    :param quadrant_segments: Number of segments to approximate a quarter circle (default 8).
+    :type quadrant_segments: Optional[Union[ColumnOrName, int]]
+    :return: Offset curve as a geometry column.
+    :rtype: Column
+    """
+    if quadrant_segments is None:
+        args = (geometry, distance)
+    else:
+        args = (geometry, distance, quadrant_segments)
+    return _call_st_function("ST_OffsetCurve", args)
+
+
+@validate_argument_types
 def ST_PointN(geometry: ColumnOrName, n: Union[ColumnOrName, int]) -> Column:
     """Get the n-th point (starts at 1) for a geometry.
 
@@ -1761,6 +2034,27 @@ def ST_StartPoint(line_string: ColumnOrName) -> Column:
     :rtype: Column
     """
     return _call_st_function("ST_StartPoint", line_string)
+
+
+@validate_argument_types
+def ST_StraightSkeleton(
+    geometry: ColumnOrName, max_vertices: Optional[Union[ColumnOrName, int]] = None
+) -> Column:
+    """Compute the straight skeleton of an areal geometry. The straight skeleton is a method
+    of representing a polygon by a topological skeleton formed by a continuous shrinking process
+    where each edge moves inward in parallel at a uniform speed.
+
+    :param geometry: Polygon or MultiPolygon geometry column to compute the straight skeleton for.
+    :type geometry: ColumnOrName
+    :param max_vertices: Optional maximum number of vertices to keep in the input geometry before computing.
+        If the geometry has more vertices, it will be simplified. This improves performance for complex geometries.
+    :type max_vertices: Optional[Union[ColumnOrName, int]]
+    :return: MultiLineString representing the straight skeleton as a geometry column.
+    :rtype: Column
+    """
+    if max_vertices is not None:
+        return _call_st_function("ST_StraightSkeleton", (geometry, max_vertices))
+    return _call_st_function("ST_StraightSkeleton", geometry)
 
 
 @validate_argument_types

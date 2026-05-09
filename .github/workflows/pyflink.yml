@@ -39,6 +39,9 @@ on:
       - 'python/**'
       - '.github/workflows/pyflink.yml'
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -48,29 +51,29 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        include:
-          - python: '3.10'
+        python: ['3.11', '3.10']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: 'zulu'
           java-version: '11'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python }}
-      - run: sudo apt-get -y install python3-pip python-dev-is-python3
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
       - run: mvn package -pl "org.apache.sedona:sedona-flink-shaded_2.12" -am -DskipTests
-      - run: sudo pip3 install -U setuptools
-      - run: sudo pip3 install -U wheel
-      - run: sudo pip3 install -U virtualenvwrapper
-      - run: python3 -m pip install uv
-      - run: cd python
-      - run: rm pyproject.toml
-      - run: uv init --no-workspace
-      - run: uv add apache-flink==1.20.1 shapely attr setuptools
-      - run: uv add pytest --dev
-      - run: |
-          wget https://repo1.maven.org/maven2/org/datasyslab/geotools-wrapper/1.8.0-33.1-rc1/geotools-wrapper-1.8.0-33.1-rc1.jar
+      - name: Install python package + flink extra
+        run: |
+          cd python
+          uv add apache-flink==1.20.1
+          uv sync
+      - name: Run PyFlink tests
+        run: |
+          wget -q https://repo1.maven.org/maven2/org/datasyslab/geotools-wrapper/1.8.0-33.1-rc1/geotools-wrapper-1.8.0-33.1-rc1.jar
           export SEDONA_PYFLINK_EXTRA_JARS=${PWD}/$(find flink-shaded/target -name sedona-flink*.jar),${PWD}/geotools-wrapper-1.8.0-33.1-rc1.jar
-          (cd python; PYTHONPATH=$(pwd) uv run pytest -v -s ./tests/flink)
+          cd python
+          PYTHONPATH=$(pwd) uv run pytest -v -s ./tests/flink

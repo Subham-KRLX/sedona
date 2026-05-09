@@ -22,7 +22,6 @@ from typing import Optional
 import datetime as python_datetime
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import dt
-from pystac import Item as PyStacItem
 from shapely.geometry.base import BaseGeometry
 
 
@@ -54,10 +53,23 @@ def get_collection_url(url: str, collection_id: Optional[str] = None) -> str:
 
 
 class CollectionClient:
-    def __init__(self, url: str, collection_id: Optional[str] = None):
+    def __init__(
+        self,
+        url: str,
+        collection_id: Optional[str] = None,
+        headers: Optional[dict] = None,
+    ):
+        """
+        Initializes a collection client for a STAC collection.
+
+        :param url: The base URL of the STAC API.
+        :param collection_id: The ID of the collection to access. If None, accesses the catalog root.
+        :param headers: Optional dictionary of HTTP headers for authentication.
+        """
         self.url = url
         self.collection_id = collection_id
         self.collection_url = get_collection_url(url, collection_id)
+        self.headers = headers if headers is not None else {}
         self.spark = SparkSession.getActiveSession()
 
     @staticmethod
@@ -164,7 +176,7 @@ class CollectionClient:
                         )
                     )
                 except (ValueError, TypeError, AttributeError):
-                    # Skip invalid geometries rather than failing  # nosec B112
+                    # Skip invalid geometries rather than failing
                     continue
 
             if geometry_conditions:
@@ -320,7 +332,7 @@ class CollectionClient:
         ] = None,
         datetime: Optional[Union[str, python_datetime.datetime, list]] = None,
         max_items: Optional[int] = None,
-    ) -> Iterator[PyStacItem]:
+    ) -> Iterator:
         """
         Returns an iterator of items. Each item has the supplied item ID and/or optional spatial and temporal extents.
 
@@ -342,6 +354,14 @@ class CollectionClient:
         """
         try:
             df = self.load_items_df(bbox, geometry, datetime, ids, max_items)
+
+            # Import pystac only when needed
+            try:
+                from pystac import Item as PyStacItem
+            except ImportError as e:
+                raise ImportError(
+                    "STAC functionality requires pystac. Please install pystac: pip install pystac"
+                ) from e
 
             # Collect the filtered rows and convert them to PyStacItem objects
             items = []
@@ -476,6 +496,22 @@ class CollectionClient:
         return df
 
     def load_items_df(self, bbox, geometry, datetime, ids, max_items):
+        """
+        Loads items from the STAC collection as a Spark DataFrame.
+
+        This method handles the conversion of headers to Spark options and
+        applies various filters to the data.
+        """
+        import json
+
+        # Prepare Spark DataFrameReader with headers if present
+        reader = self.spark.read.format("stac")
+
+        # Encode headers as JSON string for passing to Spark
+        if self.headers:
+            headers_json = json.dumps(self.headers)
+            reader = reader.option("headers", headers_json)
+
         # Load the collection data from the specified collection URL
         if (
             not ids
@@ -484,13 +520,9 @@ class CollectionClient:
             and not datetime
             and max_items is not None
         ):
-            df = (
-                self.spark.read.format("stac")
-                .option("itemsLimitMax", max_items)
-                .load(self.collection_url)
-            )
+            df = reader.option("itemsLimitMax", max_items).load(self.collection_url)
         else:
-            df = self.spark.read.format("stac").load(self.collection_url)
+            df = reader.load(self.collection_url)
             # Apply ID filters if provided
             if ids:
                 if isinstance(ids, tuple):

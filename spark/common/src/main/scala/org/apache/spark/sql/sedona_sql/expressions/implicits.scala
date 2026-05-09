@@ -18,13 +18,14 @@
  */
 package org.apache.spark.sql.sedona_sql.expressions
 
+import org.apache.sedona.common.S2Geography.{Geography, GeographyWKBSerializer}
+import org.apache.sedona.common.geometryObjects.Box2D
 import org.apache.sedona.sql.utils.GeometrySerializer
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.util.ArrayData
 import org.apache.spark.unsafe.types.UTF8String
 import org.locationtech.jts.geom.{Geometry, GeometryFactory, Point}
-import org.apache.sedona.common.geometryObjects.Geography
 
 object implicits {
 
@@ -67,7 +68,38 @@ object implicits {
           serdeAware.evalWithoutSerialization(input).asInstanceOf[Geography]
         case _ =>
           inputExpression.eval(input).asInstanceOf[Array[Byte]] match {
-            case binary: Array[Byte] => new Geography(GeometrySerializer.deserialize(binary))
+            case binary: Array[Byte] => GeographyWKBSerializer.deserialize(binary)
+            case _ => null
+          }
+      }
+    }
+
+    def toBox2D(input: InternalRow): Box2D = {
+      inputExpression match {
+        case serdeAware: SerdeAware =>
+          serdeAware.evalWithoutSerialization(input).asInstanceOf[Box2D]
+        case _ =>
+          inputExpression.eval(input) match {
+            case row: InternalRow =>
+              new Box2D(row.getDouble(0), row.getDouble(1), row.getDouble(2), row.getDouble(3))
+            case _ => null
+          }
+      }
+    }
+
+    def toGeographyArray(input: InternalRow): Array[Geography] = {
+      inputExpression match {
+        case aware: SerdeAware =>
+          aware.evalWithoutSerialization(input).asInstanceOf[Array[Geography]]
+        case _ =>
+          inputExpression.eval(input).asInstanceOf[ArrayData] match {
+            case arrayData: ArrayData =>
+              val length = arrayData.numElements()
+              val geographyies = new Array[Geography](length)
+              for (i <- 0 until length) {
+                geographyies(i) = arrayData.getBinary(i).toGeography
+              }
+              geographyies
             case _ => null
           }
       }
@@ -109,6 +141,24 @@ object implicits {
       }
     }
 
+    def toGeographyList(input: InternalRow): java.util.List[Geography] = {
+      inputExpression match {
+        case aware: SerdeAware =>
+          aware.evalWithoutSerialization(input).asInstanceOf[java.util.List[Geography]]
+        case _ =>
+          inputExpression.eval(input).asInstanceOf[ArrayData] match {
+            case arrayData: ArrayData =>
+              val length = arrayData.numElements()
+              val geometries = new java.util.ArrayList[Geography]()
+              for (i <- 0 until length) {
+                geometries.add(arrayData.getBinary(i).toGeography)
+              }
+              geometries.asInstanceOf[java.util.List[Geography]]
+            case _ => null
+          }
+      }
+    }
+
     def toInt(input: InternalRow): Int = {
       inputExpression.eval(input).asInstanceOf[Int]
     }
@@ -142,6 +192,11 @@ object implicits {
         case _ => null
       }
     }
+    def toGeography: Geography =
+      arrayData match {
+        case binary: Array[Byte] => GeographyWKBSerializer.deserialize(binary)
+        case _ => null
+      }
   }
 
   implicit class GeometryEnhancer(geom: Geometry) {
@@ -157,6 +212,7 @@ object implicits {
 
   implicit class GeographyEnhancer(geog: Geography) {
 
-    def toGenericArrayData: Array[Byte] = GeometrySerializer.serialize(geog.getGeometry)
+    def toGenericArrayData: Array[Byte] = GeographyWKBSerializer.serialize(geog)
   }
+
 }

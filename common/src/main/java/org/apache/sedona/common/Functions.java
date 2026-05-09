@@ -28,12 +28,16 @@ import java.util.*;
 import java.util.List;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.sedona.common.S2Geography.Geography;
+import org.apache.sedona.common.approximate.StraightSkeleton;
+import org.apache.sedona.common.geometryObjects.Box2D;
 import org.apache.sedona.common.geometryObjects.Circle;
-import org.apache.sedona.common.geometryObjects.Geography;
+import org.apache.sedona.common.jts2geojson.GeoJSONWriter;
 import org.apache.sedona.common.sphere.Spheroid;
 import org.apache.sedona.common.subDivide.GeometrySubDivider;
 import org.apache.sedona.common.utils.*;
 import org.locationtech.jts.algorithm.Angle;
+import org.locationtech.jts.algorithm.MinimumAreaRectangle;
 import org.locationtech.jts.algorithm.MinimumBoundingCircle;
 import org.locationtech.jts.algorithm.Orientation;
 import org.locationtech.jts.algorithm.construct.LargestEmptyCircle;
@@ -51,6 +55,7 @@ import org.locationtech.jts.io.kml.KMLWriter;
 import org.locationtech.jts.linearref.LengthIndexedLine;
 import org.locationtech.jts.operation.buffer.BufferOp;
 import org.locationtech.jts.operation.buffer.BufferParameters;
+import org.locationtech.jts.operation.buffer.OffsetCurve;
 import org.locationtech.jts.operation.distance.DistanceOp;
 import org.locationtech.jts.operation.distance3d.Distance3DOp;
 import org.locationtech.jts.operation.linemerge.LineMerger;
@@ -67,12 +72,15 @@ import org.locationtech.jts.simplify.PolygonHullSimplifier;
 import org.locationtech.jts.simplify.TopologyPreservingSimplifier;
 import org.locationtech.jts.simplify.VWSimplifier;
 import org.locationtech.jts.triangulate.DelaunayTriangulationBuilder;
+import org.locationtech.jts.triangulate.VoronoiDiagramBuilder;
 import org.locationtech.jts.triangulate.polygon.ConstrainedDelaunayTriangulator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.wololo.geojson.Feature;
 import org.wololo.geojson.FeatureCollection;
-import org.wololo.jts2geojson.GeoJSONWriter;
 
 public class Functions {
+  private static final Logger log = LoggerFactory.getLogger(Functions.class);
   private static final double DEFAULT_TOLERANCE = 1e-6;
   private static final int DEFAULT_MAX_ITER = 1000;
   private static final int OGC_SFS_VALIDITY = 0; // Use usual OGC SFS validity semantics
@@ -199,11 +207,14 @@ public class Functions {
     return Math.sqrt(closest);
   }
 
-  public static double azimuth(Geometry left, Geometry right) {
+  public static Double azimuth(Geometry left, Geometry right) {
     Coordinate leftCoordinate = left.getCoordinate();
     Coordinate rightCoordinate = right.getCoordinate();
     double deltaX = rightCoordinate.x - leftCoordinate.x;
     double deltaY = rightCoordinate.y - leftCoordinate.y;
+    if (deltaX == 0 && deltaY == 0) {
+      return null;
+    }
     double azimuth = Math.atan2(deltaX, deltaY);
     return azimuth < 0 ? azimuth + (2 * Math.PI) : azimuth;
   }
@@ -222,6 +233,28 @@ public class Functions {
 
   public static Geometry expand(Geometry geometry, double deltaX, double deltaY) {
     return expand(geometry, deltaX, deltaY, 0);
+  }
+
+  /** Expand a {@link Box2D} uniformly on both axes. NULL on null input. */
+  public static Box2D expand(Box2D box, double uniformDelta) {
+    return expand(box, uniformDelta, uniformDelta);
+  }
+
+  /**
+   * Expand a {@link Box2D} by the given per-axis deltas. Negative deltas shrink the bbox; if a
+   * negative delta produces {@code xmin > xmax} or {@code ymin > ymax}, the resulting Box2D is
+   * returned as-is (callers can detect the degenerate result via the accessor functions). NULL on
+   * null input.
+   */
+  public static Box2D expand(Box2D box, double deltaX, double deltaY) {
+    if (box == null) {
+      return null;
+    }
+    return new Box2D(
+        box.getXMin() - deltaX,
+        box.getYMin() - deltaY,
+        box.getXMax() + deltaX,
+        box.getYMax() + deltaY);
   }
 
   public static Geometry expand(Geometry geometry, double deltaX, double deltaY, double deltaZ) {
@@ -262,9 +295,7 @@ public class Functions {
       newCoords[4] = newCoords[0];
       return geometry.getFactory().createPolygon(newCoords);
     }
-    Geometry result = Constructors.polygonFromEnvelope(minX, minY, maxX, maxY);
-    result.setSRID(geometry.getSRID());
-    return result;
+    return Constructors.polygonFromEnvelope(minX, minY, maxX, maxY, geometry.getFactory());
   }
 
   public static Geometry buffer(Geometry geometry, double radius) {
@@ -415,6 +446,20 @@ public class Functions {
       }
     }
     return bufferParameters;
+  }
+
+  public static Geometry offsetCurve(Geometry geometry, double distance) {
+    return offsetCurve(geometry, distance, BufferParameters.DEFAULT_QUADRANT_SEGMENTS);
+  }
+
+  public static Geometry offsetCurve(Geometry geometry, double distance, int quadrantSegments) {
+    if (geometry.isEmpty()) {
+      return null;
+    }
+    BufferParameters bufferParameters = new BufferParameters();
+    bufferParameters.setQuadrantSegments(quadrantSegments);
+    OffsetCurve oc = new OffsetCurve(geometry, distance, bufferParameters);
+    return oc.getCurve();
   }
 
   public static int bestSRID(Geometry geometry) throws IllegalArgumentException {
@@ -571,10 +616,20 @@ public class Functions {
   }
 
   public static Geometry envelope(Geometry geometry) {
+    if (geometry.isEmpty()) {
+      return geometry;
+    }
     return geometry.getEnvelope();
   }
 
-  public static double distance(Geometry left, Geometry right) {
+  public static Box2D box2D(Geometry geometry) {
+    return Box2D.fromGeometry(geometry);
+  }
+
+  public static Double distance(Geometry left, Geometry right) {
+    if (left.isEmpty() || right.isEmpty()) {
+      return null;
+    }
     return left.distance(right);
   }
 
@@ -657,40 +712,56 @@ public class Functions {
     return max == -Double.MAX_VALUE ? null : max;
   }
 
-  public static double xMin(Geometry geometry) {
+  public static Double xMin(Geometry geometry) {
     Coordinate[] points = geometry.getCoordinates();
     double min = Double.MAX_VALUE;
     for (int i = 0; i < points.length; i++) {
       min = Math.min(points[i].getX(), min);
     }
-    return min;
+    return min == Double.MAX_VALUE ? null : min;
   }
 
-  public static double xMax(Geometry geometry) {
+  public static Double xMin(Box2D box) {
+    return box == null ? null : box.getXMin();
+  }
+
+  public static Double xMax(Geometry geometry) {
     Coordinate[] points = geometry.getCoordinates();
     double max = -Double.MAX_VALUE;
     for (int i = 0; i < points.length; i++) {
       max = Math.max(points[i].getX(), max);
     }
-    return max;
+    return max == -Double.MAX_VALUE ? null : max;
   }
 
-  public static double yMin(Geometry geometry) {
+  public static Double xMax(Box2D box) {
+    return box == null ? null : box.getXMax();
+  }
+
+  public static Double yMin(Geometry geometry) {
     Coordinate[] points = geometry.getCoordinates();
     double min = Double.MAX_VALUE;
     for (int i = 0; i < points.length; i++) {
       min = Math.min(points[i].getY(), min);
     }
-    return min;
+    return min == Double.MAX_VALUE ? null : min;
   }
 
-  public static double yMax(Geometry geometry) {
+  public static Double yMin(Box2D box) {
+    return box == null ? null : box.getYMin();
+  }
+
+  public static Double yMax(Geometry geometry) {
     Coordinate[] points = geometry.getCoordinates();
     double max = -Double.MAX_VALUE;
     for (int i = 0; i < points.length; i++) {
       max = Math.max(points[i].getY(), max);
     }
-    return max;
+    return max == -Double.MAX_VALUE ? null : max;
+  }
+
+  public static Double yMax(Box2D box) {
+    return box == null ? null : box.getYMax();
   }
 
   public static Double zMax(Geometry geometry) {
@@ -730,6 +801,33 @@ public class Functions {
 
   public static String geohash(Geometry geometry, int precision) {
     return GeometryGeoHashEncoder.calculate(geometry, precision);
+  }
+
+  /**
+   * Returns the 8 neighbors of the given geohash in the order: [N, NE, E, SE, S, SW, W, NW].
+   *
+   * @param geohash a geohash string (1-12 characters, lowercase base32)
+   * @return an array of 8 neighbor geohash strings, or null if the input is null or empty
+   * @throws IllegalArgumentException if the geohash exceeds 12 characters
+   */
+  public static String[] geohashNeighbors(String geohash) {
+    return GeoHashNeighbor.getNeighbors(geohash);
+  }
+
+  /**
+   * Returns a single neighbor of the given geohash in the specified direction.
+   *
+   * <p>Accepted direction values (case-insensitive): {@code "N"}, {@code "NE"}, {@code "E"}, {@code
+   * "SE"}, {@code "S"}, {@code "SW"}, {@code "W"}, {@code "NW"}.
+   *
+   * @param geohash a geohash string (1-12 characters, lowercase base32)
+   * @param direction the compass direction of the desired neighbor
+   * @return the neighbor geohash string, or null if either input is null or empty
+   * @throws IllegalArgumentException if the geohash exceeds 12 characters or the direction is
+   *     invalid
+   */
+  public static String geohashNeighbor(String geohash, String direction) {
+    return GeoHashNeighbor.getNeighbor(geohash, direction);
   }
 
   public static Geometry pointOnSurface(Geometry geometry) {
@@ -785,11 +883,38 @@ public class Functions {
   }
 
   public static String asEWKT(Geography geography) {
-    return asEWKT(geography.getGeometry());
+    return asEWKT(geography);
   }
 
   public static String asWKT(Geometry geometry) {
     return GeomUtils.getWKT(geometry);
+  }
+
+  /**
+   * PostGIS-format text for a Box2D: {@code BOX(x1 y1, x2 y2)}. NULL on null input.
+   *
+   * <p>Values are emitted exactly as stored on the Box2D — this method does not normalize the
+   * corners. Sedona's Box2D allows {@code xmin > xmax} (or {@code ymin > ymax}); that ordering is
+   * reserved for a future antimeridian-wraparound semantics on geography bboxes (cf. sedona-db's
+   * {@code WraparoundInterval}). The text faithfully reflects what {@code ST_XMin} / {@code
+   * ST_XMax} / etc. would return.
+   *
+   * <p>Not WKT (WKT has no {@code BOX} type), so this lives outside the {@code asWKT} family to
+   * keep that API a true geometry serializer.
+   */
+  public static String box2dAsText(Box2D box) {
+    if (box == null) {
+      return null;
+    }
+    return "BOX("
+        + box.getXMin()
+        + " "
+        + box.getYMin()
+        + ", "
+        + box.getXMax()
+        + " "
+        + box.getYMax()
+        + ")";
   }
 
   public static byte[] asEWKB(Geometry geometry) {
@@ -797,7 +922,7 @@ public class Functions {
   }
 
   public static byte[] asEWKB(Geography geography) {
-    return asEWKB(geography.getGeometry());
+    return asEWKB(geography);
   }
 
   public static String asHexEWKB(Geometry geom, String endian) {
@@ -912,7 +1037,12 @@ public class Functions {
             geometry.getPrecisionModel(),
             srid,
             geometry.getFactory().getCoordinateSequenceFactory());
-    return factory.createGeometry(geometry);
+    Geometry newGeom = factory.createGeometry(geometry);
+    // Workaround for JTS bug: GeometryEditor.editPolygon returns the original
+    // empty polygon without copying it to the new factory, so the SRID is not
+    // updated for POLYGON EMPTY (and similar empty geometry types).
+    newGeom.setSRID(srid);
+    return newGeom;
   }
 
   public static int getSRID(Geometry geometry) {
@@ -1070,6 +1200,15 @@ public class Functions {
     }
   }
 
+  public static Geometry shortestLine(Geometry left, Geometry right) {
+    if (left.isEmpty() || right.isEmpty()) {
+      return null;
+    }
+    DistanceOp distanceOp = new DistanceOp(left, right);
+    Coordinate[] closestPoints = distanceOp.nearestPoints();
+    return left.getFactory().createLineString(closestPoints);
+  }
+
   public static Geometry delaunayTriangle(Geometry geometry) {
     return delaunayTriangle(geometry, 0.0, 0);
   }
@@ -1107,6 +1246,23 @@ public class Functions {
     }
     // geom is 2D
     return 0;
+  }
+
+  public static Geometry voronoiPolygons(Geometry geom, double tolerance, Geometry extendTo) {
+    if (geom == null) {
+      return null;
+    }
+    VoronoiDiagramBuilder builder = new VoronoiDiagramBuilder();
+    builder.setSites(geom);
+    builder.setTolerance(tolerance);
+    if (extendTo != null) {
+      builder.setClipEnvelope(extendTo.getEnvelopeInternal());
+    } else {
+      Envelope e = geom.getEnvelopeInternal();
+      e.expandBy(Math.max(e.getWidth(), e.getHeight()));
+      builder.setClipEnvelope(e);
+    }
+    return builder.getDiagram(geom.getFactory());
   }
 
   public static Geometry concaveHull(Geometry geometry, double pctConvex, boolean allowHoles) {
@@ -1152,6 +1308,9 @@ public class Functions {
   }
 
   public static Geometry lineMerge(Geometry geometry) {
+    if (geometry instanceof LineString) {
+      return geometry;
+    }
     if (geometry instanceof MultiLineString) {
       MultiLineString multiLineString = (MultiLineString) geometry;
       int numLineStrings = multiLineString.getNumGeometries();
@@ -1166,7 +1325,9 @@ public class Functions {
       } else {
         // if the merger couldn't join the lines, it will contain the individual lines, so return
         // the input
-        return geometry;
+        Object[] mergedLines = merger.getMergedLineStrings().toArray(new LineString[] {});
+        multiLineString = geometry.getFactory().createMultiLineString((LineString[]) mergedLines);
+        return multiLineString;
       }
     }
     return geometry.getFactory().createGeometryCollection();
@@ -1216,6 +1377,10 @@ public class Functions {
       }
     }
     return circle;
+  }
+
+  public static Geometry orientedEnvelope(Geometry geometry) {
+    return MinimumAreaRectangle.getMinimumRectangle(geometry);
   }
 
   public static InscribedCircle maximumInscribedCircle(Geometry geometry) {
@@ -1269,6 +1434,7 @@ public class Functions {
   }
 
   public static Geometry lineInterpolatePoint(Geometry geom, double fraction) {
+    if (geom.isEmpty()) return geom.getFactory().createPoint();
     double length = geom.getLength();
     LengthIndexedLine indexedLine = new LengthIndexedLine(geom);
     Coordinate interPoint = indexedLine.extractPoint(length * fraction);
@@ -1414,7 +1580,8 @@ public class Functions {
     return ConstrainedDelaunayTriangulator.triangulate(geom);
   }
 
-  public static double lineLocatePoint(Geometry geom, Geometry point) {
+  public static Double lineLocatePoint(Geometry geom, Geometry point) {
+    if (geom.isEmpty() || point.isEmpty()) return null;
     double length = geom.getLength();
     LengthIndexedLine indexedLine = new LengthIndexedLine(geom);
     return indexedLine.indexOf(point.getCoordinate()) / length;
@@ -1765,6 +1932,131 @@ public class Functions {
     return polygons.toArray(new Polygon[0]);
   }
 
+  // =========================================================================
+  // Bing Tile functions
+  // =========================================================================
+
+  /**
+   * Creates a Bing tile quadkey from tile XY coordinates and zoom level.
+   *
+   * @param tileX the tile X coordinate
+   * @param tileY the tile Y coordinate
+   * @param zoomLevel the zoom level (1 to 23)
+   * @return the quadkey string
+   */
+  public static String bingTile(int tileX, int tileY, int zoomLevel) {
+    return BingTile.fromCoordinates(tileX, tileY, zoomLevel).toQuadKey();
+  }
+
+  /**
+   * Returns the Bing tile quadkey at a given zoom level containing the specified point.
+   *
+   * @param longitude the longitude (-180 to 180)
+   * @param latitude the latitude (-85.05112878 to 85.05112878)
+   * @param zoomLevel the zoom level (1 to 23)
+   * @return the quadkey string
+   */
+  public static String bingTileAt(double longitude, double latitude, int zoomLevel) {
+    return BingTile.fromLatLon(latitude, longitude, zoomLevel).toQuadKey();
+  }
+
+  /**
+   * Returns the 3x3 neighborhood of Bing tiles around the tile containing the specified point.
+   *
+   * @param longitude the longitude
+   * @param latitude the latitude
+   * @param zoomLevel the zoom level (1 to 23)
+   * @return array of quadkey strings
+   */
+  public static String[] bingTilesAround(double longitude, double latitude, int zoomLevel) {
+    List<BingTile> tiles = BingTile.tilesAround(latitude, longitude, zoomLevel);
+    return tiles.stream().map(BingTile::toQuadKey).toArray(String[]::new);
+  }
+
+  /**
+   * Returns the zoom level of a Bing tile quadkey.
+   *
+   * @param quadKey the quadkey string
+   * @return the zoom level
+   */
+  public static int bingTileZoomLevel(String quadKey) {
+    // Validate the quadkey by parsing it
+    BingTile.fromQuadKey(quadKey);
+    return quadKey.length();
+  }
+
+  /**
+   * Returns the X coordinate of a Bing tile from its quadkey.
+   *
+   * @param quadKey the quadkey string
+   * @return the tile X coordinate
+   */
+  public static int bingTileX(String quadKey) {
+    return BingTile.fromQuadKey(quadKey).getX();
+  }
+
+  /**
+   * Returns the Y coordinate of a Bing tile from its quadkey.
+   *
+   * @param quadKey the quadkey string
+   * @return the tile Y coordinate
+   */
+  public static int bingTileY(String quadKey) {
+    return BingTile.fromQuadKey(quadKey).getY();
+  }
+
+  /**
+   * Returns the polygon representation of a Bing tile given its quadkey.
+   *
+   * @param quadKey the quadkey string
+   * @return the tile polygon
+   */
+  public static Geometry bingTilePolygon(String quadKey) {
+    return BingTile.fromQuadKey(quadKey).toPolygon();
+  }
+
+  /**
+   * Validates and normalizes a Bing tile quadkey string.
+   *
+   * <p>The input quadkey is parsed into a {@code BingTile} for validation, and the corresponding
+   * (possibly normalized) quadkey string is returned. Invalid quadkeys will cause {@code
+   * BingTile.fromQuadKey} to throw an exception.
+   *
+   * @param quadKey the quadkey string to validate and normalize
+   * @return the validated and normalized quadkey string
+   */
+  public static String bingTileQuadKey(String quadKey) {
+    // Validate and return. This serves as a validation/normalization function.
+    return BingTile.fromQuadKey(quadKey).toQuadKey();
+  }
+
+  /**
+   * Returns the minimum set of Bing tile quadkeys that fully cover a given geometry at the
+   * specified zoom level.
+   *
+   * @param geometry the geometry to cover
+   * @param zoomLevel the zoom level (1 to 23)
+   * @return array of quadkey strings
+   */
+  public static String[] bingTileCellIDs(Geometry geometry, int zoomLevel) {
+    List<BingTile> tiles = BingTile.tilesCovering(geometry, zoomLevel);
+    return tiles.stream().map(BingTile::toQuadKey).toArray(String[]::new);
+  }
+
+  /**
+   * Converts an array of Bing tile quadkeys to their polygon geometries.
+   *
+   * @param quadKeys the array of quadkey strings
+   * @return array of polygon geometries
+   */
+  public static Geometry[] bingTileToGeom(String[] quadKeys) {
+    Geometry[] polygons = new Geometry[quadKeys.length];
+    for (int i = 0; i < quadKeys.length; i++) {
+      polygons[i] = BingTile.fromQuadKey(quadKeys[i]).toPolygon();
+    }
+    return polygons;
+  }
+
   public static Geometry simplify(Geometry geom, double distanceTolerance) {
     return DouglasPeuckerSimplifier.simplify(geom, distanceTolerance);
   }
@@ -1921,6 +2213,7 @@ public class Functions {
 
   public static Geometry makePolygon(Geometry shell, Geometry[] holes, GeometryFactory factory) {
     try {
+      LinearRing shellRing = factory.createLinearRing(shell.getCoordinates());
       if (holes != null) {
         LinearRing[] interiorRings =
             Arrays.stream(holes)
@@ -1933,20 +2226,17 @@ public class Functions {
                 .map(h -> factory.createLinearRing(h.getCoordinates()))
                 .toArray(LinearRing[]::new);
         if (interiorRings.length != 0) {
-          return factory.createPolygon(
-              factory.createLinearRing(shell.getCoordinates()),
-              Arrays.stream(holes)
-                  .filter(
-                      h ->
-                          h != null
-                              && !h.isEmpty()
-                              && h instanceof LineString
-                              && ((LineString) h).isClosed())
-                  .map(h -> factory.createLinearRing(h.getCoordinates()))
-                  .toArray(LinearRing[]::new));
+          Polygon shellPolygon = factory.createPolygon(shellRing);
+          for (LinearRing hole : interiorRings) {
+            Polygon holePolygon = factory.createPolygon(hole);
+            if (!shellPolygon.contains(holePolygon)) {
+              log.warn("Hole lies outside shell at or near point {}", hole.getCoordinate());
+            }
+          }
+          return factory.createPolygon(shellRing, interiorRings);
         }
       }
-      return factory.createPolygon(factory.createLinearRing(shell.getCoordinates()));
+      return factory.createPolygon(shellRing);
     } catch (IllegalArgumentException e) {
       return null;
     }
@@ -2302,7 +2592,7 @@ public class Functions {
     return geometricMedian(geometry, DEFAULT_TOLERANCE, DEFAULT_MAX_ITER, false);
   }
 
-  public static double frechetDistance(Geometry g1, Geometry g2) {
+  public static Double frechetDistance(Geometry g1, Geometry g2) {
     return GeomUtils.getFrechetDistance(g1, g2);
   }
 
@@ -2660,5 +2950,217 @@ public class Functions {
     // Interpolate the M value
     return fractionAlongLine * (end.getCoordinate().getM() - start.getCoordinate().getM())
         + start.getCoordinate().getM();
+  }
+
+  /**
+   * Computes the straight skeleton of an areal geometry. The straight skeleton is a method of
+   * representing a polygon by a topological skeleton, formed by a continuous shrinking process
+   * where each edge moves inward in parallel at a uniform speed.
+   *
+   * <p>This implementation uses the campskeleton library which implements the weighted straight
+   * skeleton algorithm based on Felkel's approach. The result represents the "skeleton" or
+   * centerline of the polygon.
+   *
+   * @param geometry The areal geometry (Polygon or MultiPolygon)
+   * @return A MultiLineString representing the straight skeleton, or null if input is null/empty
+   */
+  public static Geometry straightSkeleton(Geometry geometry) {
+    return straightSkeleton(geometry, 0);
+  }
+
+  /**
+   * Computes the straight skeleton of an areal geometry with optional vertex simplification.
+   *
+   * <p>The straight skeleton is a method of representing a polygon by a topological skeleton,
+   * formed by a continuous shrinking process where each edge moves inward in parallel at a uniform
+   * speed.
+   *
+   * <p>For polygons with many vertices, performance can be improved by limiting the vertex count.
+   * The algorithm will merge the shortest edges until the vertex count is reduced to the specified
+   * limit.
+   *
+   * @param geometry The areal geometry (Polygon or MultiPolygon)
+   * @param maxVertices Maximum number of vertices per polygon (0 to disable simplification).
+   *     Recommended: 100-500 for performance
+   * @return A MultiLineString representing the straight skeleton, or null if input is null/empty
+   */
+  public static Geometry straightSkeleton(Geometry geometry, Integer maxVertices) {
+    if (geometry == null || geometry.isEmpty()) {
+      return null;
+    }
+
+    // Check if the geometry is areal (Polygon or MultiPolygon)
+    if (!(geometry instanceof Polygon || geometry instanceof MultiPolygon)) {
+      throw new IllegalArgumentException(
+          "ST_StraightSkeleton only supports Polygon and MultiPolygon geometries");
+    }
+
+    GeometryFactory factory = geometry.getFactory();
+
+    // Use straight skeleton algorithm with optional simplification
+    int maxVerts = (maxVertices != null) ? maxVertices : 0;
+    return computeStraightSkeleton(geometry, factory, maxVerts);
+  }
+
+  /**
+   * Computes an approximate medial axis of an areal geometry by computing the straight skeleton and
+   * filtering to keep only interior edges.
+   *
+   * <p>The medial axis is approximated by first computing the straight skeleton, then filtering to
+   * keep only edges where both endpoints are interior to the polygon (not on the boundary). This
+   * produces a cleaner skeleton by removing branches that extend to the boundary.
+   *
+   * @param geometry The areal geometry (Polygon or MultiPolygon)
+   * @return A MultiLineString representing the approximate medial axis, or null if input is
+   *     null/empty
+   */
+  public static Geometry approximateMedialAxis(Geometry geometry) {
+    return approximateMedialAxis(geometry, 0);
+  }
+
+  /**
+   * Computes an approximate medial axis of an areal geometry by computing the straight skeleton and
+   * filtering to keep only interior edges, with optional vertex simplification.
+   *
+   * <p>The medial axis is approximated by first computing the straight skeleton, then filtering to
+   * keep only edges where both endpoints are interior to the polygon (not on the boundary). This
+   * produces a cleaner skeleton by removing branches that extend to the boundary.
+   *
+   * <p>For polygons with many vertices, performance can be improved by limiting the vertex count
+   * before computing the skeleton. The algorithm will merge the shortest edges until the vertex
+   * count is reduced to the specified limit.
+   *
+   * @param geometry The areal geometry (Polygon or MultiPolygon)
+   * @param maxVertices Maximum number of vertices per polygon (0 to disable simplification).
+   *     Recommended: 100-500 for performance
+   * @return A MultiLineString representing the approximate medial axis, or null if input is
+   *     null/empty
+   */
+  public static Geometry approximateMedialAxis(Geometry geometry, Integer maxVertices) {
+    if (geometry == null || geometry.isEmpty()) {
+      return null;
+    }
+
+    // Check if the geometry is areal (Polygon or MultiPolygon)
+    if (!(geometry instanceof Polygon || geometry instanceof MultiPolygon)) {
+      throw new IllegalArgumentException(
+          "ST_ApproximateMedialAxis only supports Polygon and MultiPolygon geometries");
+    }
+
+    GeometryFactory factory = geometry.getFactory();
+
+    // Compute the straight skeleton with optional vertex simplification
+    Geometry skeleton = straightSkeleton(geometry, maxVertices);
+
+    if (skeleton == null || skeleton.isEmpty()) {
+      return skeleton;
+    }
+
+    // Filter to keep only interior edges (not touching boundary)
+    return filterInteriorEdges(skeleton, geometry, factory);
+  }
+
+  /**
+   * Compute the straight skeleton of a geometry.
+   *
+   * <p>This method implements the straight skeleton algorithm, which simulates continuous inward
+   * movement of polygon edges to construct the skeleton. The algorithm processes edge and split
+   * events in temporal order.
+   *
+   * @param geometry The input geometry (Polygon or MultiPolygon)
+   * @param factory GeometryFactory for creating result geometries
+   * @return MultiLineString representing the straight skeleton
+   */
+  private static Geometry computeStraightSkeleton(
+      Geometry geometry, GeometryFactory factory, int maxVertices) {
+    try {
+      // Handle MultiPolygon by processing each polygon separately
+      if (geometry instanceof MultiPolygon) {
+        MultiPolygon multiPoly = (MultiPolygon) geometry;
+        java.util.List<LineString> allEdges = new java.util.ArrayList<>();
+
+        for (int i = 0; i < multiPoly.getNumGeometries(); i++) {
+          Polygon poly = (Polygon) multiPoly.getGeometryN(i);
+          StraightSkeleton skeleton = new StraightSkeleton();
+          Geometry skeletonGeom = skeleton.computeSkeleton(poly, maxVertices);
+
+          if (skeletonGeom != null && !skeletonGeom.isEmpty()) {
+            // Extract LineStrings from the skeleton geometry
+            for (int j = 0; j < skeletonGeom.getNumGeometries(); j++) {
+              allEdges.add((LineString) skeletonGeom.getGeometryN(j));
+            }
+          }
+        }
+
+        if (allEdges.isEmpty()) {
+          return factory.createMultiLineString(new LineString[0]);
+        }
+
+        Geometry result = factory.createMultiLineString(allEdges.toArray(new LineString[0]));
+        result.setSRID(geometry.getSRID());
+        return result;
+      } else {
+        // Single polygon
+        Polygon poly = (Polygon) geometry;
+        StraightSkeleton skeleton = new StraightSkeleton();
+        Geometry result = skeleton.computeSkeleton(poly, maxVertices);
+
+        if (result != null) {
+          result.setSRID(geometry.getSRID());
+        }
+
+        return result;
+      }
+    } catch (Exception e) {
+      return factory.createMultiLineString(new LineString[0]);
+    }
+  }
+
+  /**
+   * Filters skeleton edges to keep only interior edges (those that don't touch the polygon
+   * boundary).
+   *
+   * <p>An edge is considered interior if both of its endpoints are NOT on the polygon boundary.
+   * This produces a cleaner medial axis by removing all branches that extend to corners and edges.
+   *
+   * @param skeleton The straight skeleton as a MultiLineString
+   * @param polygon The original polygon geometry
+   * @param factory GeometryFactory for creating result geometries
+   * @return MultiLineString containing only interior skeleton edges
+   */
+  private static Geometry filterInteriorEdges(
+      Geometry skeleton, Geometry polygon, GeometryFactory factory) {
+    java.util.List<LineString> interiorEdges = new java.util.ArrayList<>();
+
+    // Get the polygon boundary for distance checking
+    Geometry boundary = polygon.getBoundary();
+
+    // Distance threshold for considering a point "on" the boundary
+    final double BOUNDARY_TOLERANCE = 1e-6;
+
+    // Check each skeleton edge
+    for (int i = 0; i < skeleton.getNumGeometries(); i++) {
+      LineString edge = (LineString) skeleton.getGeometryN(i);
+
+      Coordinate start = edge.getCoordinateN(0);
+      Coordinate end = edge.getCoordinateN(edge.getNumPoints() - 1);
+
+      // Check if both endpoints are interior (not on boundary)
+      Point startPoint = factory.createPoint(start);
+      Point endPoint = factory.createPoint(end);
+
+      double startDist = boundary.distance(startPoint);
+      double endDist = boundary.distance(endPoint);
+
+      // Keep edge only if BOTH endpoints are interior (away from boundary)
+      if (startDist > BOUNDARY_TOLERANCE && endDist > BOUNDARY_TOLERANCE) {
+        interiorEdges.add(edge);
+      }
+    }
+
+    // Return the filtered edges, preserving SRID from input polygon
+    Geometry result = factory.createMultiLineString(interiorEdges.toArray(new LineString[0]));
+    result.setSRID(polygon.getSRID());
+    return result;
   }
 }
