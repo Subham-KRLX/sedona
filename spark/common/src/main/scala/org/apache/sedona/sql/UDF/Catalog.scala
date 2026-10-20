@@ -58,6 +58,7 @@ object Catalog extends AbstractCatalog with Logging {
     function[ST_GeomFromWKB](),
     function[ST_GeomFromEWKB](),
     function[ST_GeomFromBox2D](),
+    function[ST_3DMakeBox](),
     function[ST_GeomFromGeoJSON](),
     function[ST_GeomFromGML](),
     function[ST_GeomFromKML](),
@@ -97,6 +98,7 @@ object Catalog extends AbstractCatalog with Logging {
     function[ST_IsClosed](),
     function[ST_IsCollection](),
     function[ST_IsEmpty](),
+    function[ST_IsLineStringCCW](),
     function[ST_IsPolygonCCW](),
     function[ST_IsPolygonCW](),
     function[ST_IsRing](),
@@ -163,15 +165,16 @@ object Catalog extends AbstractCatalog with Logging {
 
   // Predicates
   val predicateExprs: Seq[FunctionDescription] = Seq(
-    function[ST_BoxContains](),
-    function[ST_BoxIntersects](),
     function[ST_Contains](),
     function[ST_CoveredBy](),
     function[ST_Covers](),
     function[ST_Crosses](),
     function[ST_Disjoint](),
     function[ST_DWithin](),
+    function[ST_3DDWithin](),
     function[ST_Equals](),
+    function[ST_EqualsExact](),
+    function[ST_EqualsIdentical](),
     function[ST_Intersects](),
     function[ST_OrderingEquals](),
     function[ST_Overlaps](),
@@ -238,6 +241,7 @@ object Catalog extends AbstractCatalog with Logging {
   val overlayExprs: Seq[FunctionDescription] = Seq(
     function[ST_Difference](),
     function[ST_Intersection](),
+    function[ST_SharedPaths](),
     function[ST_Split](),
     function[ST_SubDivide](),
     function[ST_SubDivideExplode](),
@@ -283,6 +287,7 @@ object Catalog extends AbstractCatalog with Logging {
   val boundingBoxExprs: Seq[FunctionDescription] = Seq(
     function[ST_BoundingDiagonal](),
     function[ST_Box2D](),
+    function[ST_Box3D](),
     function[ST_Envelope](),
     function[ST_Expand](),
     function[ST_MMax](),
@@ -312,6 +317,12 @@ object Catalog extends AbstractCatalog with Logging {
     function[ST_H3CellIDs](),
     function[ST_H3KRing](),
     function[ST_H3ToGeom](),
+    function[ST_H3ToParent](),
+    function[ST_H3ToChildren](),
+    function[ST_H3ToCenterChild](),
+    function[ST_H3Uncompact](),
+    function[ST_H3Compact](),
+    function[ST_HilbertDistance](),
     function[ST_S2CellIDs](),
     function[ST_S2ToGeom](),
     function[ST_KNN]())
@@ -321,7 +332,11 @@ object Catalog extends AbstractCatalog with Logging {
     Seq(function[ExpandAddress](), function[ParseAddress]())
 
   // Other / utility expressions not in any docs category
-  val otherExprs: Seq[FunctionDescription] = Seq(function[Barrier]())
+  val otherExprs: Seq[FunctionDescription] =
+    Seq(function[Barrier](), function[__sedona_internal_coverage_invalid_edges_for_target]())
+
+  // Aggregate functions implemented as native Catalyst expressions
+  val catalystAggregateExprs: Seq[FunctionDescription] = Seq(function[ST_Collect_Agg]())
 
   // Geography (ST_Geog*) — see docs/api/sql/geography/Geography-Functions
   val geographyExprs: Seq[FunctionDescription] = Seq(
@@ -394,6 +409,7 @@ object Catalog extends AbstractCatalog with Logging {
     function[RS_ReprojectMatch]("nearestneighbor"),
     function[RS_Resample](),
     function[RS_SetBandNoDataValue](),
+    function[RS_ReplaceBandNoDataValue](),
     function[RS_SetCRS](),
     function[RS_SetGeoReference](),
     function[RS_SetPixelType](),
@@ -401,7 +417,7 @@ object Catalog extends AbstractCatalog with Logging {
     function[RS_SetValue](),
     function[RS_SetValues](),
     function[RS_SRID](),
-    function[RS_Union](),
+    function[RS_Stack](),
     function[RS_Value](1),
     function[RS_Values](1))
 
@@ -417,7 +433,11 @@ object Catalog extends AbstractCatalog with Logging {
 
   // Raster-Predicates
   val rasterPredicateExprs: Seq[FunctionDescription] =
-    Seq(function[RS_Contains](), function[RS_Intersects](), function[RS_Within]())
+    Seq(
+      function[RS_Contains](),
+      function[RS_DWithin](),
+      function[RS_Intersects](),
+      function[RS_Within]())
 
   // Raster-Geometry-Functions (raster → geometry derivations)
   val rasterGeometryExprs: Seq[FunctionDescription] =
@@ -520,6 +540,7 @@ object Catalog extends AbstractCatalog with Logging {
     spatialIndexingExprs,
     addressExprs,
     otherExprs,
+    catalystAggregateExprs,
     geographyExprs,
     rasterConstructorExprs,
     rasterAccessorExprs,
@@ -544,7 +565,7 @@ object Catalog extends AbstractCatalog with Logging {
     Seq(
       new ST_Envelope_Aggr,
       new ST_Extent,
+      new ST_3DExtent,
       new ST_Intersection_Aggr,
-      new ST_Union_Aggr(),
-      new ST_Collect_Agg())
+      new ST_Union_Aggr())
 }

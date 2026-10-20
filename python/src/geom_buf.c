@@ -56,8 +56,19 @@ SedonaErrorCode get_coord_seq_info_from_geom(
   if (dims == 0) {
     return SEDONA_GEOS_ERROR;
   }
-  int has_z = (dims >= 3);
-  int has_m = 0; /* libgeos does not support M dimension for now */
+  char has_z_result = dyn_GEOSHasZ_r(handle, geom);
+  char has_m_result = dyn_GEOSHasM_r == NULL ? 0 : dyn_GEOSHasM_r(handle, geom);
+  if (has_z_result == 2 || has_m_result == 2) {
+    return SEDONA_GEOS_ERROR;
+  }
+  int has_m = has_m_result != 0;
+  /*
+   * GEOSHasZ_r may report false when the first Z ordinate is NaN on older
+   * supported GEOS versions. Coordinate dimension still records the layout,
+   * and GEOSHasM_r disambiguates XYZ from XYM when measures are supported.
+   */
+  int has_z = has_z_result != 0 || dims == 4 || (dims == 3 && !has_m);
+  dims = 2 + has_z + has_m;
   CoordinateType coord_type = coordinate_type_of(has_z, has_m);
   unsigned int bytes_per_coord = get_bytes_per_coordinate(coord_type);
   int num_coords = dyn_GEOSGetNumCoordinates_r(handle, geom);
@@ -136,7 +147,10 @@ static SedonaErrorCode copy_coord_seq_to_buffer(
 static SedonaErrorCode copy_buffer_to_coord_seq(
     GEOSContextHandle_t handle, double *buf, int num_coords, int has_z,
     int has_m, GEOSCoordSequence **p_coord_seq) {
-  if (dyn_GEOSCoordSeq_copyFromBuffer_r != NULL) {
+  /* Older GEOS versions infer XYZ for an empty buffer. Use the explicit
+   * dimension constructor below for empty XY/XYZ sequences. M layouts need
+   * copyFromBuffer, which preserves their dimensions on GEOS >= 3.12. */
+  if (dyn_GEOSCoordSeq_copyFromBuffer_r != NULL && (num_coords > 0 || has_m)) {
     /* fast path for libgeos >= 3.10.0 */
     GEOSCoordSequence *coord_seq = dyn_GEOSCoordSeq_copyFromBuffer_r(
         handle, buf, num_coords, has_z, has_m);

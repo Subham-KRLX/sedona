@@ -71,15 +71,16 @@ These functions extract information and properties from geometry objects.
 | [ST_DumpPoints](Geometry-Accessors/ST_DumpPoints.md) | Returns a MultiPoint geometry which consists of individual points that compose the input line string. |
 | [ST_EndPoint](Geometry-Accessors/ST_EndPoint.md) | Returns last point of given linestring. |
 | [ST_ExteriorRing](Geometry-Accessors/ST_ExteriorRing.md) | Returns a line string representing the exterior ring of the POLYGON geometry. Return NULL if the geometry is not a polygon. |
-| [ST_GeometryN](Geometry-Accessors/ST_GeometryN.md) | Return the 0-based Nth geometry if the geometry is a GEOMETRYCOLLECTION, (MULTI)POINT, (MULTI)LINESTRING, MULTICURVE or (MULTI)POLYGON. Otherwise, return null |
+| [ST_GeometryN](Geometry-Accessors/ST_GeometryN.md) | Return the 1-based Nth geometry if the geometry is a GEOMETRYCOLLECTION, (MULTI)POINT, (MULTI)LINESTRING, MULTICURVE or (MULTI)POLYGON. Otherwise, return null |
 | [ST_GeometryType](Geometry-Accessors/ST_GeometryType.md) | Returns the type of the geometry as a string. EG: 'ST_Linestring', 'ST_Polygon' etc. |
 | [ST_HasZ](Geometry-Accessors/ST_HasZ.md) | Checks for the presence of Z coordinate values representing measures or linear references. Returns true if the input geometry includes an Z coordinate, false otherwise. |
-| [ST_InteriorRingN](Geometry-Accessors/ST_InteriorRingN.md) | Returns the Nth interior linestring ring of the polygon geometry. Returns NULL if the geometry is not a polygon or the given N is out of range |
+| [ST_InteriorRingN](Geometry-Accessors/ST_InteriorRingN.md) | Returns the Nth (1-based) interior linestring ring of the polygon geometry. Returns NULL if the geometry is not a polygon or the given N is out of range |
 | [ST_IsClosed](Geometry-Accessors/ST_IsClosed.md) | RETURNS true if the LINESTRING start and end point are the same. |
 | [ST_IsCollection](Geometry-Accessors/ST_IsCollection.md) | Returns `TRUE` if the geometry type of the input is a geometry collection type. Collection types are the following: |
 | [ST_IsEmpty](Geometry-Accessors/ST_IsEmpty.md) | Test if a geometry is empty geometry |
+| [ST_IsLineStringCCW](Geometry-Accessors/ST_IsLineStringCCW.md) | Returns true if the input LineString's coordinate sequence has counter-clockwise ring orientation. |
 | [ST_IsPolygonCCW](Geometry-Accessors/ST_IsPolygonCCW.md) | Returns true if all polygonal components in the input geometry have their exterior rings oriented counter-clockwise and interior rings oriented clockwise. |
-| [ST_IsPolygonCW](Geometry-Accessors/ST_IsPolygonCW.md) | Returns true if all polygonal components in the input geometry have their exterior rings oriented counter-clockwise and interior rings oriented clockwise. |
+| [ST_IsPolygonCW](Geometry-Accessors/ST_IsPolygonCW.md) | Returns true if all polygonal components in the input geometry have their exterior rings oriented clockwise and interior rings oriented counter-clockwise. |
 | [ST_IsRing](Geometry-Accessors/ST_IsRing.md) | RETURN true if LINESTRING is ST_IsClosed and ST_IsSimple. |
 | [ST_IsSimple](Geometry-Accessors/ST_IsSimple.md) | Test if geometry's only self-intersections are at boundary points. |
 | [ST_NDims](Geometry-Accessors/ST_NDims.md) | Returns the coordinate dimension of the geometry. |
@@ -111,9 +112,9 @@ These functions create modified geometries by changing type, structure, or verti
 | [ST_Force3DZ](Geometry-Editors/ST_Force3DZ.md) | Forces the geometry into a 3-dimensional model so that all output representations will have X, Y and Z coordinates. An optionally given zValue is tacked onto the geometry if the geometry is 2-dimen... |
 | [ST_Force_2D](Geometry-Editors/ST_Force_2D.md) | Forces the geometries into a "2-dimensional mode" so that all output representations will only have the X and Y coordinates. This function is an alias of [ST_Force2D](Geometry-Editors/ST_Force2D.md). |
 | [ST_ForceCollection](Geometry-Editors/ST_ForceCollection.md) | This function converts the input geometry into a GeometryCollection, regardless of the original geometry type. If the input is a multipart geometry, such as a MultiPolygon or MultiLineString, it wi... |
-| [ST_ForcePolygonCCW](Geometry-Editors/ST_ForcePolygonCCW.md) | For (Multi)Polygon geometries, this function sets the exterior ring orientation to counter-clockwise and interior rings to clockwise orientation. Non-polygonal geometries are returned unchanged. |
-| [ST_ForcePolygonCW](Geometry-Editors/ST_ForcePolygonCW.md) | For (Multi)Polygon geometries, this function sets the exterior ring orientation to clockwise and interior rings to counter-clockwise orientation. Non-polygonal geometries are returned unchanged. |
-| [ST_ForceRHR](Geometry-Editors/ST_ForceRHR.md) | Sets the orientation of polygon vertex orderings to follow the Right-Hand-Rule convention. The exterior ring will have a clockwise winding order, while any interior rings are oriented counter-clock... |
+| [ST_ForcePolygonCCW](Geometry-Editors/ST_ForcePolygonCCW.md) | Sets polygon exterior rings counter-clockwise and interior rings clockwise, including polygonal members nested in GeometryCollections. Non-polygonal members are preserved unchanged. |
+| [ST_ForcePolygonCW](Geometry-Editors/ST_ForcePolygonCW.md) | Sets polygon exterior rings clockwise and interior rings counter-clockwise, including polygonal members nested in GeometryCollections. Non-polygonal members are preserved unchanged. |
+| [ST_ForceRHR](Geometry-Editors/ST_ForceRHR.md) | Applies right-hand-rule ring orientation recursively to polygonal members, including those nested in GeometryCollections. Non-polygonal members are preserved unchanged. |
 | [ST_LineFromMultiPoint](Geometry-Editors/ST_LineFromMultiPoint.md) | Creates a LineString from a MultiPoint geometry. |
 | [ST_LineMerge](Geometry-Editors/ST_LineMerge.md) | Returns a LineString or MultiLineString formed by sewing together the constituent line work of a MULTILINESTRING. |
 | [ST_MakeLine](Geometry-Editors/ST_MakeLine.md) | Creates a LineString containing the points of Point, MultiPoint, or LineString geometries. Other geometry types cause an error. |
@@ -158,6 +159,8 @@ These functions test spatial relationships between geometries, returning boolean
 | [ST_Disjoint](Predicates/ST_Disjoint.md) | Return true if A and B are disjoint |
 | [ST_DWithin](Predicates/ST_DWithin.md) | Returns true if 'leftGeometry' and 'rightGeometry' are within a specified 'distance'. This function essentially checks if the shortest distance between the envelope of the two geometries is <= the ... |
 | [ST_Equals](Predicates/ST_Equals.md) | Return true if A equals to B |
+| [ST_EqualsExact](Predicates/ST_EqualsExact.md) | Return true if A and B have matching structures and corresponding coordinates within a tolerance |
+| [ST_EqualsIdentical](Predicates/ST_EqualsIdentical.md) | Return true if A and B have identical structures, dimensions, and coordinate values |
 | [ST_Intersects](Predicates/ST_Intersects.md) | Return true if A intersects B |
 | [ST_OrderingEquals](Predicates/ST_OrderingEquals.md) | Returns true if the geometries are equal and the coordinates are in the same order |
 | [ST_Overlaps](Predicates/ST_Overlaps.md) | Return true if A overlaps B |
@@ -236,6 +239,7 @@ These functions compute results arising from the overlay of two geometries. Thes
 | :--- | :--- |
 | [ST_Difference](Overlay-Functions/ST_Difference.md) | Return the difference between geometry A and B (return part of geometry A that does not intersect geometry B) |
 | [ST_Intersection](Overlay-Functions/ST_Intersection.md) | Return the intersection geometry of A and B |
+| [ST_SharedPaths](Overlay-Functions/ST_SharedPaths.md) | Returns the paths shared by two lineal geometries, grouped by traversal direction. |
 | [ST_Split](Overlay-Functions/ST_Split.md) | Split an input geometry by another geometry (called the blade). Linear (LineString or MultiLineString) geometry can be split by a Point, MultiPoint, LineString, MultiLineString, Polygon, or MultiPo... |
 | [ST_SubDivide](Overlay-Functions/ST_SubDivide.md) | Returns a multi-geometry divided based of given maximum number of vertices. |
 | [ST_SubDivideExplode](Overlay-Functions/ST_SubDivideExplode.md) | It works the same as ST_SubDivide but returns new rows with geometries instead of a multi-geometry. |
@@ -317,7 +321,7 @@ These functions produce or operate on bounding boxes and compute extent values.
 
 ## Spatial Indexing
 
-These functions work with spatial indexing systems including Bing Tiles, H3, S2, and GeoHash.
+These functions work with spatial indexing systems including Bing Tiles, Hilbert curves, S2, and GeoHash.
 
 | Function | Description |
 | :--- | :--- |
@@ -332,4 +336,5 @@ These functions work with spatial indexing systems including Bing Tiles, H3, S2,
 | [ST_BingTileZoomLevel](Spatial-Indexing/ST_BingTileZoomLevel.md) | Returns the zoom level of the Bing Tile identified by the given quadkey. |
 | [ST_GeoHashNeighbor](Spatial-Indexing/ST_GeoHashNeighbor.md) | Returns the neighbor geohash cell in the given direction. Valid directions are: `n`, `ne`, `e`, `se`, `s`, `sw`, `w`, `nw` (case-insensitive). |
 | [ST_GeoHashNeighbors](Spatial-Indexing/ST_GeoHashNeighbors.md) | Returns the 8 neighboring geohash cells of a given geohash string. The result is an array of 8 geohash strings in the order: N, NE, E, SE, S, SW, W, NW. |
+| [ST_HilbertDistance](Spatial-Indexing/ST_HilbertDistance.md) | Maps the midpoint of a geometry's envelope to an unsigned Hilbert-curve address within a supplied extent. |
 | [ST_S2CellIDs](Spatial-Indexing/ST_S2CellIDs.md) | Cover the geometry with Google S2 Cells, return the corresponding cell IDs with the given level. The level indicates the [size of cells](https://s2geometry.io/resources/s2cell_statistics.html). With... |

@@ -33,7 +33,40 @@ from tests.test_base import TestBase
 from sedona.spark.sql.types import GeometryType
 
 
+def _assert_serde_geometry_equal(expected, actual):
+    assert expected.equals(actual)
+    if isinstance(expected, (MultiPoint, MultiLineString, MultiPolygon)):
+        # Topological equality ignores empty members, including empty points
+        # that were incorrectly reconstructed as nonempty NaN points.
+        assert len(expected.geoms) == len(actual.geoms)
+        for expected_part, actual_part in zip(expected.geoms, actual.geoms):
+            assert expected_part.is_empty == actual_part.is_empty
+            if not expected_part.is_empty:
+                assert expected_part.equals_exact(actual_part, 1e-6)
+
+
 class TestGeometrySerde(TestBase):
+    @pytest.mark.parametrize(
+        "wkt",
+        [
+            "POINT EMPTY",
+            "POINT Z EMPTY",
+            "LINESTRING EMPTY",
+            "LINESTRING Z EMPTY",
+            "POLYGON EMPTY",
+            "POLYGON Z EMPTY",
+            "GEOMETRYCOLLECTION (POINT EMPTY, LINESTRING EMPTY, POLYGON EMPTY)",
+            "GEOMETRYCOLLECTION Z (POINT Z EMPTY, LINESTRING Z EMPTY, POLYGON Z EMPTY)",
+        ],
+    )
+    def test_spark_empty_geometry_dimensions(self, wkt):
+        geometry = wkt_loads(wkt)
+        actual = self.spark.createDataFrame(
+            [(geometry,)], StructType().add("geom", GeometryType())
+        ).first()[0]
+
+        assert actual.wkb == geometry.wkb
+
     @pytest.mark.parametrize(
         "geom",
         [
@@ -170,7 +203,7 @@ class TestGeometrySerde(TestBase):
         returned_geom = TestGeometrySerde.spark.createDataFrame([(geom,)], schema).take(
             1
         )[0][0]
-        assert geom.equals(returned_geom)
+        _assert_serde_geometry_equal(geom, returned_geom)
 
         # serialized by python, deserialized by scala
         returned_wkt = (
@@ -178,7 +211,7 @@ class TestGeometrySerde(TestBase):
             .selectExpr("ST_AsText(geom)")
             .take(1)[0][0]
         )
-        assert wkt_loads(returned_wkt).equals(geom)
+        _assert_serde_geometry_equal(geom, wkt_loads(returned_wkt))
 
         # serialized by scala, deserialized by python
         schema = StructType().add("wkt", StringType())
@@ -187,7 +220,7 @@ class TestGeometrySerde(TestBase):
             .selectExpr("ST_GeomFromText(wkt)")
             .take(1)[0][0]
         )
-        assert geom.equals(returned_geom)
+        _assert_serde_geometry_equal(geom, returned_geom)
 
     @pytest.mark.parametrize(
         "wkt",

@@ -19,13 +19,13 @@
 
 # ST_Area
 
-Introduction: Returns the spherical area of a geography in square meters, calculated on the sphere. The Earth is modeled as a sphere of radius `R = 6 371 008 m` (the authalic Earth radius); the result is the area of the polygon's interior on that sphere. Returns `0.0` for non-areal geographies (points, linestrings) and for `NULL`.
+Introduction: Returns the spherical area of a geography in square meters, calculated on the sphere. The Earth is modeled as a sphere of radius `R = 6 371 008 m` (the mean Earth radius); the result is the area of the polygon's interior on that sphere. Returns `0.0` for non-areal geographies (points, linestrings) and for `NULL`.
 
 Multi-polygons sum the children's areas; geography collections recurse into their members.
 
 ![ST_Area on a Geography on the sphere](../../../../image/ST_Area_geography/ST_Area_geography.svg "ST_Area on a Geography (sphere-native)")
 
-The result is the area of the polygon's user-intended interior. If the input ring happens to be wound in the orientation that would describe the rest of the planet instead, Sedona returns the smaller of the two regions, so the answer is always bounded by half the surface of the Earth (~2.55 × 10¹⁴ m²).
+Each Geography polygon shell is normalized to an area of at most one hemisphere. A shell intended to represent more than half the sphere is therefore interpreted as its complement; reversing the ring's coordinate sequence does not select the larger region. The returned area is bounded by half the surface of the Earth (~2.55 × 10¹⁴ m²).
 
 If you specifically want the WGS84 ellipsoidal value (which is ~0.5 % lower for typical shapes), convert via `ST_GeogToGeometry` first and use the geometry overload:
 

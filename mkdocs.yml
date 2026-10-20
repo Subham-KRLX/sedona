@@ -57,6 +57,7 @@ nav:
               - GeoJSON: tutorial/files/geojson-sedona-spark.md
               - Shapefiles: tutorial/files/shapefiles-sedona-spark.md
               - GeoTIFF metadata: tutorial/files/geotiffmetadata-sedona-spark.md
+              - NetCDF metadata: tutorial/files/netcdfmetadata-sedona-spark.md
               - STAC catalog: tutorial/files/stac-sedona-spark.md
           - Concepts:
               - Spatial Joins: tutorial/concepts/spatial-joins.md
@@ -75,6 +76,8 @@ nav:
               - Quick start: api/sql/Overview.md
               - Vector data:
                   - Geometry Functions: api/sql/Geometry-Functions.md
+                  - Box2D Functions: api/sql/box2d/Box2D-Functions.md
+                  - Box3D Functions: api/sql/box3d/Box3D-Functions.md
                   - Geography Functions: api/sql/geography/Geography-Functions.md
                   - DataFrame Style functions: api/sql/DataFrameAPI.md
                   - Query optimization: api/sql/Optimizer.md
@@ -88,6 +91,7 @@ nav:
               - Raster data:
                   - Raster Functions: api/sql/Raster-Functions.md
                   - Raster map algebra: api/sql/Raster-map-algebra.md
+                  - Raster UDFs: api/sql/Raster-UDF.md
                   - Raster affine transformation: api/sql/Raster-affine-transformation.md
               - Parameter: api/sql/Parameter.md
           - RDD (core):
@@ -98,8 +102,10 @@ nav:
               - DataFrame/SQL: api/viz/sql.md
               - RDD: api/viz/java-api.md
           - Sedona R: api/rdocs
+          - GeoPandas API coverage: api/geopandas-coverage.md
           - Sedona Python: api/pydocs
       - Release notes: setup/release-notes.md
+      - Migrating to Sedona 2.0: setup/migration-2.0.md
 
   - SedonaFlink:
       - Home: sedonaflink.md
@@ -119,6 +125,7 @@ nav:
           - SQL:
               - Overview (Flink): api/flink/Overview.md
               - Geometry Functions: api/flink/Geometry-Functions.md
+              - Geography Functions: api/flink/Geography-Functions.md
       - Release notes: setup/release-notes.md
 
   - SedonaSnow:
@@ -152,12 +159,12 @@ nav:
       - Publications: community/publication.md
   - Apache Software Foundation:
       - Foundation: asf/asf.md
-      - License: https://www.apache.org/licenses/" target="_blank
-      - Events: https://www.apache.org/events/current-event" target="_blank
-      - Sponsorship: https://www.apache.org/foundation/sponsorship.html" target="_blank
-      - Thanks: https://www.apache.org/foundation/thanks.html" target="_blank
-      - Security: https://www.apache.org/security/" target="_blank
-      - Privacy: https://privacy.apache.org/policies/privacy-policy-public.html" target="_blank
+      - License: https://www.apache.org/licenses/
+      - Events: https://www.apache.org/events/current-event
+      - Sponsorship: https://www.apache.org/foundation/sponsorship.html
+      - Thanks: https://www.apache.org/foundation/thanks.html
+      - Security: https://www.apache.org/security/
+      - Privacy: https://privacy.apache.org/policies/privacy-policy-public.html
       - Telemetry: asf/telemetry.md
 repo_url: https://github.com/apache/sedona
 repo_name: apache/sedona
@@ -200,14 +207,14 @@ extra:
     - icon: fontawesome/brands/discord
       link: 'https://discord.gg/9A3k5dEBsY'
   sedona:
-    current_version: 1.9.0
-    current_geotools: 1.9.0-33.5
+    current_version: 1.9.1
+    current_geotools: 1.9.1-33.5
   sedona_create_release:
-    current_version: 1.9.0
-    current_git_tag: sedona-1.9.0-rc1
-    current_rc: 1.9.0-rc1
-    current_snapshot: 1.9.1-SNAPSHOT
-    next_version: 1.9.1
+    current_version: 1.9.1
+    current_git_tag: sedona-1.9.1-rc1
+    current_rc: 1.9.1-rc1
+    current_snapshot: 2.0.0-SNAPSHOT
+    next_version: 2.0.0
 copyright: Copyright © 2026 The Apache Software Foundation. Apache Sedona, Sedona, Apache, the Apache feather logo, and the Apache Sedona project logo are either registered trademarks or trademarks of The Apache Software Foundation in the United States and other countries. All other marks mentioned may be trademarks or registered trademarks of their respective owners. Please visit <a href="https://www.apache.org/">Apache Software Foundation</a> for more details.<img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=f3e121f6-c909-4592-8be6-5bd345768cba" /><img referrerpolicy="no-referrer-when-downgrade" src="https://analytics.apache.org/matomo.php?idsite=74&rec=1" />
 
 markdown_extensions:
@@ -252,6 +259,8 @@ plugins:
       archive_date_format: MMMM yyyy
       # Maximum number of authors to display in the post excerpt
       post_excerpt_max_authors: 5
+      # Generates dedicated, indexable pages for each author
+      authors_profiles: true
   - i18n:
       docs_structure: suffix
       fallback_to_default: true
@@ -294,6 +303,7 @@ plugins:
             Raster DataFrame / SQL app: 栅格 DataFrame / SQL 应用
             Pure SQL environment: 纯 SQL 环境
             GeoPandas API on Sedona: Sedona 上的 GeoPandas API
+            GeoPandas API coverage: GeoPandas API 覆盖情况
             Spatial RDD app: 空间 RDD 应用
             Sedona R: Sedona R
             Work with GeoPandas and Shapely: 与 GeoPandas 和 Shapely 配合使用
@@ -314,6 +324,8 @@ plugins:
             Quick start: 快速开始
             Vector data: 矢量数据
             Geometry Functions: 几何函数
+            Box2D Functions: Box2D 函数
+            Box3D Functions: Box3D 函数
             Geography Functions: 地理函数
             DataFrame Style functions: DataFrame 风格函数
             Query optimization: 查询优化
@@ -324,6 +336,7 @@ plugins:
             Raster data: 栅格数据
             Raster Functions: 栅格函数
             Raster map algebra: 栅格地图代数
+            Raster UDFs: 栅格 UDF
             Raster affine transformation: 栅格仿射变换
             Parameter: 参数
             RDD (core): RDD（核心）
@@ -373,6 +386,10 @@ plugins:
       type: datetime
   - mike:
       canonical_version: 'latest'
+hooks:
+  - docs-overrides/hooks/i18n_blog_passthrough.py
+  - docs-overrides/hooks/i18n_sitemaps.py
+  - docs-overrides/hooks/blog_star_cta.py
 extra_css:
   - assets/stylesheets/extra.min.css
 extra_javascript:

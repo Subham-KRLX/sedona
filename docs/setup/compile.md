@@ -46,28 +46,28 @@ To compile all modules, please make sure you are in the root folder of all modul
 	Geotools jars will be packaged into the produced fat jars.
 
 !!!note
-	By default, this command will compile Sedona with Spark 3.4 and Scala 2.12
+	By default, this command will compile Sedona with Spark 3.5 and Scala 2.12
 
 ### Compile with different targets
 
 User can specify `-Dspark` and `-Dscala` command line options to compile with different targets. Available targets are:
 
-* `-Dspark`: `{major}.{minor}`: For example, specify `-Dspark=3.4` to build for Spark 3.4.
+* `-Dspark`: `{major}.{minor}`: For example, specify `-Dspark=3.5` to build for Spark 3.5.
 * `-Dscala`: `2.12` or `2.13`
 
-=== "Spark 3.4+ Scala 2.12"
+=== "Spark 3.5 Scala 2.12"
 	```
-	mvn clean install -DskipTests -Dspark=3.4 -Dscala=2.12
+	mvn clean install -DskipTests -Dspark=3.5 -Dscala=2.12
 	```
-    Please replace `3.4` with Spark major.minor version when building for higher Spark versions.
-=== "Spark 3.4+ Scala 2.13"
+    Scala 2.12 is only available for Spark 3.5. Spark 4.0 and above are built with Scala 2.13 only.
+=== "Spark 3.5+ Scala 2.13"
 	```
-	mvn clean install -DskipTests -Dspark=3.4 -Dscala=2.13
+	mvn clean install -DskipTests -Dspark=3.5 -Dscala=2.13
 	```
-    Please replace `3.4` with Spark major.minor version when building for higher Spark versions.
+    Please replace `3.5` with Spark major.minor version when building for higher Spark versions.
 
 !!!tip
-	To get the Sedona Spark Shaded jar with all GeoTools jars included, simply append `-Dgeotools` option. The command is like this:`mvn clean install -DskipTests -Dscala=2.12 -Dspark=3.4 -Dgeotools`
+	To get the Sedona Spark Shaded jar with all GeoTools jars included, simply append `-Dgeotools` option. The command is like this:`mvn clean install -DskipTests -Dscala=2.12 -Dspark=3.5 -Dgeotools`
 
 ### Download staged jars
 
@@ -78,7 +78,7 @@ Sedona uses GitHub Actions to automatically generate jars per commit. You can go
 1) Set up Spark (download if needed) and environment variables
 
 ```bash
-export SPARK_VERSION=3.4.0   # or another supported version
+export SPARK_VERSION=3.5.0   # or another supported version
 wget https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz
 tar -xvzf spark-${SPARK_VERSION}-bin-hadoop3.tgz
 rm spark-${SPARK_VERSION}-bin-hadoop3.tgz
@@ -153,50 +153,155 @@ uv sync --group docs
 After installing MkDocs and MkDocs-Material, run these commands in the Sedona root folder:
 
 ```
-uv run mkdocs build
+cd docs-overrides && npm ci && npx gulp build
+cd ..
 uv run mike deploy --update-aliases latest-snapshot -b website -p
-uv run mike serve
+uv run mike serve -b website
 ```
 
-## pre-commit
+### Compiling via Makefile (Recommended)
 
-We run [pre-commit](https://pre-commit.com/) with GitHub Actions so installation on
-your local machine is currently optional.
+For a streamlined developer experience, a unified `Makefile` is provided to handle local documentation builds automatically.
 
-The pre-commit [configuration file](https://github.com/apache/sedona/blob/master/.pre-commit-config.yaml)
-is in the repository root. Before you can run the hooks, you need to have pre-commit installed.
+To build and serve the documentation locally using the automated environment pipeline, run:
 
-The hooks run when running `git commit` and also from the command line with `pre-commit`. Some of the hooks will auto
-fix the code after the hooks fail whilst most will print error messages from the linters. If a hook fails the overall
-commit will fail, and you will need to fix the issues or problems and `git add` and git commit again. On git commit
-the hooks will run mostly only against modified files so if you want to test all hooks against all files and when you
-are adding a new hook you should always run:
+```bash
+make docsbuild
+```
 
-`pre-commit run --all-files`
+**What this command does behind the scenes:**
 
-Sometimes you might need to skip a hook to commit because the hook is stopping you from committing or your computer
-might not have all the installation requirements for all the hooks. The `SKIP` variable is comma separated for two or
-more hooks:
+1. **Environment Verification:** Validates that `uv` is available on your local path.
+2. **Dependency Syncing:** Runs `uv sync --group docs` (via `make docsinstall`) to set up or synchronize the documentation environment containing MkDocs and compilation dependencies.
+3. **Asset Generation:** Navigates into the `docs-overrides` directory to fetch, build, and bundle required JavaScript and CSS assets via Node/NPM and Gulp workflows.
+4. **MkDocs Compilation:** Compiles the Markdown files in the `docs` directory into a fully optimized, static HTML website based on the configuration inside `mkdocs.yml`.
 
-`SKIP=codespell git commit -m "foo"`
+---
 
-The same applies when running pre-commit:
+## Code Quality Checks with `prek`, `uv`, and `make`
 
-`SKIP=codespell pre-commit run --all-files`
+This guide explains how Apache Sedona manages local code quality checks, formatting, and linting. To ensure a fast and consistent developer experience, we combine `uv` (a lightning-fast Python package and environment manager) with `prek` (our internal pre-commit wrapper framework) and expose everything via a simple, unified `Makefile`.
 
-Occasionally you can have more serious problems when using `pre-commit` with `git commit`. You can use `--no-verify` to
-commit and stop `pre-commit` from checking the hooks. For example:
+### Prerequisites
 
-`git commit --no-verify -m "foo"`
+Make sure your machine has `uv` and Python 3.8+ installed before running checks.
 
-If you just want to run one hook for example just run the `markdownlint` hook:
+### Core Workflow via Makefile
 
-`pre-commit run markdownlint --all-files`
+The `Makefile` handles environment isolation and dependency resolution automatically using `uv`. The generated root `uv.lock` remains local and is not committed, so dependency versions may change when the environment is refreshed. For maximum convenience, you should interact with `prek` entirely through the following make shortcuts:
 
-We have a [Makefile](https://github.com/apache/sedona/blob/master/Makefile) in the repository root which has three pre-commit convenience commands.
+* **`make check-stage`** *Runs checks on staged changes only (Recommended before committing).* Evaluates `prek` only against the files you have explicitly staged using `git add`. It is incredibly fast.
+* **`make check`** *Runs checks on the full codebase.* Forces `prek` to evaluate every single file in the repository, regardless of git status. **Use this before opening a Pull Request.**
+* **`make check-from-ref`** *Runs checks on your entire branch history.* Automatically identifies all files changed since you branched off of the `master` branch and runs linting rules against them.
+* **`make check-last`** *Runs checks on your last commit.* If you just committed code and want to double-check that everything passes post-commit.
+* **`make update-deps`** *Keeps linter hooks up to date.* Upgrades `prek` hooks to their latest respective upstream versions and refreshes local development dependencies to their latest compatible versions.
 
-For example, you can run the following to setup pre-commit to run before each commit
+### Running prek Standalone (Without Makefile)
+
+For developers on execution environments where running a `Makefile` is unavailable, restrictive, or unoptimized (such as native Windows environments without an active bash/make emulation layer), you can execute code quality workflows by interacting with `prek` directly using `uv`.
+
+#### 1. Bootstrap the Environment
+
+Before invoking `prek` manually, force `uv` to resolve and install the mandatory development groups and local hook ecosystems:
+
+```bash
+uv sync --all-groups
+```
+
+#### 2. Executing Standalone Hooks
+
+Once dependencies are synced inside your virtual environment, execute `prek` tasks via `uv run`:
+
+* **Check Staged Files Only:**
+
+```bash
+uv run prek run
+```
+
+* **Check the Entire Codebase:**
+
+```bash
+uv run prek run --all-files
+```
+
+* **Run Specific Linters Standalone:**
+  If you only wish to validate explicit targets (such as Python formatting, markdown linter rules, or security auditing profiles), pass the specific hook ID directly:
+
+```bash
+uv run prek run <hook_id> --all-files
+```
+
+#### 3. Updating Hooks Manually
+
+To keep linter definitions synchronized with upstream styling configurations without a `Makefile` shortcut, trigger an explicit update through the core engine:
+
+```bash
+uv run prek auto-update --freeze
+```
+
+---
+
+### Advanced Usage & Examples
+
+#### Skipping Specific Hooks Locally
+
+Sometimes a specific linter rule blocks your workflow, or you want to isolate your testing to a single hook. You can bypass specific hooks by passing the `SKIP` environment variable directly to `prek`.
+
+* **Example:** Run all checks except the linter named `codespell`
+
+```bash
+SKIP=codespell make check-stage
+```
+
+* **Example:** Skip multiple hooks simultaneously (comma-separated)
+
+```bash
+SKIP=codespell,gitleaks make check
+```
+
+#### Bypassing Automated Git Hooks (`--no-verify`)
+
+If you have configured `prek` to run automatically as a native Git `pre-commit` hook on your system, it will block `git commit` if any files fail the quality gates.
+
+If you need to commit a work-in-progress (WIP) branch quickly without fixing style errors, you can bypass the `prek` gate entirely using Git's built-in `--no-verify` (or `-n`) flag.
+
+```bash
+git add .
+git commit -m "WIP: basic structure for new feature" --no-verify
+```
+
+> ⚠️ **Warning:** Continuous Integration (CI) runners will still execute all `prek` gates on your Pull Request. Bypassing hooks with `--no-verify` should only be used for temporary local savepoints.
+
+---
+
+### Housekeeping & Resetting Cache (`make clean`)
+
+If your Python environment behaves unexpectedly, or if the linters fail to pick up recent changes due to aggressive local caching, you should reset your workspace back to a pristine state using:
+
+```bash
+make clean
+```
+
+#### What happens under the hood?
+
+This command triggers a multi-directory sweep to remove compiled local artifacts and temporary caches:
+
+* `__pycache__`: Clears out compiled Python bytecode files (`.pyc`).
+* `.mypy_cache`: Empties the type-checking state cache to ensure a fresh, accurate type analysis next run.
+* `.pytest_cache`: Cleans up previous test failure tracking states.
+
+Following a `make clean`, running any subsequent `make check` command will completely rebuild the `uv` virtual environment mapping and rerun all `prek` checks completely fresh.
+
+---
+
+### Architecture Pipeline
+
+When you execute a command like `make check`, the automation engine follows these exact steps:
+
+1. **`check-install`**: Verifies `uv` is installed on your local path.
+2. **`install`**: Triggers `uv sync --all-groups`, which automatically creates/syncs a `.venv` folder containing `prek` and all development dependencies.
+3. **`Execution`**: Runs the target `prek` command within that guaranteed environment context.
 
 ```
-make checkinstall
+[ Your CLI ] ──> [ make check ] ──> [ uv syncs environment ] ──> [ prek executes hooks ]
 ```

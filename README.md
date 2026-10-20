@@ -17,13 +17,17 @@
  under the License.
  -->
 
-[![Apache Sedona](docs/image/sedona_logo.png)](https://sedona.apache.org/)
+<a href="https://sedona.apache.org/">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/image/sedona_logo_dark.png">
+    <img alt="Apache Sedona" src="docs/image/sedona_logo.png">
+  </picture>
+</a>
 
 [![CodeQL Workflow Status](https://github.com/apache/sedona/actions/workflows/codeql.yml/badge.svg)](https://github.com/apache/sedona/actions/workflows/codeql.yml)
 [![Docker image build](https://github.com/apache/sedona/actions/workflows/docker-build.yml/badge.svg)](https://github.com/apache/sedona/actions/workflows/docker-build.yml)
 [![Docs build](https://github.com/apache/sedona/actions/workflows/docs.yml/badge.svg)](https://github.com/apache/sedona/actions/workflows/docs.yml)
 [![Example project build](https://github.com/apache/sedona/actions/workflows/example.yml/badge.svg)](https://github.com/apache/sedona/actions/workflows/example.yml)
-[![First Interaction Workflow Status](https://github.com/apache/sedona/actions/workflows/first-interaction.yml/badge.svg)](https://github.com/apache/sedona/actions/workflows/first-interaction.yml)
 [![Manual Hooks Workflow Status](https://github.com/apache/sedona/actions/workflows/pre-commit-manual.yml/badge.svg)](https://github.com/apache/sedona/actions/workflows/pre-commit-manual.yml)
 [![Pre-commit Workflow Status](https://github.com/apache/sedona/actions/workflows/pre-commit.yml/badge.svg)](https://github.com/apache/sedona/actions/workflows/pre-commit.yml)
 [![Python build](https://github.com/apache/sedona/actions/workflows/python.yml/badge.svg)](https://github.com/apache/sedona/actions/workflows/python.yml)
@@ -33,6 +37,7 @@
 [![R build](https://github.com/apache/sedona/actions/workflows/r.yml/badge.svg)](https://github.com/apache/sedona/actions/workflows/r.yml)
 [![Scala and Java build](https://github.com/apache/sedona/actions/workflows/java.yml/badge.svg)](https://github.com/apache/sedona/actions/workflows/java.yml)
 
+[![GeoPandas API coverage: 91.4% (including partial implementations)](https://img.shields.io/badge/GeoPandas_API_coverage-91.4%25-brightgreen)](docs/api/geopandas-coverage.md "GeoPandas 1.1.4 API availability in Sedona 2.0.0 development, including partial implementations")
 [![GitHub commit activity](https://img.shields.io/github/commit-activity/m/apache/sedona)](https://github.com/apache/sedona/graphs/commit-activity)
 [![GitHub Issues marked as good first issue](https://img.shields.io/github/issues/apache/sedona/good%20first%20issue?color=%237057ff)](https://github.com/apache/sedona/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22)
 
@@ -48,8 +53,8 @@
 
 | Download statistics        | **Maven**  | **PyPI**                                                                                                                                                                                                                                                                                                                                     | Conda-forge                                                                                                                                     | **CRAN**                                                                                                                                                                                                                                                                                                      | **DockerHub**                                                                                                                  |
 |----------------------------|------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
-| Apache Sedona              | 330k/month | [![PyPI - Downloads](https://img.shields.io/pypi/dm/apache-sedona)](https://pepy.tech/project/apache-sedona) [![Downloads](https://static.pepy.tech/personalized-badge/apache-sedona?period=total&units=international_system&left_color=black&right_color=brightgreen&left_text=total%20downloads)](https://pepy.tech/project/apache-sedona) | [![Anaconda-Server Badge](https://anaconda.org/conda-forge/apache-sedona/badges/downloads.svg)](https://anaconda.org/conda-forge/apache-sedona) | [![CRAN downloads per month](https://cranlogs.r-pkg.org/badges/apache.sedona?color=brightgreen)](https://cran.r-project.org/package=apache.sedona) [![Total CRAN downloads](https://cranlogs.r-pkg.org/badges/grand-total/apache.sedona?color=brightgreen)](https://cran.r-project.org/package=apache.sedona) | [![Docker pulls](https://img.shields.io/docker/pulls/apache/sedona?color=brightgreen)](https://hub.docker.com/r/apache/sedona) |
-| Archived GeoSpark releases | 10k/month  | [![PyPI - Downloads](https://img.shields.io/pypi/dm/geospark)](https://pepy.tech/project/geospark)[![Downloads](https://static.pepy.tech/personalized-badge/geospark?period=total&units=international_system&left_color=black&right_color=brightgreen&left_text=total%20downloads)](https://pepy.tech/project/geospark)                      |                                                                                                                                                 |                                                                                                                                                                                                                                                                                                               |                                                                                                                                |
+| Apache Sedona              | 330k/month | [![PyPI Downloads](https://static.pepy.tech/personalized-badge/apache-sedona?period=monthly&units=NONE&left_color=BLACK&right_color=GREEN&left_text=downloads%2Fmonth)](https://pepy.tech/projects/apache-sedona) [![Downloads](https://static.pepy.tech/personalized-badge/apache-sedona?period=total&units=international_system&left_color=black&right_color=brightgreen&left_text=total%20downloads)](https://pepy.tech/project/apache-sedona) | [![Anaconda-Server Badge](https://anaconda.org/conda-forge/apache-sedona/badges/downloads.svg)](https://anaconda.org/conda-forge/apache-sedona) | [![CRAN downloads per month](https://cranlogs.r-pkg.org/badges/apache.sedona?color=brightgreen)](https://cran.r-project.org/package=apache.sedona) [![Total CRAN downloads](https://cranlogs.r-pkg.org/badges/grand-total/apache.sedona?color=brightgreen)](https://cran.r-project.org/package=apache.sedona) | [![Docker pulls](https://img.shields.io/docker/pulls/apache/sedona?color=brightgreen)](https://hub.docker.com/r/apache/sedona) |
+| Archived GeoSpark releases | 10k/month  | [![PyPI Downloads](https://static.pepy.tech/personalized-badge/geospark?period=monthly&units=NONE&left_color=BLACK&right_color=GREEN&left_text=downloads%2Fmonth)](https://pepy.tech/projects/geospark)[![Downloads](https://static.pepy.tech/personalized-badge/geospark?period=total&units=international_system&left_color=black&right_color=brightgreen&left_text=total%20downloads)](https://pepy.tech/project/geospark)                      |                                                                                                                                                 |                                                                                                                                                                                                                                                                                                               |                                                                                                                                |
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
@@ -68,7 +73,6 @@
 - [Docker image](#docker-image)
 - [Building Sedona](#building-sedona)
 - [Documentation](#documentation)
-- [Star History](#star-history)
 - [Powered by](#powered-by)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
@@ -104,7 +108,7 @@ Some of the key features of Apache Sedona include:
 * Support for a wide range of geospatial data formats, including [GeoJSON](https://en.wikipedia.org/wiki/GeoJSON), [WKT](https://en.wikipedia.org/wiki/Well-known_text_representation_of_geometry), and [ESRI](https://www.esri.com) [Shapefile](https://en.wikipedia.org/wiki/Shapefile).
 * Scalable distributed processing of large vector and raster datasets.
 * Tools for spatial indexing, spatial querying, and spatial join operations.
-* Integration with popular geospatial Python tools such as [GeoPandas](https://geopandas.org).
+* GeoPandas API on Apache Spark. See the [coverage reference](docs/api/geopandas-coverage.md) for API availability and limitations in the 2.0.0 development version, compared with GeoPandas 1.1.4.
 * Integration with popular big data tools, such as Spark, [Hadoop](https://hadoop.apache.org/), [Hive](https://hive.apache.org/), and Flink for data storage and querying.
 * A user-friendly API for working with geospatial data in the [SQL](https://en.wikipedia.org/wiki/SQL), [Python](https://www.python.org/), [Scala](https://www.scala-lang.org/) and [Java](https://www.java.com) languages.
 * Flexible deployment options, including standalone, local, and cluster modes.
@@ -227,10 +231,6 @@ We provide a Docker image for Apache Sedona with Python JupyterLab and a single-
 * [Sedona Python API Documentation](https://sedona.apache.org/latest/api/pydocs/)
 
 Please visit [Apache Sedona website](https://sedona.apache.org/) for detailed information
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=apache/sedona&type=Date)](https://www.star-history.com/#apache/sedona&Date)
 
 ## Powered by
 

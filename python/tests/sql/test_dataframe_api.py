@@ -27,6 +27,7 @@ from shapely.geometry.base import BaseGeometry
 from tests.test_base import TestBase
 
 from sedona.spark.core.geom.box2d import Box2D
+from sedona.spark.core.geom.box3d import Box3D
 from sedona.spark.core.geom.geography import Geography
 from sedona.spark.sql import st_aggregates as sta
 from sedona.spark.sql import st_constructors as stc
@@ -176,6 +177,14 @@ test_configurations = [
         "",
         # two_points has a=(0,0,0), b=(3,0,4); ST_MakeBox2D drops Z, so y is 0 for both.
         Box2D(0.0, 0.0, 3.0, 0.0),
+    ),
+    (
+        stc.ST_3DMakeBox,
+        ("a", "b"),
+        "two_points",
+        "",
+        # two_points has a=(0,0,0), b=(3,0,4).
+        Box3D(0.0, 0.0, 0.0, 3.0, 0.0, 4.0),
     ),
     (
         stc.ST_GeomFromBox2D,
@@ -548,6 +557,14 @@ test_configurations = [
         Box2D(0.0, 0.0, 5.0, 0.0),
     ),
     (
+        stf.ST_Box3D,
+        ("line",),
+        "linestring_geom",
+        "",
+        # linestring_geom is 2D so Z folds to 0 per PostGIS semantics.
+        Box3D(0.0, 0.0, 0.0, 5.0, 0.0, 0.0),
+    ),
+    (
         stf.ST_Envelope,
         ("geom",),
         "triangle_geom",
@@ -647,8 +664,15 @@ test_configurations = [
         "ST_NumGeometries(geom)",
         15,
     ),
-    (stf.ST_GeometryN, ("geom", 0), "multipoint", "", "POINT (0 0)"),
+    (stf.ST_GeometryN, ("geom", 1), "multipoint", "", "POINT (0 0)"),
     (stf.ST_GeometryType, ("point",), "point_geom", "", "ST_Point"),
+    (
+        stf.ST_HilbertDistance,
+        ("geom", 0.0, 0.0, 1.0, 1.0, 2),
+        "triangle_geom",
+        "",
+        2,
+    ),
     (
         stf.ST_GeoHashNeighbors,
         ("geohash",),
@@ -684,7 +708,7 @@ test_configurations = [
     ),
     (
         stf.ST_InteriorRingN,
-        ("geom", 0),
+        ("geom", 1),
         "geom_with_hole",
         "",
         "LINESTRING (1 1, 2 2, 2 1, 1 1)",
@@ -696,10 +720,21 @@ test_configurations = [
         "",
         "POLYGON ((2 0, 1 0, 1 1, 2 1, 2 0))",
     ),
+    (
+        stf.ST_SharedPaths,
+        (
+            lambda: f.expr("ST_GeomFromWKT('LINESTRING (0 0, 10 0)')"),
+            lambda: f.expr("ST_GeomFromWKT('LINESTRING (15 0, 5 0)')"),
+        ),
+        "null",
+        "",
+        "GEOMETRYCOLLECTION (MULTILINESTRING EMPTY, MULTILINESTRING ((5 0, 10 0)))",
+    ),
     (stf.ST_InterpolatePoint, ("linem", "point"), "linestringm_and_point", "", 1.0),
     (stf.ST_IsCollection, ("geom",), "geom_collection", "", True),
     (stf.ST_IsClosed, ("geom",), "closed_linestring_geom", "", True),
     (stf.ST_IsEmpty, ("geom",), "empty_geom", "", True),
+    (stf.ST_IsLineStringCCW, ("geom",), "closed_linestring_geom", "", True),
     (stf.ST_IsPolygonCW, ("geom",), "geom_with_hole", "", False),
     (stf.ST_IsPolygonCCW, ("geom",), "geom_with_hole", "", True),
     (stf.ST_IsRing, ("line",), "linestring_geom", "", False),
@@ -822,6 +857,13 @@ test_configurations = [
         "triangle_geom",
         "geom.radius",
         0.2927864015850548,
+    ),
+    (
+        stf.ST_MaximumInscribedCircle,
+        ("geom", 2.0),
+        "triangle_geom",
+        "ST_AsText(geom.center)",
+        "POINT (0.75 0.5)",
     ),
     (stf.ST_MaxDistance, ("a", "b"), "overlapping_polys", "", 3.1622776601683795),
     (stf.ST_Perimeter, ("geom",), "triangle_geom", "", 3.414213562373095),
@@ -1193,12 +1235,65 @@ test_configurations = [
         "",
         True,
     ),
+    (
+        stp.ST_Intersects,
+        (
+            lambda: f.expr("ST_3DMakeBox(ST_PointZ(0, 0, 0), ST_PointZ(5, 5, 5))"),
+            lambda: f.expr("ST_3DMakeBox(ST_PointZ(1, 1, 1), ST_PointZ(2, 2, 2))"),
+        ),
+        "triangle_geom",
+        "",
+        True,
+    ),
+    (
+        stp.ST_Contains,
+        (
+            lambda: f.expr("ST_3DMakeBox(ST_PointZ(0, 0, 0), ST_PointZ(5, 5, 5))"),
+            lambda: f.expr("ST_3DMakeBox(ST_PointZ(1, 1, 1), ST_PointZ(2, 2, 2))"),
+        ),
+        "triangle_geom",
+        "",
+        True,
+    ),
+    (
+        stp.ST_3DDWithin,
+        (
+            lambda: f.expr("ST_PointZ(0.0, 0.0, 0.0)"),
+            lambda: f.expr("ST_PointZ(1.0, 1.0, 1.0)"),
+            # 3D distance is sqrt(3) ≈ 1.732; 2.0 includes it.
+            2.0,
+        ),
+        "triangle_geom",
+        "",
+        True,
+    ),
     (stp.ST_Crosses, ("line", "poly"), "line_crossing_poly", "", True),
     (stp.ST_Disjoint, ("a", "b"), "two_points", "", True),
     (
         stp.ST_Equals,
         ("line", lambda: f.expr("ST_Reverse(line)")),
         "linestring_geom",
+        "",
+        True,
+    ),
+    (
+        stp.ST_EqualsExact,
+        (
+            lambda: f.expr("ST_Point(0.0, 0.0)"),
+            lambda: f.expr("ST_Point(0.03, 0.04)"),
+            0.051,
+        ),
+        "triangle_geom",
+        "",
+        True,
+    ),
+    (
+        stp.ST_EqualsIdentical,
+        (
+            lambda: f.expr("ST_GeomFromWKT('POINT Z (1 2 3)')"),
+            lambda: f.expr("ST_GeomFromWKT('POINT Z (1 2 3)')"),
+        ),
+        "triangle_geom",
         "",
         True,
     ),
@@ -1318,6 +1413,14 @@ test_configurations = [
         "",
         Box2D(0.0, 0.0, 1.0, 1.0),
     ),
+    (
+        sta.ST_3DExtent,
+        ("geom",),
+        "exploded_points",
+        "",
+        # 2D inputs fold Z=0 per PostGIS semantics.
+        Box3D(0.0, 0.0, 0.0, 1.0, 1.0, 0.0),
+    ),
     # Test aliases for *_Aggr functions with *_Agg suffix
     (
         sta.ST_Envelope_Agg,
@@ -1434,22 +1537,28 @@ wrong_type_configurations = [
     (stf.ST_ForcePolygonCW, (None,)),
     (stf.ST_ForcePolygonCCW, (None,)),
     (stf.ST_ForceRHR, (None,)),
-    (stf.ST_GeometryN, (None, 0)),
+    (stf.ST_GeometryN, (None, 1)),
     (stf.ST_GeometryN, ("", None)),
-    (stf.ST_GeometryN, ("", 0.0)),
+    (stf.ST_GeometryN, ("", 1.0)),
     (stf.ST_GeometryType, (None,)),
+    (stf.ST_HilbertDistance, (None, 0.0, 0.0, 1.0, 1.0, 2)),
+    (stf.ST_HilbertDistance, ("", None, 0.0, 1.0, 1.0, 2)),
+    (stf.ST_HilbertDistance, ("", 0.0, 0.0, 1.0, 1.0, 2.0)),
     (stf.ST_GeoHashNeighbors, (None,)),
     (stf.ST_GeoHashNeighbor, (None, "n")),
     (stf.ST_GeoHashNeighbor, ("", None)),
     (stf.ST_GeneratePoints, (None, 0.0)),
     (stf.ST_GeneratePoints, ("", None)),
-    (stf.ST_InteriorRingN, (None, 0)),
+    (stf.ST_InteriorRingN, (None, 1)),
     (stf.ST_InteriorRingN, ("", None)),
-    (stf.ST_InteriorRingN, ("", 0.0)),
+    (stf.ST_InteriorRingN, ("", 1.0)),
     (stf.ST_Intersection, (None, "")),
     (stf.ST_Intersection, ("", None)),
+    (stf.ST_SharedPaths, (None, "")),
+    (stf.ST_SharedPaths, ("", None)),
     (stf.ST_IsClosed, (None,)),
     (stf.ST_IsEmpty, (None,)),
+    (stf.ST_IsLineStringCCW, (None,)),
     (stf.ST_IsPolygonCW, (None,)),
     (stf.ST_IsPolygonCCW, (None,)),
     (stf.ST_IsRing, (None,)),
@@ -1484,6 +1593,7 @@ wrong_type_configurations = [
     (stf.ST_MakeValid, (None,)),
     (stf.ST_MakePolygon, (None,)),
     (stf.ST_MaximumInscribedCircle, (None,)),
+    (stf.ST_MaximumInscribedCircle, ("", [])),
     (stf.ST_MaxDistance, (None, None)),
     (stf.ST_MaxDistance, (None, "")),
     (stf.ST_MaxDistance, ("", None)),
@@ -1579,6 +1689,11 @@ wrong_type_configurations = [
     (stp.ST_Intersects, ("", None)),
     (stp.ST_OrderingEquals, (None, "")),
     (stp.ST_OrderingEquals, ("", None)),
+    (stp.ST_EqualsExact, (None, "", 0.0)),
+    (stp.ST_EqualsExact, ("", None, 0.0)),
+    (stp.ST_EqualsExact, ("", "", None)),
+    (stp.ST_EqualsIdentical, (None, "")),
+    (stp.ST_EqualsIdentical, ("", None)),
     (stp.ST_Overlaps, (None, "")),
     (stp.ST_Overlaps, ("", None)),
     (stp.ST_Touches, (None, "")),
@@ -1888,6 +2003,124 @@ class TestDataFrameAPI(TestBase):
             concurrent.futures.wait(futures)
         for future in futures:
             future.result()
+
+    def test_st_h3_to_parent(self):
+        df = self.spark.createDataFrame([(614552609325318143,)], ["cell"])
+        parent = df.select(stf.ST_H3ToParent("cell", 5)).first()[0]
+        assert parent == 601041811137363967
+
+    def test_st_h3_to_children(self):
+        parent = 601041811137363967
+        df = self.spark.createDataFrame([(parent, 6)], ["cell", "resolution"])
+        by_name, by_column, by_literal = df.select(
+            stf.ST_H3ToChildren("cell", 6),
+            stf.ST_H3ToChildren(f.col("cell"), f.col("resolution")),
+            stf.ST_H3ToChildren(parent, 6),
+        ).first()
+        assert len(by_name) == len(set(by_name)) == 7
+        assert by_name == by_column == by_literal
+        assert df.select(stf.ST_H3ToChildren("cell", 5)).first()[0] == [parent]
+
+    def test_st_h3_to_center_child(self):
+        parent = 601041811137363967
+        df = self.spark.createDataFrame([(parent, 6)], ["cell", "resolution"])
+        by_name, by_column, by_literal = df.select(
+            stf.ST_H3ToCenterChild("cell", 6),
+            stf.ST_H3ToCenterChild(f.col("cell"), f.col("resolution")),
+            stf.ST_H3ToCenterChild(parent, 6),
+        ).first()
+        assert by_name == by_column == by_literal == 605545409825210367
+        assert df.select(stf.ST_H3ToCenterChild("cell", 5)).first()[0] == parent
+        nullable = self.spark.createDataFrame(
+            [(None, 6), (parent, None), (None, None)], "cell long, resolution int"
+        )
+        assert all(
+            row[0] is None
+            for row in nullable.select(
+                stf.ST_H3ToCenterChild("cell", "resolution")
+            ).collect()
+        )
+
+    def test_st_h3_compact(self):
+        parent = 601041811137363967
+        children = self.spark.sql(f"SELECT ST_H3ToChildren({parent}, 6)").first()[0]
+        df = self.spark.createDataFrame([(children,)], ["cells"])
+        by_name, by_column, by_literal = df.select(
+            stf.ST_H3Compact("cells"),
+            stf.ST_H3Compact(f.col("cells")),
+            stf.ST_H3Compact(children),
+        ).first()
+        assert by_name == by_column == by_literal == [parent]
+        assert df.select(stf.ST_H3Compact([])).first()[0] == []
+        assert df.select(stf.ST_H3Compact([parent])).first()[0] == [parent]
+        nullable = self.spark.createDataFrame([(None,), ([],)], "cells array<long>")
+        assert [
+            row[0] for row in nullable.select(stf.ST_H3Compact("cells")).collect()
+        ] == [
+            None,
+            [],
+        ]
+
+    def test_st_h3_uncompact(self):
+        parent = 601041811137363967
+        df = self.spark.createDataFrame([([parent], 6)], ["cells", "resolution"])
+        by_name, by_column, by_literal = df.select(
+            stf.ST_H3Uncompact("cells", 6),
+            stf.ST_H3Uncompact(f.col("cells"), f.col("resolution")),
+            stf.ST_H3Uncompact([parent], 6),
+        ).first()
+        assert len(by_name) == len(set(by_name)) == 7
+        assert by_name == by_column == by_literal
+        assert df.select(stf.ST_H3Uncompact("cells", 5)).first()[0] == [parent]
+        assert df.select(stf.ST_H3Uncompact([], 6)).first()[0] == []
+
+    def test_coverage_validation_catalog_calls(self):
+        rows = self.spark.createDataFrame(
+            [
+                (
+                    "valid",
+                    "POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))",
+                    "POLYGON ((1 0, 1 1, 2 1, 2 0, 1 0))",
+                    None,
+                ),
+                (
+                    "overlap",
+                    "POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))",
+                    "POLYGON ((0.5 0, 0.5 1, 1.5 1, 1.5 0, 0.5 0))",
+                    None,
+                ),
+                (
+                    "null",
+                    None,
+                    "POLYGON ((1 0, 1 1, 2 1, 2 0, 1 0))",
+                    None,
+                ),
+            ],
+            "kind string, target_wkt string, adjacent_wkt string, "
+            "nullable_adjacent_wkt string",
+        ).select(
+            "kind",
+            stc.ST_GeomFromWKT("target_wkt").alias("target"),
+            f.array(
+                stc.ST_GeomFromWKT("adjacent_wkt"),
+                stc.ST_GeomFromWKT("nullable_adjacent_wkt"),
+            ).alias("adjacent"),
+        )
+
+        actual = {
+            row.kind: row.edges
+            for row in rows.select(
+                "kind",
+                f.expr(
+                    "__sedona_internal_coverage_invalid_edges_for_target("
+                    "target, adjacent, 0.0)"
+                ).alias("edges"),
+            ).collect()
+        }
+
+        assert actual["valid"].is_empty
+        assert not actual["overlap"].is_empty
+        assert actual["null"] is None
 
     @pytest.mark.skipif(
         os.getenv("SPARK_REMOTE") is not None and pyspark.__version__ < "4.0.0",

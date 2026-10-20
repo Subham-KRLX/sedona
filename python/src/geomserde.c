@@ -65,9 +65,7 @@ static SedonaErrorCode sedona_deserialize_point(GEOSContextHandle_t handle,
                                                 CoordinateSequenceInfo *cs_info,
                                                 GEOSGeometry **p_geom) {
   GEOSGeometry *geom = NULL;
-  if (cs_info->num_coords == 0) {
-    geom = dyn_GEOSGeom_createEmptyPoint_r(handle);
-  } else if (cs_info->dims == 2) {
+  if (cs_info->num_coords > 0 && cs_info->dims == 2) {
     /* fast path for 2D points */
     double x = *geom_buf->buf_coord++;
     double y = *geom_buf->buf_coord++;
@@ -122,15 +120,9 @@ static SedonaErrorCode sedona_serialize_linestring(
 static SedonaErrorCode sedona_deserialize_linestring(
     GEOSContextHandle_t handle, int srid, GeomBuffer *geom_buf,
     CoordinateSequenceInfo *cs_info, GEOSGeometry **p_geom) {
-  if (cs_info->num_coords == 0) {
-    GEOSGeometry *geom = dyn_GEOSGeom_createEmptyLineString_r(handle);
-    if (geom == NULL) {
-      return SEDONA_GEOS_ERROR;
-    }
-    *p_geom = geom;
-    return SEDONA_SUCCESS;
-  }
-
+  /* Preserve the stored dimensions for empty LineStrings too. The default
+   * GEOS empty constructor can add or drop dimensions depending on the version.
+   */
   GEOSCoordSequence *coord_seq = NULL;
   SedonaErrorCode err =
       geom_buf_read_coords(geom_buf, handle, cs_info, &coord_seq);
@@ -185,8 +177,22 @@ static SedonaErrorCode sedona_deserialize_polygon(
     GEOSContextHandle_t handle, int srid, GeomBuffer *geom_buf,
     CoordinateSequenceInfo *cs_info, GEOSGeometry **p_geom) {
   if (cs_info->num_coords == 0) {
-    GEOSGeometry *geom = dyn_GEOSGeom_createEmptyPolygon_r(handle);
+    /* An explicit empty shell preserves the stored Z/M layout. The default
+     * empty polygon constructor always creates an XY polygon. */
+    GEOSCoordSequence *coord_seq = NULL;
+    SedonaErrorCode err =
+        geom_buf_read_coords(geom_buf, handle, cs_info, &coord_seq);
+    if (err != SEDONA_SUCCESS) {
+      return err;
+    }
+    GEOSGeometry *shell = dyn_GEOSGeom_createLinearRing_r(handle, coord_seq);
+    if (shell == NULL) {
+      dyn_GEOSCoordSeq_destroy_r(handle, coord_seq);
+      return SEDONA_GEOS_ERROR;
+    }
+    GEOSGeometry *geom = dyn_GEOSGeom_createPolygon_r(handle, shell, NULL, 0);
     if (geom == NULL) {
+      dyn_GEOSGeom_destroy_r(handle, shell);
       return SEDONA_GEOS_ERROR;
     }
     *p_geom = geom;
@@ -276,14 +282,13 @@ static SedonaErrorCode sedona_deserialize_multipoint(
   SedonaErrorCode err = SEDONA_SUCCESS;
   for (int k = 0; k < num_points; k++) {
     GEOSGeometry *point = NULL;
-    if (cs_info->dims == 2) {
+    int is_empty =
+        isnan(geom_buf->buf_coord[0]) && isnan(geom_buf->buf_coord[1]);
+    if (cs_info->dims == 2 && !is_empty) {
       /* fast path for 2D points. We can get rid of constructing a coordinate
        * sequence object explicitly */
       double x = *geom_buf->buf_coord++;
       double y = *geom_buf->buf_coord++;
-      /* x and y will be NaN when serialized point was an empty point. GEOS
-       * will treat point with Nan ordinates as an empty point so we don't need
-       * to handle NaN specially. */
       point = dyn_GEOSGeom_createPointFromXY_r(handle, x, y);
       if (point == NULL) {
         err = SEDONA_GEOS_ERROR;
@@ -291,10 +296,15 @@ static SedonaErrorCode sedona_deserialize_multipoint(
       }
     } else {
       GEOSCoordSequence *coord_seq = NULL;
-      cs_info->num_coords = 1;
+      /* NaN ordinates do not create an empty Point on every GEOS version.
+       * A zero-length coordinate sequence preserves the stored empty layout. */
+      cs_info->num_coords = is_empty ? 0 : 1;
       err = geom_buf_read_coords(geom_buf, handle, cs_info, &coord_seq);
       if (err != SEDONA_SUCCESS) {
         goto handle_error;
+      }
+      if (is_empty) {
+        geom_buf->buf_coord += cs_info->dims;
       }
       point = dyn_GEOSGeom_createPoint_r(handle, coord_seq);
       if (point == NULL) {

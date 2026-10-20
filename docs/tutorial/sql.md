@@ -103,11 +103,11 @@ You can add additional Spark runtime config to the config builder. For example, 
 
 	config = SedonaContext.builder() .\
 	    config('spark.jars.packages',
-	           'org.apache.sedona:sedona-spark-shaded-3.3_2.12:{{ sedona.current_version }},'
+	           'org.apache.sedona:sedona-spark-shaded-3.5_2.12:{{ sedona.current_version }},'
 	           'org.datasyslab:geotools-wrapper:{{ sedona.current_geotools }}'). \
 	    getOrCreate()
 	```
-    If you are using a different Spark version, please replace the `3.3` in package name of sedona-spark-shaded with the corresponding major.minor version of Spark, such as `sedona-spark-shaded-3.4_2.12:{{ sedona.current_version }}`.
+    If you are using a different Spark version, please replace the `3.5` in package name of sedona-spark-shaded with the corresponding major.minor version of Spark, such as `sedona-spark-shaded-4.0_2.13:{{ sedona.current_version }}`.
 
 ## Initiate SedonaContext
 
@@ -138,6 +138,54 @@ Add the following line after creating Sedona config. If you already have a Spark
 	```
 
 You can also register everything by passing `--conf spark.sql.extensions=org.apache.sedona.sql.SedonaSqlExtensions` to `spark-submit` or `spark-shell`.
+
+## Parameterized queries (Python)
+
+`sedona.sql` supports the named parameters provided by [SparkSession.sql](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.sql.html). Bind values through `args` instead of inserting them into SQL strings with f-strings or concatenation. Pass a DataFrame as a keyword argument to reference it through a `{placeholder}`; Spark manages the temporary view for you.
+
+```python
+points = sedona.sql("""
+    SELECT 1 AS id, ST_Point(1D, 1D) AS geometry
+    UNION ALL
+    SELECT 2 AS id, ST_Point(5D, 5D) AS geometry
+""")
+region_wkt = "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))"
+
+result = sedona.sql(
+    """
+    SELECT id
+    FROM {points}
+    WHERE ST_Intersects(geometry, ST_GeomFromWKT(:region))
+    """,
+    args={"region": region_wkt},
+    points=points,
+)
+result.show()
+```
+
+```text
++---+
+| id|
++---+
+|  1|
++---+
+```
+
+Leave both `:region` and `{points}` unquoted. `:region` binds the WKT string as a SQL value, while `{points}` references the DataFrame.
+
+Shapely geometry objects cannot be bound directly. Pass `geometry.wkt` to `ST_GeomFromWKT`, or bind `geometry.wkb` and use `ST_GeomFromWKB`:
+
+```python
+from shapely.geometry import Point
+
+geometry = Point(1, 1)
+result = sedona.sql(
+    "SELECT ST_AsText(ST_GeomFromWKB(:geometry)) AS wkt",
+    args={"geometry": geometry.wkb},
+)
+print(result.first().wkt)
+# POINT (1 1)
+```
 
 ## Load data from text files
 

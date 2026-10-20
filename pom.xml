@@ -27,7 +27,7 @@
     </parent>
     <groupId>org.apache.sedona</groupId>
     <artifactId>sedona-parent</artifactId>
-    <version>1.9.1-SNAPSHOT</version>
+    <version>2.0.0-SNAPSHOT</version>
     <packaging>pom</packaging>
     <name>sedona-parent</name>
     <url>https://sedona.apache.org/</url>
@@ -68,25 +68,27 @@
         <maven.deploy.skip>${skip.deploy.common.modules}</maven.deploy.skip>
         <maven.compiler.plugin.version>3.10.1</maven.compiler.plugin.version>
 
-        <cdm.version>5.4.2</cdm.version>
+        <cdm.version>5.10.0</cdm.version>
+        <zstd-jni.version>1.5.5-4</zstd-jni.version>
         <geotools.version>33.1</geotools.version>
         <hadoop.version>3.2.4</hadoop.version>
         <jackson.version>2.13.4</jackson.version>
         <jts.version>1.20.0</jts.version>
+        <jts.io.patch.version>1.21.0-datasyslab-3</jts.io.patch.version>
         <jts2geojson.version>0.16.1</jts2geojson.version>
         <spatial4j.version>0.8</spatial4j.version>
 
-        <jt-jiffle.version>1.1.24</jt-jiffle.version>
-        <janino-version>3.1.9</janino-version>
+        <jt-jiffle.version>1.1.31</jt-jiffle.version>
+        <janino-version>3.1.12</janino-version>
 
         <!-- Actual scala, spark and log4j version will be set by activated profiles.
              Setting a default value helps IDE:s that can't make sense of profiles. -->
         <scala.compat.version>2.12</scala.compat.version>
-        <spark.version>3.4.0</spark.version>
-        <spark.compat.version>3.4</spark.compat.version>
+        <spark.version>3.5.0</spark.version>
+        <spark.compat.version>3.5</spark.compat.version>
         <spark.major.version>3</spark.major.version>
-        <log4j.version>2.25.3</log4j.version>
-        <graphframes.version>0.11.0</graphframes.version>
+        <log4j.version>2.25.4</log4j.version>
+        <graphframes.version>0.12.2</graphframes.version>
         <flink.version>1.19.0</flink.version>
         <slf4j.version>1.7.36</slf4j.version>
         <googles2.version>20250620-rc1</googles2.version>
@@ -96,7 +98,7 @@
         <scala-collection-compat.version>2.5.0</scala-collection-compat.version>
         <geoglib.version>1.52</geoglib.version>
         <caffeine.version>2.9.2</caffeine.version>
-        <proj4sedona.version>0.0.8</proj4sedona.version>
+        <proj4sedona.version>0.1.8</proj4sedona.version>
 
         <geotools.scope>provided</geotools.scope>
         <!-- Because it's not in Maven central, make it provided by default -->
@@ -156,6 +158,11 @@
                 <groupId>org.locationtech.jts</groupId>
                 <artifactId>jts-core</artifactId>
                 <version>${jts.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.datasyslab</groupId>
+                <artifactId>jts-io-patch</artifactId>
+                <version>${jts.io.patch.version}</version>
             </dependency>
             <dependency>
                 <groupId>org.locationtech.spatial4j</groupId>
@@ -357,6 +364,13 @@
                 <artifactId>guava</artifactId>
                 <version>${guava.version}</version>
             </dependency>
+            <!-- Decodes Zstandard-compressed NetCDF4/HDF5 variables. Provided because Spark ships it. -->
+            <dependency>
+                <groupId>com.github.luben</groupId>
+                <artifactId>zstd-jni</artifactId>
+                <version>${zstd-jni.version}</version>
+                <scope>provided</scope>
+            </dependency>
             <dependency>
                 <groupId>com.uber</groupId>
                 <artifactId>h3</artifactId>
@@ -381,7 +395,7 @@
             <dependency>
                 <groupId>org.datasyslab</groupId>
                 <artifactId>campskeleton</artifactId>
-                <version>0.0.2-20260118</version>
+                <version>0.0.2-20260823</version>
             </dependency>
             <!-- proj4sedona for CRS transformation (pure Java, no LGPL dependencies) -->
             <dependency>
@@ -713,21 +727,6 @@
             </repositories>
         </profile>
         <profile>
-            <id>sedona-spark-3.4</id>
-            <activation>
-                <property>
-                    <name>spark</name>
-                    <value>3.4</value>
-                </property>
-            </activation>
-            <properties>
-                <spark.version>3.4.0</spark.version>
-                <spark.compat.version>3.4</spark.compat.version>
-                <log4j.version>2.19.0</log4j.version>
-                <skip.deploy.common.modules>false</skip.deploy.common.modules>
-            </properties>
-        </profile>
-        <profile>
             <id>sedona-spark-3.5</id>
             <activation>
                 <property>
@@ -739,8 +738,7 @@
                 <spark.version>3.5.0</spark.version>
                 <spark.compat.version>3.5</spark.compat.version>
                 <log4j.version>2.20.0</log4j.version>
-                <!-- Skip deploying parent module. it will be deployed with sedona-spark-3.4 -->
-                <skip.deploy.common.modules>true</skip.deploy.common.modules>
+                <skip.deploy.common.modules>false</skip.deploy.common.modules>
             </properties>
         </profile>
         <profile>
@@ -762,7 +760,7 @@
                 <scala.version>2.13.17</scala.version>
                 <scala.compat.version>2.13</scala.compat.version>
 
-                <!-- Skip deploying parent module. it will be deployed with sedona-spark-3.4 -->
+                <!-- Skip deploying parent module. it will be deployed with sedona-spark-3.5 -->
                 <skip.deploy.common.modules>true</skip.deploy.common.modules>
             </properties>
         </profile>
@@ -785,7 +783,7 @@
                 <scala.version>2.13.17</scala.version>
                 <scala.compat.version>2.13</scala.compat.version>
 
-                <!-- Skip deploying parent module. it will be deployed with sedona-spark-3.4 -->
+                <!-- Skip deploying parent module. it will be deployed with sedona-spark-3.5 -->
                 <skip.deploy.common.modules>true</skip.deploy.common.modules>
             </properties>
         </profile>

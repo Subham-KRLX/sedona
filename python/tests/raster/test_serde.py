@@ -18,7 +18,7 @@
 import numpy as np
 import pytest
 import rasterio
-from pyspark.sql.functions import expr
+from pyspark.sql.functions import col, expr, udf
 from tests import world_map_raster_input_location
 from tests.test_base import TestBase
 
@@ -155,3 +155,133 @@ class TestRasterSerde(TestBase):
                         expected = expected % 16
                     assert arr[b, y, x] == expected
                     assert band[y, x] == expected
+
+    def test_nodata_override_trailer_survives_python_round_trip(self):
+        from sedona.spark.raster import raster_serde
+
+        original = self.spark.sql(
+            "SELECT RS_MakeRasterForTesting(1, 'D', 'BandedSampleModel', "
+            "4, 3, 100, 100, 10, -10, 0, 0, 3857) AS raster"
+        ).first()["raster"]
+        output = original.with_bands(original.as_numpy()[0].copy(), nodata=-9999.0)
+
+        serialized = raster_serde.serialize(output)
+        assert serialized.endswith(b"NDO1\x01")
+
+        round_tripped = raster_serde.deserialize(serialized)
+        assert round_tripped._sample_dimension_override_flags == [1]
+        assert round_tripped.bands_meta[0].nodata == -9999.0
+        np.testing.assert_array_equal(round_tripped.as_numpy(), output.as_numpy())
+
+        round_tripped.close()
+        output.close()
+        original.close()
+
+    @pytest.mark.parametrize(
+        ("num_bands", "data_type", "sample_model", "expected_pixel_type"),
+        [
+            pytest.param(
+                1,
+                "B",
+                "MultiPixelPackedSampleModel",
+                "UNSIGNED_8BITS",
+                id="multi-pixel-packed",
+            ),
+            pytest.param(
+                4,
+                "I",
+                "SinglePixelPackedSampleModel",
+                "SIGNED_32BITS",
+                id="single-pixel-packed",
+            ),
+        ],
+    )
+    def test_with_bands_retypes_packed_sample_models(
+        self, num_bands, data_type, sample_model, expected_pixel_type
+    ):
+        from sedona.spark.raster import raster_serde
+
+        df = self.spark.sql(
+            "SELECT RS_MakeRasterForTesting("
+            f"{num_bands}, '{data_type}', '{sample_model}', "
+            "10, 10, 100, 100, 10, -10, 0, 0, 3857) AS raster"
+        )
+        original = df.first()["raster"]
+        rebuilt = original.with_bands(original.as_numpy().copy())
+        expected_flags = [2] * num_bands
+        assert rebuilt._sample_dimension_override_flags == expected_flags
+        assert raster_serde.serialize(rebuilt).endswith(b"NDO1" + bytes(expected_flags))
+        rebuilt.close()
+        original.close()
+
+        @udf(returnType=RasterType())
+        def rebuild(raster):
+            return raster.with_bands(raster.as_numpy().copy())
+
+        result = (
+            df.select(rebuild(col("raster")).alias("out"))
+            .selectExpr("RS_BandPixelType(out, 1) AS pixel_type")
+            .first()
+        )
+
+        assert result["pixel_type"] == expected_pixel_type
+
+    def test_serialize_round_trip_via_udf(self):
+        """Deserialize → serialize round-trip through a raster-returning UDF.
+        Verifies that the Python-serialized bytes can be deserialized back
+        to produce correct pixel values.
+        """
+        from sedona.spark.raster import raster_serde
+
+        spark = self.spark
+
+        df = spark.sql(
+            "SELECT RS_MakeRasterForTesting(3, 'I', 'BandedSampleModel', "
+            "10, 8, 100, 100, 10, -10, 0, 0, 3857) as raster"
+        )
+        # Collect the deserialized raster from Spark
+        original = df.first()["raster"]
+
+        # Serialize on Python side and deserialize back
+        serialized = raster_serde.serialize(original)
+        round_tripped = raster_serde.deserialize(serialized)
+
+        # Verify pixel values for all 3 bands
+        arr = round_tripped.as_numpy()
+        assert arr.shape == (3, 8, 10)
+        for b in range(3):
+            for y in range(8):
+                for x in range(10):
+                    expected = b + y * 10 + x
+                    assert arr[b, y, x] == expected
+
+        round_tripped.close()
+        original.close()
+
+    def test_serialize_preserves_metadata(self):
+        """Verify CRS, affine, and dimensions survive serialize round-trip."""
+        from sedona.spark.raster import raster_serde
+
+        spark = self.spark
+
+        df = spark.sql(
+            "SELECT RS_MakeRasterForTesting(1, 'I', 'BandedSampleModel', "
+            "4, 3, 100, 100, 10, -10, 0, 0, 3857) as raster"
+        )
+        original = df.first()["raster"]
+
+        # Serialize and deserialize in Python
+        serialized = raster_serde.serialize(original)
+        round_tripped = raster_serde.deserialize(serialized)
+
+        # Verify spatial metadata survived the round-trip
+        assert round_tripped.width == 4
+        assert round_tripped.height == 3
+        assert round_tripped.affine_trans.scale_x == 10.0
+        assert round_tripped.affine_trans.scale_y == -10.0
+        assert round_tripped.affine_trans.ip_x == 100.0
+        assert round_tripped.affine_trans.ip_y == 100.0
+        assert "3857" in round_tripped.crs_wkt or "Mercator" in round_tripped.crs_wkt
+
+        round_tripped.close()
+        original.close()

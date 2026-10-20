@@ -20,18 +20,22 @@ package org.apache.sedona.flink;
 
 import org.apache.flink.table.functions.UserDefinedFunction;
 import org.apache.sedona.flink.expressions.*;
+import org.apache.sedona.flink.expressions.geography.GeographyConstructors;
 
 public class Catalog {
   public static UserDefinedFunction[] getFuncs() {
     return new UserDefinedFunction[] {
       new Aggregators.ST_Envelope_Aggr(),
       new Aggregators.ST_Extent(),
+      new Aggregators.ST_3DExtent(),
       new Aggregators.ST_Intersection_Aggr(),
       new Aggregators.ST_Union_Aggr(),
+      new Aggregators.ST_Collect_Aggr(),
       // Aliases for *_Aggr functions with *_Agg suffix
       new Aggregators.ST_Envelope_Agg(),
       new Aggregators.ST_Intersection_Agg(),
       new Aggregators.ST_Union_Agg(),
+      new Aggregators.ST_Collect_Agg(),
       new Constructors.ST_Point(),
       new Constructors.ST_PointZ(),
       new Constructors.ST_PointM(),
@@ -43,6 +47,7 @@ public class Catalog {
       new Constructors.ST_LinestringFromWKB(),
       new Constructors.ST_GeomFromBox2D(),
       new Constructors.ST_MakeBox2D(),
+      new Constructors.ST_3DMakeBox(),
       new Constructors.ST_MakeEnvelope(),
       new Constructors.ST_MakePoint(),
       new Constructors.ST_MakePointM(),
@@ -64,6 +69,16 @@ public class Catalog {
       new Constructors.ST_MPolyFromText(),
       new Constructors.ST_MLineFromText(),
       new Constructors.ST_GeomCollFromText(),
+      // Geography (ST_Geog*) constructors
+      new GeographyConstructors.ST_GeogFromWKT(),
+      new GeographyConstructors.ST_GeogFromText(),
+      new GeographyConstructors.ST_GeogFromEWKT(),
+      new GeographyConstructors.ST_GeogCollFromText(),
+      new GeographyConstructors.ST_GeogFromWKB(),
+      new GeographyConstructors.ST_GeogFromEWKB(),
+      new GeographyConstructors.ST_GeogFromGeoHash(),
+      new GeographyConstructors.ST_GeogToGeometry(),
+      new GeographyConstructors.ST_GeomToGeography(),
       new Functions.GeometryType(),
       new Functions.ST_Area(),
       new Functions.ST_AreaSpheroid(),
@@ -82,6 +97,7 @@ public class Catalog {
       new Functions.ST_CrossesDateLine(),
       new Functions.ST_Expand(),
       new Functions.ST_Box2D(),
+      new Functions.ST_Box3D(),
       new Functions.ST_Envelope(),
       new Functions.ST_OrientedEnvelope(),
       new Functions.ST_Difference(),
@@ -94,6 +110,12 @@ public class Catalog {
       new Functions.ST_H3CellIDs(),
       new Functions.ST_H3KRing(),
       new Functions.ST_H3ToGeom(),
+      new Functions.ST_H3ToParent(),
+      new Functions.ST_H3ToChildren(),
+      new Functions.ST_H3ToCenterChild(),
+      new Functions.ST_H3Uncompact(),
+      new Functions.ST_H3Compact(),
+      new Functions.ST_HilbertDistance(),
       new Functions.ST_BingTile(),
       new Functions.ST_BingTileAt(),
       new Functions.ST_BingTilesAround(),
@@ -167,6 +189,7 @@ public class Catalog {
       new Functions.ST_SetSRID(),
       new Functions.ST_SRID(),
       new Functions.ST_IsClosed(),
+      new Functions.ST_IsLineStringCCW(),
       new Functions.ST_IsPolygonCW(),
       new Functions.ST_IsRing(),
       new Functions.ST_IsSimple(),
@@ -206,6 +229,7 @@ public class Catalog {
       new Functions.ST_SimplifyPreserveTopology(),
       new Functions.ST_SimplifyVW(),
       new Functions.ST_SimplifyPolygonHull(),
+      new Functions.ST_SharedPaths(),
       new Functions.ST_Split(),
       new Functions.ST_Subdivide(),
       new Functions.ST_Segmentize(),
@@ -247,8 +271,6 @@ public class Catalog {
 
   public static UserDefinedFunction[] getPredicates() {
     return new UserDefinedFunction[] {
-      new Predicates.ST_BoxContains(),
-      new Predicates.ST_BoxIntersects(),
       new Predicates.ST_Intersects(),
       new Predicates.ST_Contains(),
       new Predicates.ST_Crosses(),
@@ -257,12 +279,15 @@ public class Catalog {
       new Predicates.ST_CoveredBy(),
       new Predicates.ST_Disjoint(),
       new Predicates.ST_Equals(),
+      new Predicates.ST_EqualsExact(),
+      new Predicates.ST_EqualsIdentical(),
       new Predicates.ST_OrderingEquals(),
       new Predicates.ST_Overlaps(),
       new Predicates.ST_Touches(),
       new Predicates.ST_Relate(),
       new Predicates.ST_RelateMatch(),
-      new Predicates.ST_DWithin()
+      new Predicates.ST_DWithin(),
+      new Predicates.ST_3DDWithin()
     };
   }
 }

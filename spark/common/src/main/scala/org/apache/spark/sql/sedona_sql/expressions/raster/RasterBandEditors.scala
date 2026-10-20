@@ -22,13 +22,21 @@ import org.apache.sedona.common.raster.RasterBandEditors
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.sedona_sql.expressions.InferrableFunctionConverter._
 import org.apache.spark.sql.sedona_sql.expressions.InferrableRasterTypes._
-import org.apache.spark.sql.sedona_sql.expressions.InferredExpression
+import org.apache.spark.sql.sedona_sql.expressions.{InferrableFunction, InferredExpression}
 
 private[apache] case class RS_SetBandNoDataValue(inputExpressions: Seq[Expression])
     extends InferredExpression(
-      inferrableFunction4(RasterBandEditors.setBandNoDataValue),
-      inferrableFunction3(RasterBandEditors.setBandNoDataValue),
-      inferrableFunction2(RasterBandEditors.setBandNoDataValue)) {
+      // A null noDataValue removes the band's no-data value, so let it through instead of
+      // null-propagating the whole expression.
+      InferrableFunction.allowRightNull3(RasterBandEditors.setBandNoDataValue),
+      InferrableFunction.allowRightNull(RasterBandEditors.setBandNoDataValue)) {
+  protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]) = {
+    copy(inputExpressions = newChildren)
+  }
+}
+
+private[apache] case class RS_ReplaceBandNoDataValue(inputExpressions: Seq[Expression])
+    extends InferredExpression(inferrableFunction3(RasterBandEditors.replaceBandNoDataValue)) {
   protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]) = {
     copy(inputExpressions = newChildren)
   }
@@ -44,7 +52,11 @@ private[apache] case class RS_AddBand(inputExpressions: Seq[Expression])
   }
 }
 
-private[apache] case class RS_Union(inputExpressions: Seq[Expression])
+/**
+ * Stacks the bands of 2 to 7 rasters, in argument order, into one raster. Named RS_Union before
+ * Sedona 2.0; it does not merge grids the way a raster union (PostGIS ST_Union) does.
+ */
+private[apache] case class RS_Stack(inputExpressions: Seq[Expression])
     extends InferredExpression(
       inferrableFunction2(RasterBandEditors.rasterUnion),
       inferrableFunction3(RasterBandEditors.rasterUnion),

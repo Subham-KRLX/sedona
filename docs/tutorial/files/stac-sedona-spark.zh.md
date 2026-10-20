@@ -78,6 +78,8 @@ root
  |-- constellation: string (nullable = true)
  |-- mission: string (nullable = true)
  |-- grid:code: string (nullable = true)
+ |-- eo:cloud_cover: double (nullable = true)
+ |-- eo:snow_cover: double (nullable = true)
  |-- gsd: double (nullable = true)
  |-- collection: string (nullable = true)
  |-- links: array (nullable = true)
@@ -152,6 +154,16 @@ SELECT id, datetime as dt, geometry, bbox FROM STAC_TABLE
 ```
 
 该例中，数据源会把空间过滤下推到底层数据源。
+
+### 带 EO 扩展过滤的 SQL Select
+
+```sql
+  SELECT id, datetime, geometry, `eo:cloud_cover`
+  FROM STAC_TABLE
+  WHERE `eo:cloud_cover` < 20.0
+```
+
+该例按 [EO 扩展](https://github.com/stac-extensions/eo) 中的云覆盖百分比进行过滤。当 STAC item properties 中包含 `eo:cloud_cover` 和 `eo:snow_cover` 字段时，会被自动提取。
 
 ### Sedona 的 STAC 读取器配置
 
@@ -228,6 +240,8 @@ items = client.search(
 )
 ```
 
+`max_items` 遵循 pystac-client 的语义：它限制最终返回的 Item 总数，而 `itemsLimitPerRequest` 仅控制建议的单页大小。`search()` 不暴露 `itemsLimitPerRequest`——Python 客户端会自行选择页大小，该选项的默认值 10 仅适用于直接通过 DataFrame 读取器加载的场景。当指定了 collection、最多包含一个 `datetime` 区间、可选一个或多个 `bbox`（且没有 ID 或 geometry 过滤）时，Sedona 会把每个 bbox 作为一个独立的搜索发送到 collection 公告的 Items 端点。若 `max_items` 为正数，该搜索同时带有上限，页大小为 `min(200, max_items)`。若调用方未提供 `max_items`（例如 `save_to_geoparquet`），`bbox` 与 `datetime` 仍会下推到 API，由端点而非 Spark 过滤不匹配的 Item；每个 bbox 的搜索以单页 200 个 Item 遍历端点，不施加枚举上限。Python 客户端会先合并多个 bbox 的结果并按 `(collection, id)` 去重，再应用全局 `max_items` 限制。多个 datetime 区间、ID 过滤以及 `search()` 的 `geometry` 参数属于由 Spark 执行的 Sedona 扩展；这些搜索在读取器层保持无上限，以便 Spark 检查每个 Item，但单次请求获取 200 个 Item，从而减少分页开销。
+
 #### 按 bbox 与时间区间搜索
 
 ```python
@@ -244,7 +258,12 @@ items = client.search(
 
 ```python
 bbox_list = [[-180.0, -90.0, 180.0, 90.0], [-100.0, -50.0, 100.0, 50.0]]
-items = client.search(collection_id="aster-l1t", bbox=bbox_list, return_dataframe=False)
+items = client.search(
+    collection_id="aster-l1t",
+    bbox=bbox_list,
+    max_items=200,
+    return_dataframe=False,
+)
 ```
 
 #### 在多个时间区间内搜索并以 DataFrame 返回
@@ -445,7 +464,7 @@ df.show()
 
 ---
 
-**`search(*ids: Union[str, list], collection_id: str, bbox: Optional[list] = None, datetime: Optional[Union[str, datetime.datetime, list]] = None, max_items: Optional[int] = None, return_dataframe: bool = True) -> Union[Iterator[PyStacItem], DataFrame]`**
+**`search(*ids: Union[str, list], collection_id: str, bbox: Optional[list] = None, geometry: Optional[Union[str, BaseGeometry, list]] = None, datetime: Optional[Union[str, datetime.datetime, list]] = None, max_items: Optional[int] = None, return_dataframe: bool = True) -> Union[Iterator[PyStacItem], DataFrame]`**
 在指定 collection 中按可选过滤条件搜索 item。
 
 参数：
@@ -453,6 +472,7 @@ df.show()
 * `ids` (*Union[str, list]*)：可变数量的 item ID，用于过滤。例如 `"item_id1"` 或 `["item_id1", "item_id2"]`。
 * `collection_id` (*str*)：要搜索的 collection ID。例如 `"aster-l1t"`。
 * `bbox` (*Optional[list]*)：用于过滤 item 的边界框列表，每项形如 `[min_lon, min_lat, max_lon, max_lat]`。例如 `[[ -180.0, -90.0, 180.0, 90.0 ]]`。
+* `geometry` (*Optional[Union[str, BaseGeometry, list]]*)：用于空间过滤的 Shapely 几何对象或 WKT 字符串；可以是单个几何、WKT 字符串或它们的列表。同时提供 `bbox` 和 `geometry` 时以 `geometry` 为准。geometry 过滤由 Spark 执行，而非 STAC API。例如 `"POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))"`。
 * `datetime` (*Optional[Union[str, datetime.datetime, list]]*)：单个日期时间、符合 RFC 3339 的时间戳，或一组时间区间。例如 `"2020-01-01T00:00:00Z"`、`datetime.datetime(2020, 1, 1)`、`[["2020-01-01T00:00:00Z", "2021-01-01T00:00:00Z"]]`。
 * `max_items` (*Optional[int]*)：返回 item 的最大数量。例如 `100`。
 * `return_dataframe` (*bool*)：若为 `True`（默认），返回 Spark DataFrame，而不是 `PyStacItem` 迭代器。例如 `True`。

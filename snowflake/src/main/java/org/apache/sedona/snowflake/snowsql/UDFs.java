@@ -27,6 +27,7 @@ import org.apache.sedona.common.Predicates;
 import org.apache.sedona.common.enums.FileDataSplitter;
 import org.apache.sedona.common.sphere.Haversine;
 import org.apache.sedona.common.sphere.Spheroid;
+import org.apache.sedona.common.utils.HilbertDistance;
 import org.apache.sedona.snowflake.snowsql.annotations.UDFAnnotations;
 import org.locationtech.jts.geom.Geometry;
 import org.locationtech.jts.geom.Point;
@@ -347,7 +348,7 @@ public class UDFs {
   }
 
   @UDFAnnotations.ParamMeta(argNames = {"left", "right"})
-  public static double ST_Distance(byte[] left, byte[] right) {
+  public static Double ST_Distance(byte[] left, byte[] right) {
     return Functions.distance(GeometrySerde.deserialize(left), GeometrySerde.deserialize(right));
   }
 
@@ -399,6 +400,21 @@ public class UDFs {
   @UDFAnnotations.ParamMeta(argNames = {"leftGeometry", "rightGeometry"})
   public static boolean ST_Equals(byte[] leftGeometry, byte[] rightGeometry) {
     return Predicates.equals(
+        GeometrySerde.deserialize(leftGeometry), GeometrySerde.deserialize(rightGeometry));
+  }
+
+  @UDFAnnotations.ParamMeta(argNames = {"leftGeometry", "rightGeometry", "tolerance"})
+  public static boolean ST_EqualsExact(
+      byte[] leftGeometry, byte[] rightGeometry, double tolerance) {
+    return Predicates.equalsExact(
+        GeometrySerde.deserialize(leftGeometry),
+        GeometrySerde.deserialize(rightGeometry),
+        tolerance);
+  }
+
+  @UDFAnnotations.ParamMeta(argNames = {"leftGeometry", "rightGeometry"})
+  public static boolean ST_EqualsIdentical(byte[] leftGeometry, byte[] rightGeometry) {
+    return Predicates.equalsIdentical(
         GeometrySerde.deserialize(leftGeometry), GeometrySerde.deserialize(rightGeometry));
   }
 
@@ -526,15 +542,22 @@ public class UDFs {
   }
 
   @UDFAnnotations.ParamMeta(argNames = {"geom1", "geom2"})
-  public static double ST_HausdorffDistance(byte[] geom1, byte[] geom2) {
+  public static Double ST_HausdorffDistance(byte[] geom1, byte[] geom2) {
     return Functions.hausdorffDistance(
         GeometrySerde.deserialize(geom1), GeometrySerde.deserialize(geom2));
   }
 
   @UDFAnnotations.ParamMeta(argNames = {"geom1", "geom2", "densifyFrac"})
-  public static double ST_HausdorffDistance(byte[] geom1, byte[] geom2, double densifyFrac) {
+  public static Double ST_HausdorffDistance(byte[] geom1, byte[] geom2, double densifyFrac) {
     return Functions.hausdorffDistance(
         GeometrySerde.deserialize(geom1), GeometrySerde.deserialize(geom2), densifyFrac);
+  }
+
+  @UDFAnnotations.ParamMeta(argNames = {"geometry", "xmin", "ymin", "xmax", "ymax", "level"})
+  public static long ST_HilbertDistance(
+      byte[] geometry, double xmin, double ymin, double xmax, double ymax, int level) {
+    return HilbertDistance.compute(
+        GeometrySerde.deserialize(geometry), xmin, ymin, xmax, ymax, level);
   }
 
   @UDFAnnotations.ParamMeta(argNames = {"geometry", "n"})
@@ -546,6 +569,13 @@ public class UDFs {
   public static byte[] ST_Intersection(byte[] leftGeometry, byte[] rightGeometry) {
     return GeometrySerde.serialize(
         Functions.intersection(
+            GeometrySerde.deserialize(leftGeometry), GeometrySerde.deserialize(rightGeometry)));
+  }
+
+  @UDFAnnotations.ParamMeta(argNames = {"leftGeometry", "rightGeometry"})
+  public static byte[] ST_SharedPaths(byte[] leftGeometry, byte[] rightGeometry) {
+    return GeometrySerde.serialize(
+        Functions.sharedPaths(
             GeometrySerde.deserialize(leftGeometry), GeometrySerde.deserialize(rightGeometry)));
   }
 
@@ -568,6 +598,11 @@ public class UDFs {
   @UDFAnnotations.ParamMeta(argNames = {"geometry"})
   public static boolean ST_IsEmpty(byte[] geometry) {
     return Functions.isEmpty(GeometrySerde.deserialize(geometry));
+  }
+
+  @UDFAnnotations.ParamMeta(argNames = {"geometry"})
+  public static boolean ST_IsLineStringCCW(byte[] geometry) {
+    return Functions.isLineStringCCW(GeometrySerde.deserialize(geometry));
   }
 
   @UDFAnnotations.ParamMeta(argNames = {"geometry"})

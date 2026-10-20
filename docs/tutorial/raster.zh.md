@@ -17,57 +17,33 @@
  under the License.
  -->
 
-!!!note
-    Sedona 中所有栅格函数均使用从 1 开始的索引，唯一例外是 [map algebra 函数](../api/sql/Raster-map-algebra.md)，它使用从 0 开始的索引。
+Sedona SQL 在矢量之外也原生支持栅格数据。本教程使用同一份数据集，把它从加载、检视、可视化、处理、再次可视化到落盘走完一遍完整的流水线，让你能直接看到每一步产出的结果。其他格式、所有算子的速查、以及 Python 端的额外用法，放在文末的参考章节。
 
 !!!note
-    Sedona 假定地理坐标按 lon/lat 顺序排列。如果您的数据是 lat/lon 顺序，请使用 `ST_FlipCoordinates` 交换 X 与 Y。
+    Sedona 中所有栅格函数均使用从 1 开始的索引，唯一例外是 [map algebra](../api/sql/Raster-map-algebra.md)，它使用从 0 开始的索引。
 
-自 `v1.1.0` 起，Sedona SQL 在 DataFrame 与 SQL 中支持栅格数据源与栅格算子。==Scala、Java、Python、R== 等所有 Sedona 语言绑定都已支持栅格能力。
+!!!note
+    Sedona 假定地理坐标按经度/纬度顺序排列。若数据是 lat/lon 顺序，请使用 `ST_FlipCoordinates` 交换 X 与 Y。
 
-本页介绍如何使用 SedonaSQL 管理栅格数据。
-
-=== "Scala"
-
-	```scala
-	var myDataFrame = sedona.sql("YOUR_SQL")
-	myDataFrame.createOrReplaceTempView("rasterDf")
-	```
-
-=== "Java"
-
-	```java
-	Dataset<Row> myDataFrame = sedona.sql("YOUR_SQL")
-	myDataFrame.createOrReplaceTempView("rasterDf")
-	```
-
-=== "Python"
-
-	```python
-	myDataFrame = sedona.sql("YOUR_SQL")
-	myDataFrame.createOrReplaceTempView("rasterDf")
-	```
-
-SedonaSQL 详细 API 说明请参阅 [SedonaSQL API](../api/sql/Overview.md)。示例栅格数据可在 [Sedona GitHub 仓库](https://github.com/apache/sedona/blob/0eae42576c2588fe278f75cef3b17fee600eac90/spark/common/src/test/resources/raster/raster_with_no_data/test5.tiff) 中找到。
+Scala、Java、Python、R 等所有 Sedona 语言绑定都已支持栅格能力。本教程以 Python 为主语言进行示例，关键步骤会附上多语言切换标签。
 
 ## 配置依赖
 
 === "Scala/Java"
 
 	1. 阅读 [Sedona Maven Central 坐标](../setup/maven-coordinates.md)，并在 build.sbt 或 pom.xml 中添加 Sedona 依赖。
-	2. 在 build.sbt 或 pom.xml 中添加 [Apache Spark core](https://mvnrepository.com/artifact/org.apache.spark/spark-core) 与 [Apache SparkSQL](https://mvnrepository.com/artifact/org.apache.spark/spark-sql) 依赖。
+	2. 添加 [Apache Spark core](https://mvnrepository.com/artifact/org.apache.spark/spark-core) 与 [Apache SparkSQL](https://mvnrepository.com/artifact/org.apache.spark/spark-sql) 依赖。
 	3. 参考 [SQL 示例项目](demo.md)。
 
 === "Python"
 
-	1. 请阅读 [快速开始](../setup/install-python.md) 安装 Sedona Python。
-	2. 本教程基于 [Sedona SQL Jupyter Notebook 示例](jupyter-notebook.md)。
+	1. 阅读 [快速开始](../setup/install-python.md) 安装 Sedona Python。
+	2. 本教程结构参考 [Sedona SQL Jupyter Notebook 示例](jupyter-notebook.md)。
+	3. 教程主线使用 NumPy 和 rasterio 合成输入场景：`pip install numpy rasterio`。如果直接读取已有的 GeoTIFF，则无需安装 rasterio。
 
-## 创建 Sedona 配置
+## 创建 SedonaContext
 
-在程序起始处使用以下代码创建 Sedona 配置。如果您已经有了由 Wherobots / AWS EMR / Databricks 创建的 SparkSession（通常名为 `spark`），可跳过此步骤直接使用 `spark`。
-
-可以在 builder 中追加额外的 Spark 运行时配置，例如 `SedonaContext.builder().config("spark.sql.autoBroadcastJoinThreshold", "10485760")`。
+若你已经有 SparkSession（例如来自 Wherobots、AWS EMR 或 Databricks），可直接跳过此步并把它传入 `SedonaContext.create`。否则：
 
 === "Scala"
 
@@ -75,52 +51,9 @@ SedonaSQL 详细 API 说明请参阅 [SedonaSQL API](../api/sql/Overview.md)。�
 	import org.apache.sedona.spark.SedonaContext
 
 	val config = SedonaContext.builder()
-	.master("local[*]") // 集群模式下请删除此行
-	.appName("readTestScala") // 改成合适的名字
-	.getOrCreate()
-	```
-	如果同时使用 SedonaViz 与 SedonaSQL，请在 `SedonaContext.builder()` 之后追加以下行启用 Sedona Kryo 序列化器：
-	```scala
-	.config("spark.kryo.registrator", classOf[SedonaVizKryoRegistrator].getName) // org.apache.sedona.viz.core.Serde.SedonaVizKryoRegistrator
-	```
-
-=== "Java"
-
-	```java
-	import org.apache.sedona.spark.SedonaContext;
-
-	SparkSession config = SedonaContext.builder()
-	.master("local[*]") // 集群模式下请删除此行
-	.appName("readTestScala") // 改成合适的名字
-	.getOrCreate()
-	```
-	如果同时使用 SedonaViz 与 SedonaSQL，请在 `SedonaContext.builder()` 之后追加以下行启用 Sedona Kryo 序列化器：
-	```scala
-	.config("spark.kryo.registrator", SedonaVizKryoRegistrator.class.getName) // org.apache.sedona.viz.core.Serde.SedonaVizKryoRegistrator
-	```
-
-=== "Python"
-
-	```python
-	from sedona.spark import *
-
-	config = SedonaContext.builder() .\
-	    config('spark.jars.packages',
-	           'org.apache.sedona:sedona-spark-shaded-3.3_2.12:{{ sedona.current_version }},'
-	           'org.datasyslab:geotools-wrapper:{{ sedona.current_geotools }}'). \
-	    getOrCreate()
-	```
-    请将 sedona-spark-shaded 包名中的 `3.3` 替换为对应的 Spark major.minor 版本，例如 `sedona-spark-shaded-3.4_2.12:{{ sedona.current_version }}`。
-
-## 初始化 SedonaContext
-
-在创建 Sedona 配置之后加上以下代码。如果您已经有了由 Wherobots / AWS EMR / Databricks 创建的 SparkSession（通常名为 `spark`），请改为调用 `SedonaContext.create(spark)`。
-
-=== "Scala"
-
-	```scala
-	import org.apache.sedona.spark.SedonaContext
-
+	  .master("local[*]") // 在集群上运行时请删除此行
+	  .appName("rasterTutorial")
+	  .getOrCreate()
 	val sedona = SedonaContext.create(config)
 	```
 
@@ -129,542 +62,630 @@ SedonaSQL 详细 API 说明请参阅 [SedonaSQL API](../api/sql/Overview.md)。�
 	```java
 	import org.apache.sedona.spark.SedonaContext;
 
-	SparkSession sedona = SedonaContext.create(config)
+	SparkSession config = SedonaContext.builder()
+	  .master("local[*]") // 在集群上运行时请删除此行
+	  .appName("rasterTutorial")
+	  .getOrCreate();
+	SparkSession sedona = SedonaContext.create(config);
 	```
 
 === "Python"
 
 	```python
-	from sedona.spark import *
+	from sedona.spark import SedonaContext
 
+	config = (
+	    SedonaContext.builder()
+	    .config(
+	        "spark.jars.packages",
+	        "org.apache.sedona:sedona-spark-shaded-3.5_2.12:{{ sedona.current_version }},"
+	        "org.datasyslab:geotools-wrapper:{{ sedona.current_geotools }}",
+	    )
+	    .getOrCreate()
+	)
 	sedona = SedonaContext.create(config)
 	```
+	请将 `sedona-spark-shaded-3.5` 中的 `3.5` 替换为对应的 Spark 主.次版本号，例如 `sedona-spark-shaded-4.0_2.13`。
 
-也可以通过 `spark-submit` / `spark-shell` 传入 `--conf spark.sql.extensions=org.apache.sedona.sql.SedonaSqlExtensions` 一并完成注册。
+你也可以通过给 `spark-submit` 或 `spark-shell` 传入 `--conf spark.sql.extensions=org.apache.sedona.sql.SedonaSqlExtensions` 来注册 Sedona。
 
-## 加载 GeoTiff 数据
+## 端到端教程
 
-加载 GeoTiff 栅格数据的推荐方式是 `raster` 数据源。它会加载 GeoTiff 文件并自动将其切分为较小的 tile，每个 tile 在结果 DataFrame 中作为一行，并以 `Raster` 类型存储。
+本教程贯穿一份 2 波段 GeoTIFF —— 一小块 AOI 上的红光与近红外反射率影像 —— 让它走完一条典型的栅格处理流水线。场景影像在 Python 中合成，因此整个示例可重复运行，仓库无需新增任何二进制数据。对真实的 Sentinel-2 切片，下面同样的 SQL 不用改一行就能跑，仅输入路径需要换一下。
+
+![流水线总览](../image/raster-tutorial/00-pipeline.png)
+
+??? example "真实栅格长什么样"
+
+    上面这套代码可处理任何符合 GeoTIFF 规范的数据。下面两个示例来自 Sedona 自带的测试资源：
+
+    | 3 波段彩色栅格 | 单波段栅格 |
+    | :--- | :--- |
+    | ![多波段](../image/raster-tutorial/real-rgb.png) | ![单波段](../image/raster-tutorial/real-singleband.png) |
+
+    它们的 `RS_NumBands(rast)` 分别返回 `3` 和 `1`。`RS_Band(rast, ARRAY(1,2,3))`、`RS_MapAlgebra` 等波段级函数在两类栅格上用法一致。
+
+### 1. 准备输入场景
+
+合成一份 256 × 256 的栅格，其中包含一块圆形植被田。真实工作流跳过这一步，直接让 Sedona 读取磁盘或对象存储上已有的 GeoTIFF。
+
+```python
+import os
+import numpy as np
+import rasterio
+from rasterio.transform import from_bounds
+
+WORK = "/tmp/sedona-raster-tutorial"
+os.makedirs(WORK, exist_ok=True)
+
+AOI = (-91.10, 41.50, -91.00, 41.60)  # xmin, ymin, xmax, ymax，EPSG:4326
+W = H = 256
+transform = from_bounds(*AOI, W, H)
+rng = np.random.default_rng(42)
+
+ys, xs = np.mgrid[0:H, 0:W]
+field = ((xs - 96) ** 2 + (ys - 160) ** 2) < 60**2  # 圆形植被田
+
+red = (1500 + 200 * rng.standard_normal((H, W))).clip(0, 10000).astype("uint16")
+nir = (1800 + 200 * rng.standard_normal((H, W))).clip(0, 10000)
+nir = np.where(field, nir + 4000, nir).astype("uint16")
+
+with rasterio.open(
+    f"{WORK}/scene.tif",
+    "w",
+    driver="GTiff",
+    tiled=True,
+    blockxsize=256,
+    blockysize=256,
+    height=H,
+    width=W,
+    count=2,
+    dtype="uint16",
+    crs="EPSG:4326",
+    transform=transform,
+) as dst:
+    dst.write(red, 1)
+    dst.set_band_description(1, "red")
+    dst.write(nir, 2)
+    dst.set_band_description(2, "nir")
+```
+
+### 2. 使用 `raster` 数据源加载
+
+`raster` 数据源可以加载 GeoTIFF 并自动将文件切成多个 tile。每一个 tile 在结果 DataFrame 中对应一行，`Raster` 类型保存于其中的一列。
 
 === "Scala"
-    ```scala
-    var rasterDf = sedona.read.format("raster").load("/some/path/*.tif")
-    rasterDf.createOrReplaceTempView("rasterDf")
-    rasterDf.show()
-    ```
+
+	```scala
+	// 把路径替换为 scene.tif 的实际位置，例如对象存储 URL。
+	val rasterDf = sedona.read.format("raster").load("/tmp/sedona-raster-tutorial/scene.tif")
+	rasterDf.createOrReplaceTempView("rasterDf")
+	rasterDf.show()
+	```
 
 === "Java"
-    ```java
-    Dataset<Row> rasterDf = sedona.read().format("raster").load("/some/path/*.tif");
-    rasterDf.createOrReplaceTempView("rasterDf");
-    rasterDf.show();
-    ```
+
+	```java
+	// 把路径替换为 scene.tif 的实际位置，例如对象存储 URL。
+	Dataset<Row> rasterDf = sedona.read().format("raster").load("/tmp/sedona-raster-tutorial/scene.tif");
+	rasterDf.createOrReplaceTempView("rasterDf");
+	rasterDf.show();
+	```
 
 === "Python"
-    ```python
-    rasterDf = sedona.read.format("raster").load("/some/path/*.tif")
-    rasterDf.createOrReplaceTempView("rasterDf")
-    rasterDf.show()
-    ```
 
-输出大致如下：
+	```python
+	rasterDf = sedona.read.format("raster").load(f"{WORK}/scene.tif")
+	rasterDf.createOrReplaceTempView("rasterDf")
+	rasterDf.show()
+	```
 
 ```
-+--------------------+---+---+----+
-|                rast|  x|  y|name|
-+--------------------+---+---+----+
-|GridCoverage2D["g...|  0|  0| ...|
-|GridCoverage2D["g...|  1|  0| ...|
-|GridCoverage2D["g...|  2|  0| ...|
-...
++--------------------+---+---+----------+
+|                rast|  x|  y|      name|
++--------------------+---+---+----------+
+|GridCoverage2D["g...|  0|  0| scene.tif|
++--------------------+---+---+----------+
 ```
 
 各列含义：
 
-- `rast`：以 `Raster` 类型表示的栅格数据。
-- `x`：tile 的 X 坐标（从 0 开始）；只有未禁用 retile 时才会出现。
-- `y`：tile 的 Y 坐标（从 0 开始）；同上。
-- `name`：栅格文件名。
+- `rast` —— 栅格数据，Sedona 内置 `Raster` 类型。
+- `x`、`y` —— 当前 tile 在源文件内的 0 基索引（仅在启用 retile 时出现）。
+- `name` —— 源文件名。
 
-### Tiling 选项
+256 × 256 的场景在这里恰好放在一个 tile 中，所以 DataFrame 只有一行。一份几 GB 的 GeoTIFF 则会产生很多行 —— 下游同一份 SQL 在两种情况下都能工作。
 
-默认情况下启用 tiling（`retile = true`），且 tile 大小由 GeoTiff 的内部 tile 方案决定，无需手动指定 `tileWidth` 或 `tileHeight`。建议栅格数据使用 [Cloud Optimized GeoTIFF (COG)](https://www.cogeo.org/) 格式，因为它通常会把像素数据组织为正方形 tile。
+![Tiling 流程示意](../image/raster-tutorial/tiling-flow.svg)
 
-也可以可选地覆盖 tile 大小，或完全禁用 tiling：
+更多内容见下文的 [加载选项](#loading-options)：包括 tile 大小覆盖、目录递归读取、以及 NetCDF / Arc Grid 等非 GeoTIFF 格式。
+
+### 3. 检视元数据
+
+在做任何处理之前，先确认像素维度、地理参考与坐标系：
+
+```python
+sedona.sql("""
+    SELECT RS_Width(rast)       AS width,
+           RS_Height(rast)      AS height,
+           RS_NumBands(rast)    AS bands,
+           RS_SRID(rast)        AS srid,
+           RS_GeoReference(rast) AS world_file
+    FROM rasterDf
+""").show(truncate=False)
+```
+
+```
++-----+------+-----+----+----------------------------------------------------------+
+|width|height|bands|srid|world_file                                                 |
++-----+------+-----+----+----------------------------------------------------------+
+|256  |256   |2    |4326|0.000391\n0.000000\n0.000000\n-0.000391\n-91.099805\n41.599805|
++-----+------+-----+----+----------------------------------------------------------+
+```
+
+[`RS_MetaData`](../api/sql/Raster-Operators/RS_MetaData.md) 把同样的信息以单个数组返回：`[upperLeftX, upperLeftY, width, height, scaleX, scaleY, skewX, skewY, srid, numBands]`。
+
+地理参考字段共同定义了从像素空间到世界坐标的仿射变换：
+
+![仿射变换](../image/Raster_Affine_Transformation/Raster_Affine_Transformation.svg)
+
+每个访问器的详细说明见 [栅格元数据参考](#raster-metadata-reference)；运行时的像素—世界坐标互转使用 [`RS_PixelAsPoint`](../api/sql/Pixel-Functions/RS_PixelAsPoint.md) 与 [`RS_WorldToRasterCoord`](../api/sql/Raster-Accessors/RS_WorldToRasterCoord.md)。
+
+### 4. 可视化原始栅格
+
+先把两个波段渲染出来，看看处理前的输入是什么样子。`SedonaUtils.display_image` 在 Jupyter notebook 中会自动检测栅格列并就地渲染：
+
+```python
+from sedona.spark import SedonaUtils
+
+SedonaUtils.display_image(
+    sedona.sql("SELECT RS_Band(rast, ARRAY(1)) AS rast FROM rasterDf")
+)
+SedonaUtils.display_image(
+    sedona.sql("SELECT RS_Band(rast, ARRAY(2)) AS rast FROM rasterDf")
+)
+```
+
+波段 1 是红光通道 —— 大体是没什么特征的裸地。波段 2 (NIR) 在植被田上明显变亮：
+
+| 波段 1（红光） | 波段 2 (NIR) |
+| :--- | :--- |
+| ![原始红光波段](../image/raster-tutorial/01-raw-red.png) | ![原始 NIR 波段](../image/raster-tutorial/02-raw-nir.png) |
+
+如果不在 notebook 环境，使用 [`RS_AsImage(rast, width)`](../api/sql/Raster-Output/RS_AsImage.md) 得到 HTML `<img>` 标签，或者用 [`RS_AsBase64`](../api/sql/Raster-Output/RS_AsBase64.md) 得到任意图像查看器都能解码的 Base64 字符串。
+
+### 5. 处理 —— 用 map algebra 计算 NDVI
+
+归一化植被指数（NDVI）可以把活体植被从其他地物中分离出来：
+
+```
+NDVI = (NIR − Red) / (NIR + Red)
+```
+
+[`RS_MapAlgebra`](../api/sql/Raster-map-algebra.md) 在一个或多个波段上按像素运行一段脚本。输出类型 `'D'`（double）保留 NDVI 的负值范围：
+
+```python
+ndviDf = sedona.sql("""
+    SELECT RS_MapAlgebra(
+               rast, 'D',
+               'out[0] = (rast[1] - rast[0]) / (rast[1] + rast[0] + 1e-6);'
+           ) AS rast
+    FROM rasterDf
+""")
+ndviDf.createOrReplaceTempView("ndviDf")
+```
+
+![NDVI map algebra 示意](../image/raster-tutorial/ndvi-math.svg)
+
+Map algebra 是最通用的处理原语 —— 裁剪、遮罩、阈值过滤、不同波段或不同栅格之间的算术运算，都可以用同样的 `RS_MapAlgebra(rast, pixelType, script)`（或双栅格版本）写出来。脚本语法见 [Map algebra](../api/sql/Raster-map-algebra.md)；其他备选算子（`RS_Clip`、`RS_Resample`、`RS_SetValues`）见下文的 [栅格处理参考](#raster-processing-reference)。
+
+!!!warning
+    `RS_MapAlgebra` 自 `v1.9.1` 起弃用，并将在**未来版本中移除**，请改用
+    [栅格 UDF](../api/sql/Raster-UDF.md)：它用 Python 表达同样的逐像素计算，而且还能直接使用 NumPy、SciPy、
+    scikit-learn 与 rasterio。该函数目前仍然可用，所以本教程照原样运行没有问题，但新代码应改用 UDF；两种写法的
+    对照见 [NDVI：地图代数写法与 UDF 写法](../api/sql/Raster-UDF.md#ndvi-as-map-algebra-and-as-a-udf)。
+
+### 6. 可视化处理结果
+
+NDVI 栅格让植被田一目了然：NDVI 高的像素显示为绿色，其余为淡红色。
+
+```python
+SedonaUtils.display_image(ndviDf)
+```
+
+![NDVI 结果](../image/raster-tutorial/03-ndvi.png)
+
+### 7. 使用分区统计聚合到矢量区域
+
+逐像素的 NDVI 很少是最终的可交付成果。真正想回答的问题往往是「哪一块*区域*变绿了？」—— 哪个农业地块、哪个普查区、哪个流域。[`RS_ZonalStats(raster, zone, statType)`](../api/sql/Raster-Band-Accessors/RS_ZonalStats.md) 就是栅格 → 矢量聚合的规范函数：落在区域多边形内的每个像素都会贡献到该统计值上。
+
+真实的地块边界往往是不规则的 —— 形状各异的田地、地块之间留出的道路与地役权间隙、不属于任何区域的留白。下面在 AOI 上手绘 5 个地块：
+
+```python
+from pyspark.sql import Row
+
+parcels = sedona.createDataFrame(
+    [
+        Row(
+            parcel_id="Orchard",
+            wkt="POLYGON((-91.085 41.515, -91.045 41.510, -91.030 41.530, "
+            "-91.040 41.560, -91.075 41.572, -91.085 41.555, -91.085 41.515))",
+        ),
+        Row(
+            parcel_id="EastFarm",
+            wkt="POLYGON((-91.025 41.512, -91.005 41.512, -91.005 41.572, "
+            "-91.035 41.572, -91.025 41.535, -91.025 41.512))",
+        ),
+        Row(
+            parcel_id="WestFarm",
+            wkt="POLYGON((-91.095 41.520, -91.087 41.520, -91.080 41.555, "
+            "-91.080 41.572, -91.095 41.572, -91.095 41.520))",
+        ),
+        Row(
+            parcel_id="NorthBlock",
+            wkt="POLYGON((-91.095 41.580, -91.005 41.580, -91.005 41.598, "
+            "-91.095 41.598, -91.095 41.580))",
+        ),
+        Row(
+            parcel_id="SouthStrip",
+            wkt="POLYGON((-91.095 41.502, -91.005 41.502, -91.005 41.508, "
+            "-91.095 41.508, -91.095 41.502))",
+        ),
+    ]
+).selectExpr("parcel_id", "ST_GeomFromText(wkt) AS geom")
+
+parcels.createOrReplaceTempView("parcels")
+
+ranked = sedona.sql("""
+    SELECT p.parcel_id,
+           ROUND(RS_ZonalStats(n.rast, p.geom, 'mean'), 4) AS mean_ndvi
+    FROM parcels p, ndviDf n
+    ORDER BY mean_ndvi DESC
+""")
+ranked.show()
+```
+
+```
++----------+---------+
+| parcel_id|mean_ndvi|
++----------+---------+
+|   Orchard|   0.4213|
+|  WestFarm|   0.1182|
+|NorthBlock|   0.0925|
+|  EastFarm|   0.0907|
+|SouthStrip|   0.0905|
++----------+---------+
+```
+
+不规则形状的 **Orchard** 地块明显胜出 —— 它正好覆盖了植被田。落在地块缝隙里的像素（道路、未登记土地）不属于任何区域，对所有统计值都没有影响。
+
+![分区统计](../image/raster-tutorial/07-zonalstats.png)
+
+!!!note
+    当输入栅格被分成多个 tile 时，`parcels × ndviDf` 的笛卡尔连接会产生每个 `(parcel, tile)` 一行的结果。要在 tile 之间正确聚合，应该按 tile 先算 `sum` 与 `count`，再 `GROUP BY parcel_id` 用 `SUM(sum) / SUM(count)` 汇总。思路相同，只是多加一层聚合。[`RS_ZonalStatsAll`](../api/sql/Raster-Band-Accessors/RS_ZonalStatsAll.md) 可以在一次调用里返回所有常用统计量。
+
+### 8. 写回磁盘
+
+写出栅格分两步：先用 `RS_AsXXX` 把 `Raster` 列转成二进制，再把这个二进制 DataFrame 交给 Sedona 的 `raster` writer。
+
+![写出流水线](../image/raster-tutorial/write-pipeline.svg)
+
+=== "Scala"
+
+	```scala
+	import org.apache.spark.sql.functions.expr
+
+	ndviDf.withColumn("raster_binary", expr("RS_AsGeoTiff(rast)"))
+	  .write.format("raster").mode("overwrite").save("/tmp/sedona-raster-tutorial/ndvi_out")
+	```
+
+=== "Python"
+
+	```python
+	from pyspark.sql.functions import expr
+
+	(
+	    ndviDf.withColumn("raster_binary", expr("RS_AsGeoTiff(rast)"))
+	    .write.format("raster")
+	    .mode("overwrite")
+	    .save(f"{WORK}/ndvi_out")
+	)
+	```
+
+输出目录中，每一行对应一个 part 子目录中的一个文件，再加上 Spark 的 `_SUCCESS` 标记。读回方式：
+
+```python
+roundtrip = sedona.read.format("raster").load(f"{WORK}/ndvi_out/*/*.tiff")
+roundtrip.selectExpr("RS_Width(rast) AS w", "RS_Height(rast) AS h").show()
+```
+
+完整的 writer 选项（`rasterField`、`pathField`、`fileExtension`、`useDirectCommitter`）与可选的二进制格式（`RS_AsGeoTiff`、`RS_AsCOG`、`RS_AsArcGrid`、`RS_AsPNG`）见下文 [写出栅格参考](#writing-rasters-reference)。
+
+---
+
+下面是参考材料：其他加载方式、按用途分组的所有栅格算子、以及在 Python 端处理已收集 `SedonaRaster` 对象的用法。
+
+{% raw %}
+
+## 加载选项 {#loading-options}
+
+{% endraw %}
+
+### Tile 大小覆盖
+
+`raster` 数据源默认使用 GeoTIFF 自身的内部 tile 方案。推荐使用 [Cloud Optimized GeoTIFF](https://www.cogeo.org/)（COG）作为源格式，因为它本身就把像素按方形 tile 组织。要显式覆盖 tile 设置：
 
 | 选项 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `retile` | `true` | 是否启用 tiling。设为 `false` 则把整张栅格作为一行加载。 |
-| `tileWidth` | GeoTiff 内部 tile 宽度 | 可选。手动指定每个 tile 的宽度（像素）。 |
-| `tileHeight` | 若设置了 `tileWidth` 则与之相同，否则使用 GeoTiff 内部 tile 高度 | 可选。手动指定每个 tile 的高度（像素）。 |
-| `padWithNoData` | `false` | 当右、下边缘的 tile 小于指定大小时，使用 NODATA 值进行填充。 |
-
-覆盖 tile 大小：
+| `retile` | `true` | 是否进行 tile 切分。设为 `false` 时每个文件作为单行加载。 |
+| `tileWidth` | 源文件内部的 tile 宽度 | 覆盖每个 tile 的宽度（像素）。 |
+| `tileHeight` | 若已设置 `tileWidth`，则同其 | 覆盖每个 tile 的高度（像素）。 |
+| `padWithNoData` | `false` | 当右侧/底部边缘的 tile 小于指定尺寸时，是否用 NODATA 值填充。 |
 
 === "Python"
-    ```python
-    rasterDf = (
-        sedona.read.format("raster")
-        .option("tileWidth", "256")
-        .option("tileHeight", "256")
-        .load("/some/path/*.tif")
-    )
-    ```
+	```python
+	rasterDf = (
+	    sedona.read.format("raster")
+	    .option("tileWidth", "256")
+	    .option("tileHeight", "256")
+	    .load("/some/path/*.tif")
+	)
+	```
 
 !!!note
-    如果栅格数据的内部 tile 方案不利于切分，`raster` 数据源会抛出错误。可以通过 `option("retile", "false")` 关闭自动切分，或手动指定 tile 大小绕过该问题。更彻底的做法是使用 `gdal_translate` 等工具把数据转换为 COG 格式。
+    若文件内部布局不适合 tile 切分，数据源会报错。可通过 `option("retile", "false")` 禁用，或显式指定 tile 尺寸；更彻底的做法是用 `gdal_translate` 把文件重写为 COG。
 
-### 从目录中加载栅格文件
+### 按目录与 glob 加载
 
-`raster` 数据源也支持 Spark 通用文件源选项，如 `option("pathGlobFilter", "*.tif*")` 与 `option("recursiveFileLookup", "true")`。例如，递归加载某目录下所有 `.tif` 文件：
+`raster` 数据源支持 Spark 通用的文件源选项：
 
 === "Python"
-    ```python
-    rasterDf = (
-        sedona.read.format("raster")
-        .option("recursiveFileLookup", "true")
-        .option("pathGlobFilter", "*.tif*")
-        .load(path_to_raster_data_folder)
-    )
-    ```
+	```python
+	rasterDf = (
+	    sedona.read.format("raster")
+	    .option("recursiveFileLookup", "true")
+	    .option("pathGlobFilter", "*.tif*")
+	    .load("/path/to/raster_folder")
+	)
+	```
 
 !!!tip
-    当传入路径以 `/` 结尾时，`raster` 数据源会递归地在该目录及其子目录中查找栅格文件。这等价于不带尾部 `/` 并设置 `option("recursiveFileLookup", "true")`。
+    如果加载路径以 `/` 结尾，会自动开启递归扫描 —— 相当于设置了 `recursiveFileLookup=true`。
 
-!!!tip
-    加载栅格之后，可以在 Jupyter Notebook 中通过 `SedonaUtils.display_image(df)` 快速预览：它会自动识别栅格列并以图像形式渲染。详情请参阅 [栅格可视化文档](../api/sql/Raster-Functions.md#raster-output)。
+### 非 GeoTIFF 格式（NetCDF、Arc Grid）
 
-## 加载非 GeoTiff 数据（NetCDF、Arc Grid）
-
-对于 NetCDF、Arc Info ASCII Grid 等非 GeoTiff 栅格格式，请配合 Spark 内置的 `binaryFile` 数据源与 Sedona 的栅格构造器一起使用。
-
-### 步骤 1：加载为 binary DataFrame
-
-=== "Scala"
-    ```scala
-    var rawDf = sedona.read.format("binaryFile").load(path_to_raster_data)
-    rawDf.createOrReplaceTempView("rawdf")
-    rawDf.show()
-    ```
-
-=== "Java"
-    ```java
-    Dataset<Row> rawDf = sedona.read().format("binaryFile").load(path_to_raster_data);
-    rawDf.createOrReplaceTempView("rawdf");
-    rawDf.show();
-    ```
+对 GeoTIFF 以外的格式，使用 Spark 的 `binaryFile` 数据源加上 Sedona 的栅格构造器。
 
 === "Python"
-    ```python
-    rawDf = sedona.read.format("binaryFile").load(path_to_raster_data)
-    rawDf.createOrReplaceTempView("rawdf")
-    rawDf.show()
-    ```
+	```python
+	rawDf = sedona.read.format("binaryFile").load("/path/to/file.asc")
+	rawDf.createOrReplaceTempView("rawdf")
+	```
 
-输出大致如下：
+然后把 `content` 列提升为 `Raster`：
 
-```
-|                path|    modificationTime|length|             content|
-+--------------------+--------------------+------+--------------------+
-|file:/Download/ra...|2023-09-06 16:24:...|174803|[49 49 2A 00 08 0...|
-```
-
-如需加载多个栅格文件，可递归加载：
-
-=== "Python"
-    ```python
-    rawDf = (
-        sedona.read.format("binaryFile")
-        .option("recursiveFileLookup", "true")
-        .option("pathGlobFilter", "*.asc*")
-        .load(path_to_raster_data_folder)
-    )
-    rawDf.createOrReplaceTempView("rawdf")
-    rawDf.show()
-    ```
-
-### 步骤 2：创建 Raster 类型列
-
-SedonaSQL 中所有栅格运算都要求 Raster 类型对象，可使用以下任一构造器：
-
-#### 从 GeoTiff 创建
+| 构造器 | 源格式 |
+| :--- | :--- |
+| [`RS_FromGeoTiff(content)`](../api/sql/Raster-Constructors/RS_FromGeoTiff.md) | GeoTIFF（也可通过上述 `raster` 数据源直接读） |
+| [`RS_FromArcInfoAsciiGrid(content)`](../api/sql/Raster-Constructors/RS_FromArcInfoAsciiGrid.md) | Arc Info ASCII Grid |
+| [`RS_FromNetCDF(...)`](../api/sql/Raster-Constructors/RS_FromNetCDF.md) | NetCDF |
 
 ```sql
-SELECT RS_FromGeoTiff(content) AS rast, modificationTime, length, path FROM rawdf
+SELECT RS_FromArcInfoAsciiGrid(content) AS rast,
+       modificationTime, length, path
+FROM rawdf
 ```
 
-#### 从 Arc Grid 创建
+{% raw %}
 
-```sql
-SELECT RS_FromArcInfoAsciiGrid(content) AS rast, modificationTime, length, path FROM rawdf
-```
+## 栅格元数据参考 {#raster-metadata-reference}
 
-#### 从 NetCDF 创建
+{% endraw %}
 
-加载 NetCDF 文件的方法详见 [RS_FromNetCDF](../api/sql/Raster-Constructors/RS_FromNetCDF.md)。
+| 函数 | 返回内容 |
+| :--- | :--- |
+| [`RS_MetaData(rast)`](../api/sql/Raster-Operators/RS_MetaData.md) | 上述所有字段，以单个数组返回 |
+| [`RS_Width(rast)`](../api/sql/Raster-Accessors/RS_Width.md)、[`RS_Height(rast)`](../api/sql/Raster-Accessors/RS_Height.md) | 像素维度 |
+| [`RS_NumBands(rast)`](../api/sql/Raster-Operators/RS_NumBands.md) | 波段数 |
+| [`RS_SRID(rast)`](../api/sql/Raster-Operators/RS_SRID.md) | 坐标参考系（EPSG 代码） |
+| [`RS_GeoReference(rast, format)`](../api/sql/Raster-Accessors/RS_GeoReference.md) | world file（GDAL 或 ESRI 风格） |
+| [`RS_UpperLeftX(rast)`](../api/sql/Raster-Accessors/RS_UpperLeftX.md)、`RS_UpperLeftY` | 左上角世界坐标 |
+| [`RS_ScaleX(rast)`](../api/sql/Raster-Accessors/RS_ScaleX.md)、`RS_ScaleY` | 每像素对应的世界坐标尺寸 |
 
-校验栅格列是否创建成功：
+{% raw %}
 
-```python
-rasterDf.printSchema()
-```
+## 栅格处理参考 {#raster-processing-reference}
 
-```
-root
- |-- rast: raster (nullable = true)
- |-- modificationTime: timestamp (nullable = true)
- |-- length: long (nullable = true)
- |-- path: string (nullable = true)
-```
+{% endraw %}
 
-## 栅格的元数据
-
-Sedona 提供了获取栅格元数据的函数，以及获取栅格 world file 的函数。
-
-### 元数据
-
-该函数返回一个数组，包含栅格的所有必要信息，详见 [RS_MetaData](../api/sql/Raster-Operators/RS_MetaData.md)。
-
-```sql
-SELECT RS_MetaData(rast) FROM rasterDf
-```
-
-输出形如：
-
-```
-[-1.3095817809482181E7, 4021262.7487925636, 512.0, 517.0, 72.32861272132695, -72.32861272132695, 0.0, 0.0, 3857.0, 1.0]
-```
-
-数组中前两个元素是栅格图像左上像素的真实地理坐标（如经纬度），接下来的两个元素是栅格的像素维度。
-
-### World File
-
-[world file](https://en.wikipedia.org/wiki/World_file) 有 GDAL 与 ESRI 两种 georeference。详情参见 [RS_GeoReference](../api/sql/Raster-Accessors/RS_GeoReference.md)。
-
-```sql
-SELECT RS_GeoReference(rast, "ESRI") FROM rasterDf
-```
-
-输出如下：
-
-```
-72.328613
-0.000000
-0.000000
--72.328613
--13095781.645176
-4021226.584486
-```
-
-world file 用于通过建立图像到世界坐标的变换，把真实地理坐标对应到图像像素，从而实现 georeference 与 geolocate。
-
-## 栅格操作
-
-自 `v1.5.0` 起 Sedona 增加了大量栅格操作能力。下面给出几个示例查询。
-
-!!!note
-    更多栅格操作请参阅 [SedonaSQL 栅格算子](../api/sql/Raster-Functions.md#raster-operators)。
+教程主线使用 `RS_MapAlgebra` 计算 NDVI。完整的算子集合：
 
 ### 坐标转换
 
-Sedona 支持按需在像素坐标与世界坐标之间互相转换。
+- [`RS_PixelAsPoint(rast, col, row)`](../api/sql/Pixel-Functions/RS_PixelAsPoint.md) —— 像素 → 世界坐标。
+- [`RS_WorldToRasterCoord(rast, x, y)`](../api/sql/Raster-Accessors/RS_WorldToRasterCoord.md) —— 世界坐标 → 像素（只取单轴时用 `RS_WorldToRasterCoordX` / `Y`）。
 
-#### PixelAsPoint
-
-使用 [RS_PixelAsPoint](../api/sql/Pixel-Functions/RS_PixelAsPoint.md) 将像素坐标转换为世界坐标位置：
-
-```sql
-SELECT RS_PixelAsPoint(rast, 450, 400) FROM rasterDf
-```
-
-输出：
-
-```
-POINT (-13063342 3992403.75)
-```
-
-#### 世界坐标转栅格坐标
-
-使用 [RS_WorldToRasterCoord](../api/sql/Raster-Accessors/RS_WorldToRasterCoord.md) 把世界坐标位置转换为像素坐标。仅取 X 用 [RS_WorldToRasterCoordX](../api/sql/Raster-Accessors/RS_WorldToRasterCoordX.md)，仅取 Y 用 [RS_WorldToRasterCoordY](../api/sql/Raster-Accessors/RS_WorldToRasterCoordY.md)。
-
-```sql
-SELECT RS_WorldToRasterCoord(rast, -1.3063342E7, 3992403.75)
-```
-
-输出：
-
-```
-POINT (450 400)
-```
+![世界坐标转栅格坐标](../image/RS_WorldToRasterCoord/RS_WorldToRasterCoord.svg)
 
 ### 像素操作
 
-使用 [RS_Values](../api/sql/Raster-Operators/RS_Values.md) 获取由点几何数组指定位置上的栅格值。这些点几何的坐标表示真实世界位置。
-
-```sql
-SELECT RS_Values(rast, Array(ST_Point(-13063342, 3992403.75), ST_Point(-13074192, 3996020)))
-```
-
-输出：
-
-```
-[132.0, 148.0]
-```
-
-要在网格或某个几何区域内修改像素值，可使用 [RS_SetValues](../api/sql/Raster-Operators/RS_SetValues.md)：
-
-```sql
-SELECT RS_SetValues(
-        rast, 1, 250, 260, 3, 3,
-        Array(10, 12, 17, 26, 28, 37, 43, 64, 66)
-    )
-```
-
-详细用法请点击上面的链接。
+- [`RS_Values(rast, points)`](../api/sql/Raster-Operators/RS_Values.md) —— 在一组点几何处采样像素值。
+- [`RS_SetValues(rast, band, x, y, width, height, values)`](../api/sql/Raster-Operators/RS_SetValues.md) —— 覆写一个矩形像素块。
 
 ### 波段操作
 
-Sedona 提供了从栅格图像中选择特定波段并构造新栅格的 API。例如，使用 [RS_Band](../api/sql/Raster-Band-Accessors/RS_Band.md) 从栅格中选取 2 个波段以构造多波段栅格。
+- [`RS_Band(rast, bands)`](../api/sql/Raster-Band-Accessors/RS_Band.md) —— 选取部分波段构造新栅格。
+- [`RS_AddBand(target, source, srcBand, dstBand)`](../api/sql/Raster-Operators/RS_AddBand.md) —— 在两个栅格之间复制波段。
 
-下面以一张 [多波段栅格](https://github.com/apache/sedona/blob/2a0b36989aa895c0781f9a10c907dd726506d0b7/spark/common/src/test/resources/raster_geotiff_color/FAA_UTM18N_NAD83.tif) 为例进行演示，加载与转换为 raster 类型的方式与前文相同。
+### 重采样与裁剪
 
-```sql
-SELECT RS_Band(colorRaster, Array(1, 2))
+- [`RS_Resample(rast, scaleX, scaleY, gridX, gridY, useScale, method)`](../api/sql/Raster-Operators/RS_Resample.md) —— 改变像元尺寸或将栅格对齐到目标网格，支持最近邻、双线性、双立方插值。
+- [`RS_Clip(rast, band, geom)`](../api/sql/Raster-Operators/RS_Clip.md) —— 按多边形裁剪。
+- [`RS_ReprojectMatch`](../api/sql/Raster-Operators/RS_ReprojectMatch.md) —— 将一个栅格重采样到另一个栅格的网格与坐标系上：
+
+![Reproject match](../image/RS_ReprojectMatch/RS_ReprojectMatch.svg)
+
+### 逐像素计算
+
+请使用[栅格 UDF](../api/sql/Raster-UDF.md)。UDF 可以接收一个或多个栅格列，因此已弃用的 `RS_MapAlgebra` 的两种
+形式都有直接对应的写法 —— 下面是双栅格的变化检测场景：
+
+```python
+import numpy as np
+from pyspark.sql.functions import col, udf
+
+from sedona.spark.sql.types import RasterType
+
+NODATA = -9999.0
+
+
+@udf(returnType=RasterType())
+def delta(after, before):
+    # 用 as_numpy_masked() 而非 as_numpy()：NODATA 会变成 NaN，从而保持无效状态，
+    # 不会把哨兵值带进减法结果。
+    diff = after.as_numpy_masked()[0] - before.as_numpy_masked()[0]
+    return after.with_bands(np.where(np.isnan(diff), NODATA, diff), nodata=NODATA)
+
+
+# ndvi_after 与 ndvi_before 是两个日期的 NDVI 栅格，位于同一网格上，
+# 并各自带有 raster 数据源生成的 x、y tile 索引列。
+(
+    ndvi_after.alias("after")
+    .join(ndvi_before.alias("before"), ["x", "y"])
+    .select(delta(col("after.rast"), col("before.rast")).alias("delta"))
+)
 ```
 
-如果有多个单波段栅格，希望把额外的波段加入栅格以执行 [map algebra 操作](#execute-map-algebra-operations)，可使用 [RS_AddBand](../api/sql/Raster-Operators/RS_AddBand.md)：
+单栅格写法、NDVI 的两种写法对照，以及需要注意的限制，见[栅格 UDF](../api/sql/Raster-UDF.md)。
 
-```sql
-SELECT RS_AddBand(raster1, raster2, 1, 2)
-```
+## 栅格与矢量互通
 
-执行后 `raster1` 会附带上 `raster2` 中指定的波段。
+### 几何栅格化
 
-### 重采样栅格数据
-
-Sedona 支持使用最近邻、双线性、双三次等不同插值方法对栅格数据进行重采样，以改变 cell 大小或对齐栅格网格，详见 [RS_Resample](../api/sql/Raster-Operators/RS_Resample.md)。
-
-```sql
-SELECT RS_Resample(rast, 50, -50, -13063342, 3992403.75, true, "bicubic")
-```
-
-更多用法请参考链接中的文档。
-
-## 执行 map algebra 操作
-
-map algebra 是一种通过数学表达式对栅格进行计算的方法。表达式既可以是简单的算术运算，也可以是多个运算的复杂组合。
-
-归一化植被指数（NDVI）是一个简单的图形指标，常用于分析航天平台的遥感测量结果，评估观测目标是否包含活体绿色植被：
-
-```
-NDVI = (NIR - Red) / (NIR + Red)
-```
-
-其中 NIR 表示近红外波段，Red 表示红色波段。
-
-```sql
-SELECT RS_MapAlgebra(raster, 'D', 'out = (rast[3] - rast[0]) / (rast[3] + rast[0]);') as ndvi FROM raster_table
-```
-
-更多内容请参阅 [Map Algebra API](../api/sql/Raster-map-algebra.md)。
-
-## 栅格与矢量数据的互通
-
-### 几何转栅格
-
-可以使用 [RS_AsRaster](../api/sql/Raster-Operators/RS_AsRaster.md) 把几何对象栅格化：
+[`RS_AsRaster`](../api/sql/Raster-Operators/RS_AsRaster.md) 将矢量几何渲染到栅格网格上：
 
 ```sql
 SELECT RS_AsRaster(
-        ST_GeomFromWKT('POLYGON((150 150, 220 260, 190 300, 300 220, 150 150))'),
-        RS_MakeEmptyRaster(1, 'b', 4, 6, 1, -1, 1),
-        'b', 230
-    )
+    ST_GeomFromWKT('POLYGON((150 150, 220 260, 190 300, 300 220, 150 150))'),
+    RS_MakeEmptyRaster(1, 'b', 4, 6, 1, -1, 1),
+    'b', false, 230, 0
+)
 ```
 
-针对该矢量生成的图像如下：
+![矢量栅格化结果](../image/rasterized-image.png)
 
-![Rasterized vector](../image/rasterized-image.png)
+### 空间过滤与连接
 
-!!!note
-    示例图像中的矢量坐标做了适度放大以便观察，实际使用时不一定与本例完全一致。
-
-### 空间范围查询
-
-Sedona 提供了基于几何窗口的栅格谓词来执行范围查询。例如使用 [RS_Intersects](../api/sql/Raster-Predicates/RS_Intersects.md)：
+栅格谓词既可用于 `WHERE` 子句，也可作为连接条件：
 
 ```sql
-SELECT rast FROM rasterDf WHERE RS_Intersect(rast, ST_GeomFromWKT('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'))
+-- 范围查询：保留与 AOI 相交的 tile
+SELECT rast FROM rasterDf
+WHERE RS_Intersects(rast, ST_GeomFromWKT('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))'))
+
+-- 空间连接：把每个 tile 与覆盖到它的矢量要素配对
+SELECT r.rast, g.geom
+FROM rasterDf r JOIN geomDf g ON RS_Intersects(r.rast, g.geom)
 ```
 
-### 空间连接查询
+[`RS_Intersects`](../api/sql/Raster-Predicates/RS_Intersects.md) 与其他 [栅格谓词](../api/sql/Raster-Functions.md#raster-predicates) 都基于栅格的空间外包做判断。
 
-Sedona 的栅格谓词同样支持基于栅格列与几何列的空间连接：
+### 分区统计
 
-```sql
-SELECT r.rast, g.geom FROM rasterDf r, geomDf g WHERE RS_Interest(r.rast, g.geom)
-```
+教程主线使用 [`RS_ZonalStats(raster, zone, statType)`](../api/sql/Raster-Band-Accessors/RS_ZonalStats.md) 配合 `'mean'`。同一函数还支持 `'sum'`、`'count'`、`'min'`、`'max'`、`'stddev'`。如需一次拿到所有标准统计量，使用 [`RS_ZonalStatsAll`](../api/sql/Raster-Band-Accessors/RS_ZonalStatsAll.md)，它对每个区域返回一个 struct，包含全部统计字段。
 
-!!!note
-    上述范围查询与连接查询都会基于提供的几何边界以及栅格的空间边界进行过滤。
+## 可视化参考
 
-    Sedona 还提供了更多用于空间范围查询与空间连接的栅格谓词，详见 [栅格谓词文档](../api/sql/Raster-Functions.md#raster-predicates)。
+除教程主线使用的 `SedonaUtils.display_image` 与 `RS_AsImage` 之外：
 
-## 可视化栅格图像
+- [`RS_AsBase64(rast)`](../api/sql/Raster-Output/RS_AsBase64.md) —— 编码为 Base64 字符串，便于嵌入或使用 [在线解码器](https://base64-viewer.onrender.com/) 查看。
+- [`RS_AsMatrix(rast)`](../api/sql/Raster-Output/RS_AsMatrix.md) —— 把底层像素网格渲染成文本矩阵（适合小尺寸栅格或调试场景）。
 
-Sedona 提供了若干 API 把栅格数据以图像形式可视化。
+完整列表见 [栅格输出函数](../api/sql/Raster-Functions.md#raster-output)。
 
-### Base64 字符串
+{% raw %}
 
-[RS_AsBase64](../api/sql/Raster-Output/RS_AsBase64.md) 将栅格编码为 Base64 字符串，可以使用 [在线解码器](https://base64-viewer.onrender.com/) 查看：
+## 写出栅格参考 {#writing-rasters-reference}
 
-```sql
-SELECT RS_AsBase64(rast) FROM rasterDf
-```
+{% endraw %}
 
-### HTML Image
+教程使用的两步写出流程支持以下四种输出格式：
 
-[RS_AsImage](../api/sql/Raster-Output/RS_AsImage.md) 返回一个 HTML `<img>` 标签，可以在 HTML viewer 或 Jupyter Notebook 中查看：
-
-```sql
-SELECT RS_AsImage(rast, 500) FROM rasterDf
-```
-
-输出如下：
-
-![Output](../image/DisplayImage.png)
-
-!!!tip
-    在 Jupyter Notebook 中使用 `SedonaUtils.display_image` 即可直接渲染栅格，无需手动调用 RS_AsImage：
-
-    ```python
-    from sedona.spark import SedonaUtils
-
-    SedonaUtils.display_image(rasterDf)
-    ```
-
-    详情请参阅 [在 Jupyter 中显示栅格](../api/sql/Raster-Functions.md#raster-output)。
-
-### 二维矩阵
-
-如果上述 API 不能满足需求，Sedona 还提供了将栅格数据可视化为二维矩阵的 API：
-
-```sql
-SELECT RS_AsMatrix(rast) FROM rasterDf
-```
-
-输出形如：
-
-```sql
-| 1   3   4   0|
-| 2   9  10  11|
-| 3   4   5   6|
-```
-
-更多用法请参阅 [栅格可视化文档](../api/sql/Raster-Functions.md#raster-output)。
-
-## 保存到永久存储
-
-保存栅格数据分两步：(1) 使用某个 `RS_AsXXX` 函数将 Raster 列转换为二进制格式；(2) 通过 Sedona 的 `raster` 数据源 writer 把二进制 DataFrame 写入文件。
-
-### 步骤 1：转换为二进制格式
-
-可选的输出格式函数：
-
-| 函数 | 格式 | 说明 |
+| 函数 | 格式 | 适用场景 |
 | :--- | :--- | :--- |
-| [RS_AsGeoTiff](../api/sql/Raster-Output/RS_AsGeoTiff.md) | GeoTiff | 通用栅格格式，可选压缩 |
-| [RS_AsCOG](../api/sql/Raster-Output/RS_AsCOG.md) | Cloud Optimized GeoTiff | 适合云存储，支持高效的范围读取 |
-| [RS_AsArcGrid](../api/sql/Raster-Output/RS_AsArcGrid.md) | Arc Grid | 基于 ASCII 的格式，仅支持单波段 |
-| [RS_AsPNG](../api/sql/Raster-Output/RS_AsPNG.md) | PNG | 图像格式，仅支持无符号整型像素 |
+| [`RS_AsGeoTiff`](../api/sql/Raster-Output/RS_AsGeoTiff.md) | GeoTIFF | 通用格式，可选压缩 |
+| [`RS_AsCOG`](../api/sql/Raster-Output/RS_AsCOG.md) | Cloud Optimized GeoTIFF | 对象存储 + 高效 range read |
+| [`RS_AsArcGrid`](../api/sql/Raster-Output/RS_AsArcGrid.md) | Arc Info ASCII Grid | 单波段、文本格式 |
+| [`RS_AsPNG`](../api/sql/Raster-Output/RS_AsPNG.md) | PNG | 仅用于显示，像素类型必须为无符号整数 |
 
-```sql
-SELECT RS_AsGeoTiff(rast) AS raster_binary FROM rasterDf
-```
-
-### 步骤 2：写入文件
-
-使用 Sedona 内置的 `raster` 数据源写出二进制 DataFrame：
-
-=== "Scala"
-    ```scala
-    rasterDf.withColumn("raster_binary", expr("RS_AsGeoTiff(rast)"))
-      .write.format("raster").mode("overwrite").save("my_raster_file")
-    ```
-
-=== "Python"
-    ```python
-    rasterDf.withColumn("raster_binary", expr("RS_AsGeoTiff(rast)")).write.format(
-        "raster"
-    ).mode("overwrite").save("my_raster_file")
-    ```
-
-writer 数据源的常用选项：
+`raster` writer 支持以下选项：
 
 | 选项 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `rasterField` | schema 中最后一个 `binary` 列 | 要写出的二进制列名。当 DataFrame 含有多个 binary 列时，强烈建议显式指定。 |
-| `fileExtension` | `.tiff` | 输出文件的扩展名（如 `.png`、`.asc`）。 |
-| `pathField` | None | 包含输出文件名的列名。仅使用基础文件名（去掉目录），并把已有扩展名替换为 `fileExtension`。未设置时每个文件以随机 UUID 命名。 |
-| `useDirectCommitter` | `true` | 若为 `true`，文件直接写入目标位置；若为 `false`，先写入临时位置再移动。`false` 速度较慢，尤其在 S3 等对象存储上。 |
+| `rasterField` | schema 中最后一个 `binary` 列 | 要写出的二进制列名。当 DataFrame 中存在多个二进制列时建议显式设置。 |
+| `fileExtension` | `.tiff` | 输出文件扩展名（例如 `.png`、`.asc`）。 |
+| `pathField` | 无 | 提供输出文件名的列。仅使用文件 basename，已有扩展名会被 `fileExtension` 替换。未设置时每个文件以随机 UUID 命名。 |
+| `useDirectCommitter` | `true` | 直接写入目标位置。设为 `false` 时先写到临时位置，速度较慢，尤其在 S3 等对象存储上。 |
 
-带全部选项的示例：
+设置所有选项的完整示例：
 
 === "Scala"
-    ```scala
-    rasterDf.withColumn("raster_binary", expr("RS_AsGeoTiff(rast)"))
-      .write.format("raster")
-      .option("rasterField", "raster_binary")
-      .option("pathField", "name")
-      .option("fileExtension", ".tiff")
-      .mode("overwrite")
-      .save("my_raster_file")
-    ```
+	```scala
+	import org.apache.spark.sql.functions.expr
+
+	rasterDf.withColumn("raster_binary", expr("RS_AsGeoTiff(rast)"))
+	  .write.format("raster")
+	  .option("rasterField", "raster_binary")
+	  .option("pathField", "name")
+	  .option("fileExtension", ".tiff")
+	  .mode("overwrite")
+	  .save("my_raster_file")
+	```
 
 === "Python"
-    ```python
-    rasterDf.withColumn("raster_binary", expr("RS_AsGeoTiff(rast)")).write.format(
-        "raster"
-    ).option("rasterField", "raster_binary").option("pathField", "name").option(
-        "fileExtension", ".tiff"
-    ).mode(
-        "overwrite"
-    ).save(
-        "my_raster_file"
-    )
-    ```
+	```python
+	from pyspark.sql.functions import expr
 
-写出后的文件结构形如：
+	(
+	    rasterDf.withColumn("raster_binary", expr("RS_AsGeoTiff(rast)"))
+	    .write.format("raster")
+	    .option("rasterField", "raster_binary")
+	    .option("pathField", "name")
+	    .option("fileExtension", ".tiff")
+	    .mode("overwrite")
+	    .save("my_raster_file")
+	)
+	```
+
+输出目录结构：
 
 ```
 my_raster_file
-- part-00000-6c7af016-c371-4564-886d-1690f3b27ca8-c000
-	- test1.tiff
-	- .test1.tiff.crc
-- part-00001-6c7af016-c371-4564-886d-1690f3b27ca8-c000
-	- test2.tiff
-	- .test2.tiff.crc
-- _SUCCESS
+├── part-00000-…-c000
+│   ├── test1.tiff
+│   └── .test1.tiff.crc
+├── part-00001-…-c000
+│   ├── test2.tiff
+│   └── .test2.tiff.crc
+└── _SUCCESS
 ```
 
-读回保存的栅格：
+使用同一 `raster` 数据源读回：
 
 ```python
 rasterDf = sedona.read.format("raster").load("my_raster_file/*/*.tiff")
 ```
 
-## 在 Python 中收集并本地处理带栅格列的 DataFrame
+{% raw %}
 
-自 `v1.6.0` 起，Sedona 支持把含有栅格列的 DataFrame 收集（collect）到 Python 端进行本地处理。栅格对象在 Python 端表示为 `SedonaRaster`，可对其执行各种栅格操作。
+## 在 Python 中处理栅格 DataFrame {#working-with-raster-dataframes-in-python}
+
+{% endraw %}
+
+自 `v1.6.0` 起，可以把含栅格列的 DataFrame 拉到 Python driver 端本地处理。被收集回的栅格元素表现为 `SedonaRaster` 对象。
 
 !!!tip
-    如果只是希望在 Jupyter 中快速预览栅格，无需 collect DataFrame，使用 `SedonaUtils.display_image(df)` 即可：
-
-    ```python
-    from sedona.spark import SedonaUtils
-
-    SedonaUtils.display_image(df_raster)
-    ```
+    在 Jupyter 中若只是想快速可视化栅格，优先使用 `SedonaUtils.display_image(df)`，无需 collect。
 
 ```python
 df_raster = (
@@ -672,39 +693,39 @@ df_raster = (
 )
 rows = df_raster.collect()
 raster = rows[0].rast
-raster  # <sedona.raster.sedona_raster.InDbSedonaRaster at 0x1618fb1f0>
+raster  # <sedona.raster.sedona_raster.InDbSedonaRaster at 0x…>
 ```
 
-通过 `SedonaRaster` 对象的属性可以读取栅格元数据：
+`SedonaRaster` 通过 Python 属性暴露元数据：
 
 ```python
-raster.width  # 栅格宽度
-raster.height  # 栅格高度
-raster.affine_trans  # 仿射变换矩阵
-raster.crs_wkt  # 以 WKT 表示的坐标参考系
+raster.width
+raster.height
+raster.affine_trans
+raster.crs_wkt
 ```
 
-可以通过 `as_numpy` 或 `as_numpy_masked` 方法获取栅格波段数据的 numpy 数组，数组按 CHW 顺序组织。
+像素数据以 NumPy 数组形式提供（CHW 排列）：
 
 ```python
-raster.as_numpy()  # 栅格的 numpy 数组
-raster.as_numpy_masked()  # nodata 值被掩为 nan 的 numpy 数组
+raster.as_numpy()  # ndarray
+raster.as_numpy_masked()  # ndarray，NODATA 被掩码为 NaN
 ```
 
-如果希望使用 `rasterio` 处理栅格数据，可以通过 `as_rasterio` 方法获取一个 `rasterio.DatasetReader` 对象。
-
-!!!note
-    使用此方法需要安装 `rasterio` 包（>= 1.2.10）：`pip install rasterio`。
+需要与 `rasterio`（>= 1.2.10）互操作时：
 
 ```python
-ds = raster.as_rasterio()  # rasterio.DatasetReader 对象
-# 使用 rasterio 处理栅格
-band1 = ds.read(1)  # 读取第 1 个波段
+ds = raster.as_rasterio()  # rasterio.DatasetReader
+band1 = ds.read(1)
 ```
 
-## 编写处理栅格数据的 Python UDF
+## 在栅格上编写 Python UDF
 
-可以编写 Python UDF 来处理栅格数据。UDF 接收 `SedonaRaster` 对象作为输入，返回任意 Spark 数据类型。下面是一个计算栅格均值的 UDF 示例：
+Python UDF 接收栅格数据，使用 NumPy / SciPy / scikit-learn 等处理，并返回标量或新栅格。本节是入门介绍；完整内容见 [栅格 UDF](../api/sql/Raster-UDF.md)，其中包括何时该选 UDF 而不是 `RS_MapAlgebra`、双栅格 UDF，以及需要注意的各项限制。
+
+### 栅格 → 标量
+
+UDF 可接收 `SedonaRaster` 输入并返回任意 Spark 数据类型。下面的 UDF 计算栅格均值：
 
 ```python
 from pyspark.sql.types import DoubleType
@@ -726,33 +747,72 @@ df_raster.withColumn("mean", expr("mean_udf(rast)")).show()
 +--------------------+------------------+
 ```
 
-返回栅格对象的 UDF 较为棘手，因为 Sedona 目前还不支持序列化 Python 端的栅格对象。但可以让 UDF 返回波段数据数组，再通过 `RS_MakeRaster` 构造栅格对象。下面是一个基于输入栅格第一个波段创建掩码栅格的 Python UDF：
+### 栅格 → 栅格
+
+从 `v1.9.1` 起，UDF 也可以返回栅格对象。使用 `SedonaRaster.with_bands()` 替换像素数据，同时沿用源栅格的 CRS 与仿射变换。波段数与 dtype 可自由变化。
 
 ```python
-from pyspark.sql.types import ArrayType, DoubleType
 import numpy as np
+from sedona.spark.sql.types import RasterType
 
 
 def mask_udf(raster):
+    # 假定场景没有空洞；若可能携带 NODATA，请改用 as_numpy_masked() —— 见栅格 UDF 页面
     band1 = raster.as_numpy()[0, :, :]
-    mask = (band1 < 1400).astype(np.float64)
-    return mask.flatten().tolist()
+    mask = (band1 < 1400).astype(np.float32)
+    return raster.with_bands(mask)  # 1 个波段，位于输入的网格上
 
 
-sedona.udf.register("mask_udf", band_udf, ArrayType(DoubleType()))
-df_raster.withColumn("mask", expr("mask_udf(rast)")).withColumn(
-    "mask_rast", expr("RS_MakeRaster(rast, 'I', mask)")
-).show()
+sedona.udf.register("mask_udf", mask_udf, RasterType())
+df_raster.withColumn("mask_rast", expr("mask_udf(rast)")).show()
 ```
 
 ```
-+--------------------+--------------------+--------------------+
-|                rast|                mask|           mask_rast|
-+--------------------+--------------------+--------------------+
-|GridCoverage2D["g...|[0.0, 0.0, 0.0, 0...|GridCoverage2D["g...|
-+--------------------+--------------------+--------------------+
++--------------------+--------------------+
+|                rast|           mask_rast|
++--------------------+--------------------+
+|GridCoverage2D["g...|GridCoverage2D["g...|
++--------------------+--------------------+
 ```
+
+`with_bands()` 接受 NumPy 数组：CHW 顺序（波段 × 高 × 宽），或单波段输出时的 HW 顺序（高 × 宽）。返回的 `SedonaRaster` 在 UDF 返回时会自动序列化回 JVM 端，因此输出就是一个普通栅格列。
+
+除非另行指定，输出的 NODATA 会继承自输入波段，而这通常不是派生栅格想要的 —— 用 `nodata=` 明确设置：
+
+```python
+return raster.with_bands(mask, nodata=-9999.0)
+```
+
+!!!note
+    结果始终位于输入的网格上 —— `with_bands()` 要求高、宽一致，并沿用输入的 CRS 与仿射变换，因此重投影和重采样无法在 Python UDF 内部完成。这一点以及 dtype 相关的注意事项见 [栅格 UDF](../api/sql/Raster-UDF.md#limits)。
+
+### 在 UDF 中使用 rasterio
+
+`as_rasterio()` 在 UDF 内部同样可用，因此 rasterio 与 GDAL 的算法可以直接作用于栅格列。该 dataset 是只读的 —— 若要返回栅格，需要把得到的数组交给 `with_bands()`：
+
+```python
+import rasterio.fill
+
+
+def fill_udf(raster):
+    # GDAL dataset 不携带 Sedona 的 NODATA，因此要从 SedonaRaster 构造掩膜 ——
+    # as_numpy_masked() 会把 NODATA 替换为 NaN。
+    nodata = raster.bands_meta[0].nodata
+    valid = ~np.isnan(raster.as_numpy_masked()[0])
+    with raster.as_rasterio() as src:
+        filled = rasterio.fill.fillnodata(src.read(1), mask=valid.astype(np.uint8))
+    # fillnodata 只在距有效数据 max_search_distance（默认 100 像素）内插值，更深处
+    # 的像素仍保留哨兵值，因此保留 NODATA 声明。只有确定所有空洞都能被完全填充时，
+    # 才改用 nodata=float("nan")。
+    return raster.with_bands(filled, nodata=nodata)
+
+
+sedona.udf.register("fill_udf", fill_udf, RasterType())
+df_raster.withColumn("filled", expr("fill_udf(rast)")).show()
+```
+
+这适用于任何不改变网格的 rasterio 运算。warp 与重投影会改变网格，无法这样返回 —— 请改用 [`RS_Resample`](../api/sql/Raster-Operators/RS_Resample.md) 或 [`RS_ReprojectMatch`](../api/sql/Raster-Operators/RS_ReprojectMatch.md)。
 
 ## 性能优化
 
-处理大规模栅格数据集时，请参考 [在 Parquet 中存储栅格几何对象](storing-blobs-in-parquet.md) 一文中的性能优化建议。
+处理大体量栅格时，可参考 [将栅格几何以 Parquet 形式存储](storing-blobs-in-parquet.md) 的分区与持久化建议。

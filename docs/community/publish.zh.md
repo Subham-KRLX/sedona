@@ -65,7 +65,7 @@ rm report.txt
 请确认以下文件中的 Sedona 版本均为 {{ sedona_create_release.current_version }}：
 
 1. https://github.com/apache/sedona/blob/master/python/sedona/version.py
-2. https://github.com/apache/sedona/blob/master/python/pyproject.toml（`[project]` 下的 `version` 字段）
+2. [python/pyproject.toml](https://github.com/apache/sedona/blob/master/python/pyproject.toml)（`[project]` 下的 `version` 字段）
 3. https://github.com/apache/sedona/blob/master/R/DESCRIPTION
 4. https://github.com/apache/sedona/blob/99239524f17389fc4ae9548ea88756f8ea538bb9/R/R/dependencies.R#L42
 5. https://github.com/apache/sedona/blob/master/zeppelin/package.json
@@ -125,7 +125,7 @@ rm -rf $LOCAL_DIR && git clone --depth 1 --branch $TAG $REPO_URL $LOCAL_DIR && c
 MAVEN_PLUGIN_VERSION="2.3.2"
 
 # Spark 与 Scala 版本
-declare -a SPARK_VERSIONS=("3.4" "3.5" "4.0" "4.1")
+declare -a SPARK_VERSIONS=("3.5" "4.0" "4.1")
 declare -a SCALA_VERSIONS=("2.12" "2.13")
 
 # 根据 Spark 版本确定所需 Java 版本
@@ -380,19 +380,6 @@ verify_java_version() {
   fi
   echo "✓ Verified: Maven wrapper is using Java $mvn_java_version"
 }
-
-# 使用 Java 11 编译 Spark 3.4
-JAVA_VERSION=$(get_java_version "3.4")
-MVN_WRAPPER=$(create_mvn_wrapper $JAVA_VERSION)
-verify_java_version $MVN_WRAPPER $JAVA_VERSION
-
-echo "Compiling for Spark 3.4 with Scala 2.12 using Java $JAVA_VERSION..."
-cd apache-sedona-${SEDONA_VERSION}-src && $MVN_WRAPPER clean && $MVN_WRAPPER install -DskipTests -Dspark=3.4 -Dscala=2.12 && cd ..
-cp apache-sedona-${SEDONA_VERSION}-src/spark-shaded/target/sedona-*${SEDONA_VERSION}.jar apache-sedona-${SEDONA_VERSION}-bin/
-
-echo "Compiling for Spark 3.4 with Scala 2.13 using Java $JAVA_VERSION..."
-cd apache-sedona-${SEDONA_VERSION}-src && $MVN_WRAPPER clean && $MVN_WRAPPER install -DskipTests -Dspark=3.4 -Dscala=2.13 && cd ..
-cp apache-sedona-${SEDONA_VERSION}-src/spark-shaded/target/sedona-*${SEDONA_VERSION}.jar apache-sedona-${SEDONA_VERSION}-bin/
 
 # 使用 Java 11 编译 Spark 3.5
 JAVA_VERSION=$(get_java_version "3.5")

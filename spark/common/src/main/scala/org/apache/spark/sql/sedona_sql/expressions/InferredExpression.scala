@@ -20,12 +20,12 @@ package org.apache.spark.sql.sedona_sql.expressions
 
 import org.apache.commons.lang3.StringUtils
 import org.apache.sedona.common.S2Geography.Geography
-import org.apache.sedona.common.geometryObjects.Box2D
+import org.apache.sedona.common.geometryObjects.{Box2D, Box3D}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.expressions.{Expression, ImplicitCastInputTypes}
 import org.apache.spark.sql.catalyst.util.ArrayData
-import org.apache.spark.sql.sedona_sql.UDT.{Box2DUDT, GeographyUDT, GeometryUDT}
+import org.apache.spark.sql.sedona_sql.UDT.{Box2DUDT, Box3DUDT, GeographyUDT, GeometryUDT}
 import org.apache.spark.sql.sedona_sql.expressions.implicits._
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
@@ -167,6 +167,8 @@ object InferrableType {
     new InferrableType[Array[Geography]] {}
   implicit val box2DInstance: InferrableType[Box2D] =
     new InferrableType[Box2D] {}
+  implicit val box3DInstance: InferrableType[Box3D] =
+    new InferrableType[Box3D] {}
   implicit val javaDoubleInstance: InferrableType[java.lang.Double] =
     new InferrableType[java.lang.Double] {}
   implicit val javaIntegerInstance: InferrableType[java.lang.Integer] =
@@ -219,6 +221,8 @@ object InferredTypes {
       expr.toGeographyArray(input)
     } else if (t =:= typeOf[Box2D]) { expr => input =>
       expr.toBox2D(input)
+    } else if (t =:= typeOf[Box3D]) { expr => input =>
+      expr.toBox3D(input)
     } else if (InferredRasterExpression.isRasterType(t)) {
       InferredRasterExpression.rasterExtractor
     } else if (t =:= typeOf[Array[Double]]) { expr => input =>
@@ -226,7 +230,10 @@ object InferredTypes {
     } else if (t =:= typeOf[String]) { expr => input =>
       expr.asString(input)
     } else if (t =:= typeOf[Array[Long]]) { expr => input =>
-      expr.eval(input).asInstanceOf[ArrayData].toLongArray()
+      expr.eval(input).asInstanceOf[ArrayData] match {
+        case null => null
+        case arrayData: ArrayData => arrayData.toLongArray()
+      }
     } else if (t =:= typeOf[Array[String]]) { expr => input =>
       expr.eval(input).asInstanceOf[ArrayData] match {
         case null => null
@@ -276,6 +283,14 @@ object InferredTypes {
       output =>
         if (output != null) {
           udt.serialize(output.asInstanceOf[Box2D])
+        } else {
+          null
+        }
+    } else if (t =:= typeOf[Box3D]) {
+      val udt = Box3DUDT
+      output =>
+        if (output != null) {
+          udt.serialize(output.asInstanceOf[Box3D])
         } else {
           null
         }
@@ -347,6 +362,8 @@ object InferredTypes {
       DataTypes.createArrayType(GeographyUDT())
     } else if (t =:= typeOf[Box2D]) {
       Box2DUDT()
+    } else if (t =:= typeOf[Box3D]) {
+      Box3DUDT()
     } else if (InferredRasterExpression.isRasterType(t)) {
       InferredRasterExpression.rasterUDT
     } else if (InferredRasterExpression.isRasterArrayType(t)) {
@@ -447,6 +464,47 @@ object InferrableFunction {
           val arg2 = extractor2(input)
           if (arg1 != null) {
             func(arg1, arg2)
+          } else {
+            null
+          }
+        }
+      })
+  }
+
+  /**
+   * A variant of ternary inferred expression which allows the third argument to be null. This is
+   * not an overload of [[allowRightNull]] since overloading it breaks eta-expansion of the
+   * overloaded methods passed to it at existing call sites.
+   * @param f
+   *   Function to be wrapped as a catalyst expression.
+   * @param typeTag
+   *   Type tag of the function.
+   * @tparam R
+   *   Return type of the function.
+   * @tparam A1
+   *   Type of the first argument.
+   * @tparam A2
+   *   Type of the second argument.
+   * @tparam A3
+   *   Type of the third argument.
+   * @return
+   *   InferrableFunction.
+   */
+  def allowRightNull3[R, A1, A2, A3](f: (A1, A2, A3) => R)(implicit
+      typeTag: TypeTag[(A1, A2, A3) => R]): InferrableFunction = {
+    apply(
+      typeTag,
+      extractors => {
+        val func = f.asInstanceOf[(Any, Any, Any) => Any]
+        val extractor1 = extractors(0)
+        val extractor2 = extractors(1)
+        val extractor3 = extractors(2)
+        input => {
+          val arg1 = extractor1(input)
+          val arg2 = extractor2(input)
+          val arg3 = extractor3(input)
+          if (arg1 != null && arg2 != null) {
+            func(arg1, arg2, arg3)
           } else {
             null
           }

@@ -21,6 +21,8 @@
 
 Apache Sedona 上的 GeoPandas API 提供了与 GeoPandas 一致的接口，可以让您的地理空间分析突破单机的局限。该 API 把熟悉的 GeoPandas DataFrame 语法与 Apache Sedona 在 Apache Spark 上的分布式处理能力结合起来，让您能够使用同样的代码模式处理行星级（planetary-scale）的数据集。
 
+请参阅 [API 覆盖情况参考](../api/geopandas-coverage.md)，了解支持的方法、参数限制和 API 覆盖率。
+
 ## 概览
 
 ### 什么是 Apache Sedona 的 GeoPandas API？
@@ -181,7 +183,8 @@ nyc_buildings.head()
 
 ### 空间过滤
 
-使用空间索引与过滤方法。注意：当前版本尚未实现 `cx` 空间索引：
+使用 `cx` 进行分布式坐标范围筛选；如需将相交的几何裁剪到掩膜边界，
+可继续使用 `clip`：
 
 ```python
 from shapely.geometry import box
@@ -194,13 +197,14 @@ central_park_bbox = box(
     40.789,  # 右上角（经度，纬度）
 )
 
-# 使用空间索引筛选边界框内的建筑
-# 注意：该写法需要把数据收集到 driver 才能进行空间过滤
-# 对于大规模数据，建议改用空间连接（spatial join）
-buildings_sample = nyc_buildings.sample(1000)  # 演示用：抽样 1000 行
-central_park_buildings = buildings_sample[
-    buildings_sample.geometry.intersects(central_park_bbox)
+# 筛选与坐标范围相交的要素
+central_park_buildings = nyc_buildings.cx[
+    -73.973:-73.951,
+    40.764:40.789,
 ]
+
+# 将筛选后的几何裁剪到精确的多边形边界
+central_park_buildings = central_park_buildings.clip(central_park_bbox)
 
 # 显示结果
 print(
@@ -237,14 +241,44 @@ intersects_result = left_df.sjoin(right_df, predicate="intersects")
 contains_result = left_df.sjoin(right_df, predicate="contains")
 ```
 
+### 最近邻点连接
+
+`GeoDataFrame.sjoin_nearest`、`sedona.spark.geopandas.sjoin_nearest` 和
+`sedona.spark.geopandas.tools.sjoin_nearest` 使用 Sedona 的分布式 KNN 连接。
+当前实现支持 **点数据的内连接**：
+
+```python
+nearest = left_points.sjoin_nearest(
+    right_points,
+    distance_col="distance",
+    max_distance=100,
+)
+```
+
+结果保留左侧几何、CRS 和索引，以及右侧索引和双方属性。重名属性使用
+`_left` 和 `_right` 后缀。缺失或空几何不参与匹配。距离按平面计算，使用 CRS
+单位并忽略 Z；请使用投影 CRS 获取有意义的距离单位。可选的 `max_distance`
+必须是有限正数，仅在最近邻搜索后过滤结果，不会缩小搜索范围。
+`distance_col` 必须是新列，输出行的顺序不保证。
+
+**等距候选遵循 Sedona 配置，不保证像 GeoPandas 一样返回所有等距行。**
+`spark.sedona.join.knn.includeTieBreakers` 默认为 `false`，在等距候选中选择
+一行，选择顺序不保证。设为 `true` 会返回等距候选，但候选几何完全相同的
+不同记录仍可能被省略。本 API 不会修改此会话配置。
+
+目前仅支持 `how="inner"`、`exclusive=False`、默认后缀、唯一的单层字符串列名
+和单层索引（允许重复索引值）。不支持的选项、非空的非点几何及歧义输出列名
+会明确报错。输入验证在 Spark 上计算标量汇总，几何数据始终保持分布式。
+
 ### 坐标参考系操作
 
 在不同坐标参考系（CRS）之间转换几何对象：
 
 ```python
-# 设置初始 CRS
+# GeoParquet 通常会保留 CRS 元数据，仅在缺失时进行设置
 buildings = gpd.read_parquet("buildings.parquet")
-buildings = buildings.set_crs("EPSG:4326")
+if buildings.crs is None:
+    buildings = buildings.set_crs("EPSG:4326")
 
 # 转换为投影坐标系以便计算面积
 buildings_projected = buildings.to_crs("EPSG:3857")
@@ -296,20 +330,26 @@ buildings_projected["perimeter"] = buildings_projected.geometry.length
 
 ## 已支持的操作
 
-Apache Sedona 的 GeoPandas API 已实现 **39 个 GeoSeries 函数** 与 **10 个 GeoDataFrame 函数**，覆盖了 GeoPandas 中最常用的操作：
+Apache Sedona 的 GeoPandas API 已实现最常用的 GeoSeries 与 GeoDataFrame 操作：
 
 ### 数据 I/O
 
 - `read_parquet()` —— 读取 GeoParquet 文件
 - `read_file()` —— 读取多种地理空间格式
+- `list_layers()` —— 列出 GeoPackage 中的矢量图层和非空间表
 - `to_parquet()` —— 写出为 Parquet 格式
 
 ### 空间操作
 
 - `sjoin()` —— 多种谓词的空间连接
+- `cx` —— 基于坐标范围的空间筛选
+- `clip()` —— 使用标量、矩形或分布式掩膜裁剪几何
+- `overlay()` —— 支持全部五种 GeoPandas 模式的分布式数据框叠加
 - `buffer()` —— 几何缓冲
+- `transform()` —— 在 executor 上分批执行坐标数组回调
 - `distance()` —— 距离计算
 - `intersects()`、`contains()`、`within()` —— 空间谓词
+- `geom_equals_identical()` —— 对所有已存储坐标维度执行精确的结构相等性比较
 - `sindex` —— 空间索引（功能有限）
 
 ### CRS 操作
@@ -325,22 +365,170 @@ Apache Sedona 的 GeoPandas API 已实现 **39 个 GeoSeries 函数** 与 **10 �
 - `centroid`、`envelope`、`boundary` —— 几何属性
 - `x`、`y`、`z`、`has_z` —— 坐标访问
 - `total_bounds`、`estimate_utm_crs` —— 包围盒与 CRS 工具
+- `hilbert_distance()` —— 基于几何包围盒中点生成分布式空间排序键
 
 ### 空间运算
 
 - `buffer()` —— 几何缓冲
+- `transform()` —— 在 executor 上分批执行坐标数组回调
 - `distance()` —— 距离计算
 - `intersects()`、`contains()`、`within()` —— 空间谓词
 - `intersection()` —— 几何相交
 - `make_valid()` —— 几何校验与修复
+- `is_valid_coverage()` —— 校验多边形覆盖的内部是否互不重叠、共享边界是否完全匹配
+- `invalid_coverage_edges()` —— 按输入行返回导致覆盖无效的边，并可选择检测狭窄间隙
+- `simplify_coverage()` —— 使用分布式空间连接和可靠检查点，一致地简化多边形共享边界
+- `sample_points()` —— 使用原生分布式表达式按面积对多边形采样、按长度对线采样
+- `GeoSeries.explode()` 与 `GeoDataFrame.explode()` —— 将多部件几何展开为多行，
+  其中 GeoDataFrame 方法会保留对应的属性列
+- `cx` —— 基于坐标范围的空间筛选
+- `clip()` —— 分布式几何裁剪
+- `overlay()` —— GeoDataFrame 之间的分布式相交、差集、恒等、对称差和并集
 - `sindex` —— 空间索引（功能有限）
+
+```python
+from shapely.geometry import box
+
+coverage = gpd.GeoSeries([box(0, 0, 1, 1), box(1, 0, 2, 1)])
+assert coverage.is_valid_coverage()
+
+with_gap = gpd.GeoSeries([box(0, 0, 1, 1), box(1.1, 0, 2.1, 1)])
+assert not with_gap.is_valid_coverage(gap_width=0.2)
+invalid_edges = with_gap.invalid_coverage_edges(gap_width=0.2)
+```
+
+`invalid_coverage_edges()` 会让几何行保持分布式执行。Sedona 对按
+`gap_width` 扩展的包围盒执行空间自连接来寻找候选邻居，聚合候选并在 executor
+上执行校验，再将诊断结果映射回输入行。该方法
+保留所有输入行、各级索引和 CRS；没有无效边或多边形分量的行返回空线，缺失
+几何保持缺失。`is_valid_coverage()` 通过分布式归约返回一个 Python `bool`。
+在高密度或大量重叠的覆盖中，或 `gap_width` 较大时，每个目标的候选数组和
+executor 内存开销都会增加。`gap_width` 必须是有限的非负数。
+
+自 v2.0.0 起，`simplify_coverage(tolerance, simplify_boundary=True)` 可以
+一致地删除相邻多边形的共享顶点。输入必须是有效、坐标有限、边界完全匹配的
+二维 Polygon/MultiPolygon 覆盖。缺失值和空多边形会保留；非多边形、Z/M
+坐标、无效多边形以及环内非闭合位置的重复顶点会被拒绝。空的内环也会被拒绝，
+但空多边形和 MultiPolygon 中的空部件会被保留。完整覆盖的有效性是
+使用前提，并不会自动检查。结果是无名称的 GeoSeries，保留所有索引级别和 CRS。
+
+与多数几何方法不同，该操作会立即执行 Spark 作业，直到保守简化规则不再接受
+任何修改。它需要 Spark Classic，以及所有 executor 都能访问的检查点目录：
+
+```python
+# 集群上使用可写的共享文件系统；本地目录仅适用于 Spark 本地模式。
+spark.sparkContext.setCheckpointDir("hdfs:///user/me/coverage-checkpoints")
+simplified = coverage.simplify_coverage(0.1, simplify_boundary=False)
+```
+
+后续检查点物化完成后，中间检查点会被清理。在使用结果或其派生 DataFrame
+期间，最终检查点必须保持可用。其文件遵循 Spark 的检查点清理策略；该方法
+不会删除配置的根目录，也不要求用户调用 `close()`。
+
+容差必须是有限的非负标量：候选顶点的局部三角形面积不得超过
+`tolerance ** 2`。这不是最大位移上限。零容差仍可删除共线顶点；
+`simplify_boundary=False` 会固定覆盖的外部边界。该算法可能比 GeoPandas/GEOS
+保留更多顶点，且不会删除环、孔洞或多边形部件；不保证选择完全相同的顶点。
+
+几何数据保持分布式执行，但长环、密集空间匹配和大量同步轮次的开销可能很高。
+重建过程按环和原始几何构造数组。每个几何最多 100,000 个坐标的准入限制不是
+内存安全保证：低于此限制的长环仍可能耗尽 executor 内存。实现不会把完整覆盖
+或整个邻域收集成几何数组。
+
+`transform(transformation, include_z=False)` 自 v2.0.0 起可用，要求 driver
+和 worker 均安装 Spark >=3.5 和 Shapely >=2.0。该方法在 executor 上以批次为单位，
+惰性地将可序列化的回调应用于 NumPy 坐标数组，并保留索引、CRS 元数据、逐行 SRID、
+缺失值和空几何。GeoDataFrame 调用会转换活动几何列，并返回 GeoSeries。
+
+与本地 GeoPandas 不同，回调每次只能看到一个 Spark 批次，而非整个 GeoSeries。
+请使用确定性的逐坐标回调，例如 `lambda coords: coords + [1, 2]`。
+`lambda coords: coords - coords.mean(axis=0)` 会分别对每个批次做中心化，
+因此结果可能随分区方式或批次大小而变化。若需要全局统计量，请先通过分布式聚合
+单独计算，再将结果作为常量传入回调。Spark 可能多次执行回调，因此结果不能依赖
+可变状态；Sedona 无法自动检测这些批次依赖。回调错误会在 Spark 实际计算结果时
+抛出。`transform()` 保留输入 CRS；需要感知 CRS 的重投影时，请使用 `to_crs()`。
+
+`hilbert_distance()` 使用原生 Spark 表达式，并让逐行排序键保持分布式执行。
+未提供 `total_bounds` 时，该方法会通过一次分布式聚合计算所有包围盒中点的
+范围，只有这个有界摘要会返回 driver。由于 Spark 没有无符号整数类型，
+与 GeoPandas 无符号 32 位值相同的结果会存储在 `int64` Series 中。
+
+`overlay()` 会让两个输入始终保持分布式执行。候选对由 Sedona 空间连接
+生成，差集分支则在 executor 上按源行聚合相匹配的掩膜几何。该实现不会收集
+几何行、创建 Python UDF 或缓存中间候选对。构造结果时会先对两个完整输入
+lineage 执行一次分布式的校验与元数据聚合；只有有界的摘要会返回 driver，
+叠加几何行仍保持惰性求值。组合模式会有意执行多次空间连接，而不是隐式持久化
+可能很大的候选对关系，从而以重复计算换取避免隐藏的缓存内存与生命周期成本。
+输出行顺序不受保证。
+
+与 GeoPandas 一样，每个输入必须只包含一个基本几何族，且默认修复无效多边形。
+JTS 与 GEOS 对拓扑等价的结果可能采用不同的部件或坐标顺序。
+Sedona 的 JTS 结构修复可能与 GeoPandas 的 GEOS 线网修复采用不同方式拆分
+无效多边形；有效输入的拓扑应保持一致。`keep_geom_type=None` 的过滤行为与
+`True` 相同，但 Sedona 不会仅为了在删除
+低维几何时发出 GeoPandas 的条件警告而提前执行完整叠加。MultiIndex 列、
+重复的单级列标签，以及会产生重复输出标签的属性后缀都会被明确拒绝。包括
+MultiIndex 在内的输入行索引会被新的分布式索引替代。除 `difference` 外的
+模式始终把活动输出列命名为 `geometry`，空结果与空间上不相交的结果也不例外，
+从而避免 GeoPandas 的包围盒快速路径产生特殊命名。空的左输入会返回保留类型
+的空结果，而不会像部分 GeoPandas 版本那样在访问第一个几何时抛出异常。
+`identity` 遵循 GeoPandas 1.1+ 的 dtype 语义，保留左侧属性的 dtype，并提升
+可空右侧属性的 dtype。`union` 和 `symmetric_difference` 即使某个逻辑差集
+分支没有输出行，也会使用稳定的可空属性 dtype，从而避免仅为特化 dtype 而
+触发提前执行。
+
+`GeoSeries.explode()` 与 `GeoDataFrame.explode()` 使用 Sedona 原生的
+`ST_Dump` 表达式与 Spark `posexplode`。几何部件及 GeoDataFrame 属性始终
+保持分布式处理；这两个操作都不会收集源数据行，也不会使用 Python UDF。
+为了保留与 GeoPandas 一致的行顺序和部件顺序并重建分布式索引，需要执行一次
+全局排序与 shuffle；对于 `GeoDataFrame`，保留的属性列也会参与该 shuffle。
+
+### 分布式几何聚合
+
+- `GeoDataFrame.dissolve()` —— 对行进行分组，并使用 Sedona 原生分布式聚合
+  对每组几何执行并集
+- `sedona.spark.geopandas.tools.collect()` —— 将分布式 GeoSeries 聚合为一个
+  几何，并在需要时使用同构多部件几何
+
+```python
+from sedona.spark.geopandas.tools import collect
+
+by_region = buildings.dissolve(
+    by="region",
+    aggfunc={"population": "sum", "name": "first"},
+)
+all_building_parts = collect(buildings.geometry)
+```
+
+`dissolve` 支持 `unary` 并集方法，并会明确拒绝定点精度 `grid_size`、
+`coverage` 与 `disjoint_subset` 并集。多个属性聚合会保留为 pandas-on-Spark
+的两级 `MultiIndex`；GeoPandas 则把对应元组标签放在单级 object 索引中。
+原生 `first`、`last` 与 `count` 聚合支持所有属性类型；`nunique` 支持数值、
+布尔与字符串列；`min`、`max`、`sum`、`mean`、`median`、`std` 与 `var`
+支持数值和布尔列。字符串 `sum` 与所有 `prod` 聚合都会被明确拒绝。可调用
+聚合仅限 Python 内置的 `min`、`max`、`sum`，以及 NumPy 的 `amin`、
+`amax`、`min`、`max`、`sum`、`mean`、`median`、`std` 与 `var`。
+两个操作都在 Spark executor 上聚合输入行。`collect` 只会把聚合元数据和
+该 API 所需的单个几何结果传输到 driver。
 
 ### 数据转换
 
 - `to_geopandas()` —— 转换为传统 GeoPandas
-- `to_wkb()`、`to_wkt()` —— 转换为 WKB/WKT
-- `from_xy()` —— 通过坐标创建几何
+- `GeoDataFrame.to_wkb()`、`GeoDataFrame.to_wkt()` —— 在分布式
+  pandas-on-Spark DataFrame 中把所有几何列序列化为 WKB/WKT
+- `points_from_xy()`、`GeoSeries.from_xy()` —— 通过坐标列创建分布式
+  GeoSeries，且不收集分布式输入
 - `geom_type` —— 获取几何类型
+
+与 GeoPandas 不同，`GeoDataFrame.to_wkb()` 和 `GeoDataFrame.to_wkt()` 返回
+惰性的 pandas-on-Spark DataFrame。仅在需要本地 pandas DataFrame 时，才对结果
+调用 `.to_pandas()`。
+
+`points_from_xy()` 会让 pandas-on-Spark 坐标 Series 保持分布式执行。本地
+列表、NumPy 数组和 pandas 对象会先在 driver 上物化，因此大型坐标列应使用
+分布式 Series。类似地，大型逐行 `sample_points()` 数量向量也应使用分布式
+`size` Series。采样输出与逐行中间计算量会随请求的数量增长；当前线采样器会先
+物化该行的采样点，再把它们收集为 MultiPoint。
 
 ## 完整工作流示例
 
@@ -369,8 +557,9 @@ overture_path = DATA_DIR + overture_size + "/" + "overture-buildings/"
 postal_codes = gpd.read_parquet(postal_codes_path)
 buildings = gpd.read_parquet(overture_path)
 
-# 空间分析
-buildings = buildings.set_crs("EPSG:4326")
+# 空间分析（GeoParquet 通常会保留 CRS 元数据）
+if buildings.crs is None:
+    buildings = buildings.set_crs("EPSG:4326")
 buildings_projected = buildings.to_crs("EPSG:3857")
 
 # 计算面积并过滤

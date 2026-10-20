@@ -18,6 +18,9 @@
  */
 package org.apache.sedona.flink.expressions;
 
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
 import org.apache.flink.table.annotation.DataTypeHint;
 import org.apache.sedona.flink.GeometryTypeSerializer;
 import org.locationtech.jts.geom.Geometry;
@@ -36,6 +39,24 @@ public class Accumulators {
       minY = Double.MAX_VALUE;
       maxX = -Double.MAX_VALUE;
       maxY = -Double.MAX_VALUE;
+    }
+  }
+
+  public static class Envelope3D {
+    public double minX = Double.MAX_VALUE;
+    public double minY = Double.MAX_VALUE;
+    public double minZ = Double.MAX_VALUE;
+    public double maxX = -Double.MAX_VALUE;
+    public double maxY = -Double.MAX_VALUE;
+    public double maxZ = -Double.MAX_VALUE;
+
+    void reset() {
+      minX = Double.MAX_VALUE;
+      minY = Double.MAX_VALUE;
+      minZ = Double.MAX_VALUE;
+      maxX = -Double.MAX_VALUE;
+      maxY = -Double.MAX_VALUE;
+      maxZ = -Double.MAX_VALUE;
     }
   }
 
@@ -59,6 +80,26 @@ public class Accumulators {
     AccGeometryN(int numGeoms) {
       this.geoms = new Geometry[numGeoms];
       this.numGeoms = numGeoms;
+    }
+  }
+
+  /**
+   * RAW accumulator used by ST_Collect_Aggr for both Geometry and Geography input.
+   *
+   * <p>Values are stored in their stable binary forms so that the accumulator does not depend on
+   * either spatial object's internal representation.
+   */
+  public static class AccGeometryCollection implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    public List<byte[]> values = new ArrayList<>();
+    public Boolean geography;
+    public int srid;
+
+    void reset() {
+      values.clear();
+      geography = null;
+      srid = 0;
     }
   }
 }

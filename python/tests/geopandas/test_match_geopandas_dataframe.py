@@ -33,8 +33,10 @@ from shapely.geometry import (
 from packaging.version import parse as parse_version
 from sedona.spark.geopandas import GeoDataFrame, GeoSeries
 import geopandas as gpd
+import pandas as pd
 from tests.geopandas.test_geopandas_base import TestGeopandasBase
 import pyspark.pandas as ps
+from pandas.testing import assert_frame_equal
 
 
 @pytest.mark.skipif(
@@ -127,6 +129,59 @@ class TestMatchGeopandasDataFrame(TestGeopandasBase):
                 self.check_pd_series_equal(actual_series, expected_series)  # type: ignore
 
         self.check_sgpd_df_equals_gpd_df(sgpd_df, gpd_df)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"index_parts": True},
+            {"ignore_index": True},
+            {"ignore_index": True, "index_parts": True},
+        ],
+    )
+    def test_explode(self, kwargs):
+        from geopandas.testing import assert_geodataframe_equal
+
+        index = pd.MultiIndex.from_tuples(
+            [
+                ("group-a", 1),
+                ("group-a", 1),
+                ("group-b", 2),
+                ("group-b", 3),
+                ("group-c", 4),
+            ],
+            names=["group", "feature_id"],
+        )
+        expected_source = gpd.GeoDataFrame(
+            {
+                "label": ["multi", "single-empty", "multi-empty", "null", "collection"],
+                "secondary": gpd.GeoSeries(
+                    [Point(i, i) for i in range(5)],
+                    index=index,
+                ),
+                "shape": [
+                    MultiPoint([(0, 0), (1, 1)]),
+                    Point(),
+                    MultiPoint(),
+                    None,
+                    GeometryCollection([Point(2, 2), MultiPoint([(3, 3), (4, 4)])]),
+                ],
+            },
+            index=index,
+            geometry="shape",
+            crs="EPSG:4326",
+        )
+
+        expected = expected_source.explode(**kwargs)
+        actual = GeoDataFrame(expected_source).explode(**kwargs).to_geopandas()
+
+        assert_geodataframe_equal(
+            actual,
+            expected,
+            check_index_type=False,
+            check_geom_type=True,
+        )
+        pd.testing.assert_index_equal(actual.index, expected.index, exact=False)
 
     def test_set_geometry(self):
         sgpd_df = GeoDataFrame(self.geometries)
@@ -224,6 +279,45 @@ class TestMatchGeopandasDataFrame(TestGeopandasBase):
                 sgpd_result = GeoDataFrame(data, crs="EPSG:3857").to_json(**kwargs)
             gpd_result = gpd.GeoDataFrame(data, crs="EPSG:3857").to_json(**kwargs)
             assert sgpd_result == gpd_result
+
+    def test_to_wkt_and_to_wkb(self):
+        index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 1), ("b", 2)],
+            names=["group", "position"],
+        )
+        primary = ("geometry", "primary")
+        secondary = ("geometry", "secondary")
+        value = ("attribute", "value")
+        gpd_df = gpd.GeoDataFrame(
+            {
+                "primary": gpd.GeoSeries(
+                    [Point(0, 0), Polygon(), None],
+                    index=index,
+                    crs="EPSG:4326",
+                ),
+                "secondary": gpd.GeoSeries(
+                    [LineString([(0, 0), (1, 1)]), None, Point(2, 2)],
+                    index=index,
+                    crs="EPSG:4326",
+                ),
+                "value": [1, 2, 3],
+            },
+            index=index,
+            geometry="primary",
+            crs="EPSG:4326",
+        )
+        gpd_df.columns = pd.MultiIndex.from_tuples(
+            [primary, secondary, value], names=["kind", "name"]
+        )
+        gpd_df = gpd_df.set_geometry(primary)
+        sgpd_df = GeoDataFrame(gpd_df)
+
+        assert_frame_equal(sgpd_df.to_wkt().to_pandas(), gpd_df.to_wkt())
+        assert_frame_equal(sgpd_df.to_wkb().to_pandas(), gpd_df.to_wkb())
+        assert_frame_equal(
+            sgpd_df.to_wkb(hex=True).to_pandas(),
+            gpd_df.to_wkb(hex=True),
+        )
 
     def test_from_arrow(self):
         if parse_version(gpd.__version__) < parse_version("1.0.0"):

@@ -24,6 +24,7 @@ import static org.junit.Assert.*;
 
 import com.google.common.geometry.S2CellId;
 import com.google.common.math.DoubleMath;
+import com.uber.h3core.exceptions.H3Exception;
 import java.util.*;
 import java.util.stream.Collectors;
 import org.apache.sedona.common.geometryObjects.Box2D;
@@ -37,6 +38,8 @@ import org.geotools.referencing.operation.projection.ProjectionException;
 import org.junit.Test;
 import org.locationtech.jts.geom.*;
 import org.locationtech.jts.geom.LinearRing;
+import org.locationtech.jts.geom.impl.CoordinateArraySequenceFactory;
+import org.locationtech.jts.geom.impl.PackedCoordinateSequenceFactory;
 import org.locationtech.jts.geom.prep.PreparedGeometry;
 import org.locationtech.jts.geom.prep.PreparedGeometryFactory;
 import org.locationtech.jts.io.ParseException;
@@ -567,6 +570,112 @@ public class FunctionsTest extends TestBase {
     Geometry actualResult = Functions.split(geometryCollection, lineString);
 
     assertNull(actualResult);
+  }
+
+  @Test
+  public void splitMultiPointByPolygon() {
+    // Partition a MultiPoint into points inside and outside the polygon. The union of the two
+    // MultiPoints reconstructs the original input.
+    MultiPoint multiPoint =
+        GEOMETRY_FACTORY.createMultiPointFromCoords(coordArray(1.0, 1.0, 5.0, 5.0, 15.0, 15.0));
+    Polygon polygon =
+        GEOMETRY_FACTORY.createPolygon(
+            coordArray(0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0, 0.0, 0.0));
+
+    String actualResult = Functions.split(multiPoint, polygon).norm().toText();
+    String expectedResult = "GEOMETRYCOLLECTION (MULTIPOINT ((1 1), (5 5)), MULTIPOINT ((15 15)))";
+
+    assertEquals(expectedResult, actualResult);
+  }
+
+  @Test
+  public void splitHomogeneousPuntalGeometryCollectionByPolygon() {
+    // Nested puntal collection: GeometryCollection of a MultiPoint and a Point. Must be flattened
+    // by walking coordinates rather than casting children to Point (which would ClassCastException
+    // on the MultiPoint child).
+    Geometry collection =
+        GEOMETRY_FACTORY.createGeometryCollection(
+            new Geometry[] {
+              GEOMETRY_FACTORY.createMultiPointFromCoords(coordArray(1.0, 1.0, 5.0, 5.0)),
+              GEOMETRY_FACTORY.createPoint(new Coordinate(15.0, 15.0))
+            });
+    Polygon polygon =
+        GEOMETRY_FACTORY.createPolygon(
+            coordArray(0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0, 0.0, 0.0));
+
+    String actualResult = Functions.split(collection, polygon).norm().toText();
+    String expectedResult = "GEOMETRYCOLLECTION (MULTIPOINT ((1 1), (5 5)), MULTIPOINT ((15 15)))";
+
+    assertEquals(expectedResult, actualResult);
+  }
+
+  @Test
+  public void splitMultiPointAllInsidePolygon() {
+    MultiPoint multiPoint =
+        GEOMETRY_FACTORY.createMultiPointFromCoords(coordArray(1.0, 1.0, 5.0, 5.0));
+    Polygon polygon =
+        GEOMETRY_FACTORY.createPolygon(
+            coordArray(0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0, 0.0, 0.0));
+
+    String actualResult = Functions.split(multiPoint, polygon).norm().toText();
+    // Only the inside group is present — the outside group is omitted because it is empty.
+    String expectedResult = "GEOMETRYCOLLECTION (MULTIPOINT ((1 1), (5 5)))";
+
+    assertEquals(expectedResult, actualResult);
+  }
+
+  @Test
+  public void splitMultiPointAllOutsidePolygon() {
+    MultiPoint multiPoint =
+        GEOMETRY_FACTORY.createMultiPointFromCoords(coordArray(20.0, 20.0, 30.0, 30.0));
+    Polygon polygon =
+        GEOMETRY_FACTORY.createPolygon(
+            coordArray(0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0, 0.0, 0.0));
+
+    String actualResult = Functions.split(multiPoint, polygon).norm().toText();
+    String expectedResult = "GEOMETRYCOLLECTION (MULTIPOINT ((20 20), (30 30)))";
+
+    assertEquals(expectedResult, actualResult);
+  }
+
+  @Test
+  public void splitMultiPointOnPolygonBoundaryGoesToInside() {
+    // Points on the polygon boundary are covered by it, so they fall in the "inside" group.
+    MultiPoint multiPoint =
+        GEOMETRY_FACTORY.createMultiPointFromCoords(coordArray(0.0, 5.0, 5.0, 5.0, 20.0, 20.0));
+    Polygon polygon =
+        GEOMETRY_FACTORY.createPolygon(
+            coordArray(0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0, 0.0, 0.0));
+
+    String actualResult = Functions.split(multiPoint, polygon).norm().toText();
+    String expectedResult = "GEOMETRYCOLLECTION (MULTIPOINT ((0 5), (5 5)), MULTIPOINT ((20 20)))";
+
+    assertEquals(expectedResult, actualResult);
+  }
+
+  @Test
+  public void splitPointByPolygon() {
+    // A single Point input is treated as a one-element MultiPoint.
+    Point point = GEOMETRY_FACTORY.createPoint(new Coordinate(5.0, 5.0));
+    Polygon polygon =
+        GEOMETRY_FACTORY.createPolygon(
+            coordArray(0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0, 0.0, 0.0));
+
+    String actualResult = Functions.split(point, polygon).norm().toText();
+    String expectedResult = "GEOMETRYCOLLECTION (MULTIPOINT ((5 5)))";
+
+    assertEquals(expectedResult, actualResult);
+  }
+
+  @Test
+  public void splitPuntalByNonPolygonalBladeReturnsNull() {
+    // Only polygonal blades are supported for puntal input. Lineal and puntal blades return null.
+    Point point = GEOMETRY_FACTORY.createPoint(new Coordinate(5.0, 5.0));
+    LineString lineBlade = GEOMETRY_FACTORY.createLineString(coordArray(0.0, 0.0, 10.0, 10.0));
+    MultiPoint pointBlade = GEOMETRY_FACTORY.createMultiPointFromCoords(coordArray(5.0, 5.0));
+
+    assertNull(Functions.split(point, lineBlade));
+    assertNull(Functions.split(point, pointBlade));
   }
 
   @Test
@@ -1491,6 +1600,247 @@ public class FunctionsTest extends TestBase {
   }
 
   @Test
+  public void h3ToParent() {
+    long child = H3Utils.coordinateToCell(new Coordinate(1, 2), 8);
+    long parent = Functions.h3ToParent(child, 5);
+
+    assertEquals(5, H3Utils.h3.getResolution(parent));
+    assertTrue(H3Utils.h3.cellToChildren(parent, 8).contains(child));
+    assertEquals(child, Functions.h3ToParent(child, 8));
+  }
+
+  @Test
+  public void h3ToChildren() {
+    long parent = H3Utils.coordinateToCell(new Coordinate(1, 2), 5);
+    for (int resolution : new int[] {6, 7}) {
+      Long[] children = Functions.h3ToChildren(parent, resolution);
+      assertEquals(resolution == 6 ? 7 : 49, children.length);
+      assertEquals(children.length, new HashSet<>(Arrays.asList(children)).size());
+      for (long child : children) {
+        assertEquals(resolution, H3Utils.h3.getResolution(child));
+        assertEquals(parent, Functions.h3ToParent(child, 5));
+      }
+    }
+    for (int resolution : new int[] {0, 5, 15}) {
+      long cell = H3Utils.coordinateToCell(new Coordinate(1, 2), resolution);
+      assertArrayEquals(new Long[] {cell}, Functions.h3ToChildren(cell, resolution));
+    }
+  }
+
+  @Test
+  public void h3ToChildrenPentagon() {
+    long parent = H3Utils.h3.getPentagons(5).iterator().next();
+    for (int resolution : new int[] {6, 7}) {
+      Long[] children = Functions.h3ToChildren(parent, resolution);
+      assertEquals(resolution == 6 ? 6 : 41, children.length);
+      assertEquals(children.length, new HashSet<>(Arrays.asList(children)).size());
+      for (long child : children) {
+        assertEquals(resolution, H3Utils.h3.getResolution(child));
+        assertEquals(parent, Functions.h3ToParent(child, 5));
+      }
+    }
+  }
+
+  @Test
+  public void h3ToChildrenInvalidResolution() {
+    long cell = H3Utils.coordinateToCell(new Coordinate(1, 2), 5);
+    for (int resolution : new int[] {-1, 16}) {
+      assertThrows(IllegalArgumentException.class, () -> Functions.h3ToChildren(cell, resolution));
+    }
+    assertThrows(H3Exception.class, () -> Functions.h3ToChildren(cell, 4));
+  }
+
+  @Test
+  public void h3ToCenterChild() {
+    long parent = 601041811137363967L;
+    long immediate = Functions.h3ToCenterChild(parent, 6);
+    assertEquals(605545409825210367L, immediate);
+    assertTrue(H3Utils.h3.cellToChildren(parent, 6).contains(immediate));
+    for (int resolution : new int[] {6, 8, 15}) {
+      long child = Functions.h3ToCenterChild(parent, resolution);
+      assertEquals(resolution, H3Utils.h3.getResolution(child));
+      assertEquals(parent, Functions.h3ToParent(child, 5));
+      assertEquals(child, Functions.h3ToCenterChild(immediate, resolution));
+    }
+    // H3's documented center-child example, including a skip of two resolutions.
+    assertEquals(0x872834700ffffffL, Functions.h3ToCenterChild(0x85283473fffffffL, 7));
+  }
+
+  @Test
+  public void h3ToCenterChildPentagon() {
+    for (long pentagon : H3Utils.h3.getPentagons(5)) {
+      for (int resolution : new int[] {6, 8, 15}) {
+        long child = Functions.h3ToCenterChild(pentagon, resolution);
+        assertEquals(resolution, H3Utils.h3.getResolution(child));
+        assertTrue(H3Utils.h3.isPentagon(child));
+        assertEquals(pentagon, Functions.h3ToParent(child, 5));
+      }
+    }
+  }
+
+  @Test
+  public void h3ToCenterChildEqualResolutionAndBoundaries() {
+    for (int resolution : new int[] {0, 5, 15}) {
+      long cell = H3Utils.coordinateToCell(new Coordinate(1, 2), resolution);
+      assertEquals(cell, Functions.h3ToCenterChild(cell, resolution));
+    }
+    for (int resolution : new int[] {0, 14}) {
+      long cell = H3Utils.coordinateToCell(new Coordinate(1, 2), resolution);
+      long child = Functions.h3ToCenterChild(cell, resolution + 1);
+      assertEquals(resolution + 1, H3Utils.h3.getResolution(child));
+      assertEquals(cell, Functions.h3ToParent(child, resolution));
+    }
+  }
+
+  @Test
+  public void h3ToCenterChildInvalidResolution() {
+    long cell = H3Utils.coordinateToCell(new Coordinate(1, 2), 5);
+    for (int resolution : new int[] {-1, 16}) {
+      assertThrows(
+          IllegalArgumentException.class, () -> Functions.h3ToCenterChild(cell, resolution));
+    }
+    assertThrows(H3Exception.class, () -> Functions.h3ToCenterChild(cell, 4));
+  }
+
+  @Test
+  public void h3CompactRecursive() {
+    long parent = H3Utils.coordinateToCell(new Coordinate(1, 2), 5);
+    for (int resolution : new int[] {6, 7}) {
+      long[] children =
+          H3Utils.h3.cellToChildren(parent, resolution).stream()
+              .mapToLong(Long::longValue)
+              .toArray();
+      assertArrayEquals(new Long[] {parent}, Functions.h3Compact(children));
+    }
+  }
+
+  @Test
+  public void h3CompactPartialSets() {
+    long parent = H3Utils.coordinateToCell(new Coordinate(1, 2), 5);
+    List<Long> children = H3Utils.h3.cellToChildren(parent, 6);
+    long[] partial = children.subList(0, 6).stream().mapToLong(Long::longValue).toArray();
+    Long[] unchanged = Functions.h3Compact(partial);
+    assertEquals(6, unchanged.length);
+    assertEquals(new HashSet<>(children.subList(0, 6)), new HashSet<>(Arrays.asList(unchanged)));
+
+    long other = H3Utils.coordinateToCell(new Coordinate(10, 20), 6);
+    List<Long> input = new ArrayList<>(children);
+    input.add(other);
+    Long[] compacted = Functions.h3Compact(input.stream().mapToLong(Long::longValue).toArray());
+    assertEquals(2, compacted.length);
+    assertEquals(
+        new HashSet<>(Arrays.asList(parent, other)), new HashSet<>(Arrays.asList(compacted)));
+  }
+
+  @Test
+  public void h3CompactPentagon() {
+    long pentagon = H3Utils.h3.getPentagons(5).iterator().next();
+    for (int resolution : new int[] {6, 7}) {
+      long[] children =
+          H3Utils.h3.cellToChildren(pentagon, resolution).stream()
+              .mapToLong(Long::longValue)
+              .toArray();
+      assertEquals(resolution == 6 ? 6 : 41, children.length);
+      assertArrayEquals(new Long[] {pentagon}, Functions.h3Compact(children));
+    }
+  }
+
+  @Test
+  public void h3CompactRoundTrip() {
+    long cell = H3Utils.coordinateToCell(new Coordinate(1, 2), 6);
+    List<Long> original = H3Utils.h3.gridDisk(cell, 2);
+    Long[] compacted = Functions.h3Compact(original.stream().mapToLong(Long::longValue).toArray());
+    assertTrue(compacted.length < original.size());
+    Long[] restored =
+        Functions.h3Uncompact(Arrays.stream(compacted).mapToLong(Long::longValue).toArray(), 6);
+    assertEquals(original.size(), restored.length);
+    assertEquals(new HashSet<>(original), new HashSet<>(Arrays.asList(restored)));
+  }
+
+  @Test
+  public void h3CompactEmptyAndSingleton() {
+    assertArrayEquals(new Long[0], Functions.h3Compact(new long[0]));
+    for (int resolution : new int[] {0, 5, 15}) {
+      long cell = H3Utils.coordinateToCell(new Coordinate(1, 2), resolution);
+      assertArrayEquals(new Long[] {cell}, Functions.h3Compact(new long[] {cell}));
+    }
+  }
+
+  @Test
+  public void h3CompactDuplicateError() {
+    long cell = H3Utils.coordinateToCell(new Coordinate(1, 2), 6);
+    long[] duplicates = new long[8];
+    Arrays.fill(duplicates, cell);
+    assertThrows(H3Exception.class, () -> Functions.h3Compact(duplicates));
+  }
+
+  @Test
+  public void h3UncompactMixedResolutions() {
+    long parent = H3Utils.coordinateToCell(new Coordinate(1, 2), 5);
+    long other = H3Utils.coordinateToCell(new Coordinate(10, 20), 6);
+    for (int resolution : new int[] {6, 7}) {
+      Long[] cells = Functions.h3Uncompact(new long[] {parent, other}, resolution);
+      Set<Long> expected = new HashSet<>(H3Utils.h3.cellToChildren(parent, resolution));
+      expected.addAll(H3Utils.h3.cellToChildren(other, resolution));
+      assertEquals(resolution == 6 ? 8 : 56, cells.length);
+      assertEquals(expected, new HashSet<>(Arrays.asList(cells)));
+      for (long cell : cells) {
+        assertEquals(resolution, H3Utils.h3.getResolution(cell));
+      }
+    }
+  }
+
+  @Test
+  public void h3UncompactEqualResolutionAndEmpty() {
+    for (int resolution : new int[] {0, 5, 15}) {
+      long cell = H3Utils.coordinateToCell(new Coordinate(1, 2), resolution);
+      assertArrayEquals(new Long[] {cell}, Functions.h3Uncompact(new long[] {cell}, resolution));
+      assertArrayEquals(new Long[0], Functions.h3Uncompact(new long[0], resolution));
+    }
+  }
+
+  @Test
+  public void h3UncompactPentagon() {
+    long pentagon = H3Utils.h3.getPentagons(5).iterator().next();
+    for (int resolution : new int[] {6, 7}) {
+      Long[] cells = Functions.h3Uncompact(new long[] {pentagon}, resolution);
+      assertEquals(resolution == 6 ? 6 : 41, cells.length);
+      assertEquals(cells.length, new HashSet<>(Arrays.asList(cells)).size());
+      for (long cell : cells) {
+        assertEquals(resolution, H3Utils.h3.getResolution(cell));
+        assertEquals(pentagon, H3Utils.h3.cellToParent(cell, 5));
+      }
+    }
+  }
+
+  @Test
+  public void h3UncompactRoundTrip() {
+    long cell = H3Utils.coordinateToCell(new Coordinate(1, 2), 6);
+    List<Long> original = H3Utils.h3.gridDisk(cell, 2);
+    long[] compacted =
+        H3Utils.h3.compactCells(original).stream().mapToLong(Long::longValue).toArray();
+    assertTrue(compacted.length < original.size());
+    Long[] uncompacted = Functions.h3Uncompact(compacted, 6);
+    assertEquals(original.size(), uncompacted.length);
+    assertEquals(new HashSet<>(original), new HashSet<>(Arrays.asList(uncompacted)));
+  }
+
+  @Test
+  public void h3UncompactInvalidResolution() {
+    long parent = H3Utils.coordinateToCell(new Coordinate(1, 2), 5);
+    long child = H3Utils.h3.cellToCenterChild(parent, 6);
+    for (int resolution : new int[] {-1, 16}) {
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> Functions.h3Uncompact(new long[] {parent}, resolution));
+      assertThrows(
+          IllegalArgumentException.class, () -> Functions.h3Uncompact(new long[0], resolution));
+    }
+    assertThrows(H3Exception.class, () -> Functions.h3Uncompact(new long[] {parent}, 4));
+    assertThrows(H3Exception.class, () -> Functions.h3Uncompact(new long[] {parent, child}, 5));
+  }
+
+  @Test
   public void geometricMedian() throws Exception {
     MultiPoint multiPoint =
         GEOMETRY_FACTORY.createMultiPointFromCoords(coordArray(1480, 0, 620, 0));
@@ -1667,6 +2017,139 @@ public class FunctionsTest extends TestBase {
   }
 
   @Test
+  public void testForcePolygonCWRecursesIntoNestedGeometryCollections() throws ParseException {
+    Geometry source =
+        Constructors.geomFromWKT(
+            "GEOMETRYCOLLECTION ("
+                + "POINT (9 9), "
+                + "GEOMETRYCOLLECTION ("
+                + "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0)), "
+                + "LINESTRING (3 3, 4 4), "
+                + "GEOMETRYCOLLECTION EMPTY, "
+                + "MULTIPOLYGON (((10 0, 12 0, 12 2, 10 2, 10 0)))), "
+                + "POLYGON ((20 0, 22 0, 22 2, 20 2, 20 0)))",
+            4326);
+
+    Geometry result = Functions.forcePolygonCW(source);
+
+    assertNestedCollectionOrientation(source, result, true);
+  }
+
+  @Test
+  public void testForcePolygonCCWRecursesIntoNestedGeometryCollections() throws ParseException {
+    Geometry source =
+        Constructors.geomFromWKT(
+            "GEOMETRYCOLLECTION ("
+                + "POINT (9 9), "
+                + "GEOMETRYCOLLECTION ("
+                + "POLYGON ((0 0, 0 2, 2 2, 2 0, 0 0)), "
+                + "LINESTRING (3 3, 4 4), "
+                + "GEOMETRYCOLLECTION EMPTY, "
+                + "MULTIPOLYGON (((10 0, 10 2, 12 2, 12 0, 10 0)))), "
+                + "POLYGON ((20 0, 20 2, 22 2, 22 0, 20 0)))",
+            4326);
+
+    Geometry result = Functions.forcePolygonCCW(source);
+
+    assertNestedCollectionOrientation(source, result, false);
+  }
+
+  private void assertNestedCollectionOrientation(
+      Geometry source, Geometry result, boolean clockwise) {
+    assertTrue(result instanceof GeometryCollection);
+    assertEquals(source.getSRID(), result.getSRID());
+    assertEquals(source.getNumGeometries(), result.getNumGeometries());
+
+    assertEquals(source.getGeometryN(0), result.getGeometryN(0));
+    assertTrue(result.getGeometryN(1) instanceof GeometryCollection);
+    assertTrue(result.getGeometryN(2) instanceof Polygon);
+
+    GeometryCollection sourceNested = (GeometryCollection) source.getGeometryN(1);
+    GeometryCollection resultNested = (GeometryCollection) result.getGeometryN(1);
+    assertEquals(sourceNested.getSRID(), resultNested.getSRID());
+    assertEquals(sourceNested.getNumGeometries(), resultNested.getNumGeometries());
+
+    assertTrue(resultNested.getGeometryN(0) instanceof Polygon);
+    assertEquals(sourceNested.getGeometryN(1), resultNested.getGeometryN(1));
+    assertEquals(sourceNested.getGeometryN(2), resultNested.getGeometryN(2));
+    assertTrue(resultNested.getGeometryN(2).isEmpty());
+    assertTrue(resultNested.getGeometryN(3) instanceof MultiPolygon);
+
+    Geometry nestedPolygon = resultNested.getGeometryN(0);
+    Geometry nestedMultiPolygon = resultNested.getGeometryN(3);
+    Geometry topLevelPolygon = result.getGeometryN(2);
+    assertEquals(source.getSRID(), nestedPolygon.getSRID());
+    assertEquals(source.getSRID(), nestedMultiPolygon.getSRID());
+    assertEquals(source.getSRID(), topLevelPolygon.getSRID());
+
+    if (clockwise) {
+      assertTrue(Functions.isPolygonCW(nestedPolygon));
+      assertTrue(Functions.isPolygonCW(nestedMultiPolygon));
+      assertTrue(Functions.isPolygonCW(topLevelPolygon));
+      assertTrue(Functions.isPolygonCCW(sourceNested.getGeometryN(0)));
+      assertTrue(Functions.isPolygonCCW(sourceNested.getGeometryN(3)));
+      assertTrue(Functions.isPolygonCCW(source.getGeometryN(2)));
+    } else {
+      assertTrue(Functions.isPolygonCCW(nestedPolygon));
+      assertTrue(Functions.isPolygonCCW(nestedMultiPolygon));
+      assertTrue(Functions.isPolygonCCW(topLevelPolygon));
+      assertTrue(Functions.isPolygonCW(sourceNested.getGeometryN(0)));
+      assertTrue(Functions.isPolygonCW(sourceNested.getGeometryN(3)));
+      assertTrue(Functions.isPolygonCW(source.getGeometryN(2)));
+    }
+  }
+
+  @Test
+  public void testForcePolygonOrientationPreservesCollectionMetadata() throws ParseException {
+    Geometry source =
+        Constructors.geomFromWKT(
+            "GEOMETRYCOLLECTION ("
+                + "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0)), "
+                + "POLYGON ((10 0, 10 2, 12 2, 12 0, 10 0)))",
+            0);
+    source.setSRID(4326);
+    source.setUserData("metadata");
+
+    Geometry clockwise = Functions.forcePolygonCW(source);
+    Geometry counterClockwise = Functions.forcePolygonCCW(source);
+
+    assertEquals(0, source.getFactory().getSRID());
+    assertEquals(4326, clockwise.getSRID());
+    assertEquals(4326, counterClockwise.getSRID());
+    assertEquals("metadata", clockwise.getUserData());
+    assertEquals("metadata", counterClockwise.getUserData());
+  }
+
+  @Test
+  public void testForcePolygonOrientationPreservesNull() {
+    assertNull(Functions.forcePolygonCW(null));
+    assertNull(Functions.forcePolygonCCW(null));
+  }
+
+  @Test
+  public void testIsLineStringCCW() throws ParseException {
+    Geometry closedCCW = Constructors.geomFromWKT("LINESTRING (0 0, 1 0, 1 1, 0 1, 0 0)", 0);
+    Geometry closedCW = Constructors.geomFromWKT("LINESTRING (0 0, 0 1, 1 1, 1 0, 0 0)", 0);
+    Geometry openCCW = Constructors.geomFromWKT("LINESTRING (0 0, 1 0, 1 1, 0 1)", 0);
+    Geometry asymmetricOpen = Constructors.geomFromWKT("LINESTRING (0 1, 0 -1, -1 -2, 3 -2)", 0);
+    Geometry asymmetricClosed =
+        Constructors.geomFromWKT("LINESTRING (0 1, 0 -1, -1 -2, 3 -2, 0 1)", 0);
+
+    assertTrue(Functions.isLineStringCCW(closedCCW));
+    assertFalse(Functions.isLineStringCCW(closedCW));
+    assertTrue(Functions.isLineStringCCW(openCCW));
+    assertFalse(Functions.isLineStringCCW(asymmetricOpen));
+    assertTrue(Functions.isLineStringCCW(asymmetricClosed));
+    assertFalse(
+        Functions.isLineStringCCW(Constructors.geomFromWKT("LINESTRING (0 0, 1 0, 0 1)", 0)));
+    assertFalse(
+        Functions.isLineStringCCW(Constructors.geomFromWKT("LINESTRING (0 0, 1 0, 0 0)", 0)));
+    assertFalse(Functions.isLineStringCCW(Constructors.geomFromWKT("LINESTRING EMPTY", 0)));
+    assertFalse(Functions.isLineStringCCW(Constructors.geomFromWKT("POINT (0 0)", 0)));
+    assertFalse(Functions.isLineStringCCW(null));
+  }
+
+  @Test
   public void testIsPolygonCW() throws ParseException {
     Geometry polyCCW =
         Constructors.geomFromWKT(
@@ -1687,11 +2170,13 @@ public class FunctionsTest extends TestBase {
             0);
     assertTrue(Functions.isPolygonCW(mPoly));
 
+    // Non-polygonal geometries have no polygonal component to violate the orientation, so
+    // PostGIS (and Sedona 2.0.0+) vacuously returns true for them.
     Geometry point = Constructors.geomFromWKT("POINT (45 20)", 0);
-    assertFalse(Functions.isPolygonCW(point));
+    assertTrue(Functions.isPolygonCW(point));
 
     Geometry lineClosed = Constructors.geomFromWKT("LINESTRING (30 20, 20 25, 20 15, 30 20)", 0);
-    assertFalse(Functions.isPolygonCW(lineClosed));
+    assertTrue(Functions.isPolygonCW(lineClosed));
   }
 
   @Test
@@ -1715,11 +2200,75 @@ public class FunctionsTest extends TestBase {
             0);
     assertTrue(Functions.isPolygonCCW(mPoly));
 
+    // Non-polygonal geometries have no polygonal component to violate the orientation, so
+    // PostGIS (and Sedona 2.0.0+) vacuously returns true for them.
     Geometry point = Constructors.geomFromWKT("POINT (45 20)", 0);
-    assertFalse(Functions.isPolygonCCW(point));
+    assertTrue(Functions.isPolygonCCW(point));
 
     Geometry lineClosed = Constructors.geomFromWKT("LINESTRING (30 20, 20 25, 20 15, 30 20)", 0);
-    assertFalse(Functions.isPolygonCCW(lineClosed));
+    assertTrue(Functions.isPolygonCCW(lineClosed));
+  }
+
+  @Test
+  public void testIsPolygonOrientationHandlesEmptyPolygons() throws ParseException {
+    Polygon emptyPolygon = GEOMETRY_FACTORY.createPolygon();
+    MultiPolygon emptyMultiPolygon = GEOMETRY_FACTORY.createMultiPolygon(new Polygon[0]);
+
+    assertTrue(Functions.isPolygonCW(emptyPolygon));
+    assertTrue(Functions.isPolygonCCW(emptyPolygon));
+    assertTrue(Functions.isPolygonCW(emptyMultiPolygon));
+    assertTrue(Functions.isPolygonCCW(emptyMultiPolygon));
+
+    Polygon clockwisePolygon =
+        (Polygon) Constructors.geomFromWKT("POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))", 0);
+    Polygon counterClockwisePolygon =
+        (Polygon) Constructors.geomFromWKT("POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))", 0);
+
+    MultiPolygon clockwiseWithEmpty =
+        GEOMETRY_FACTORY.createMultiPolygon(new Polygon[] {emptyPolygon, clockwisePolygon});
+    MultiPolygon counterClockwiseWithEmpty =
+        GEOMETRY_FACTORY.createMultiPolygon(new Polygon[] {emptyPolygon, counterClockwisePolygon});
+
+    assertTrue(Functions.isPolygonCW(clockwiseWithEmpty));
+    assertTrue(Functions.isPolygonCCW(counterClockwiseWithEmpty));
+  }
+
+  @Test
+  public void testIsPolygonOrientationRecursesIntoGeometryCollections() throws ParseException {
+    // Empty geometry collections have no polygonal components: vacuously true for both.
+    Geometry emptyCollection = Constructors.geomFromWKT("GEOMETRYCOLLECTION EMPTY", 0);
+    assertTrue(Functions.isPolygonCW(emptyCollection));
+    assertTrue(Functions.isPolygonCCW(emptyCollection));
+
+    // A point paired with a nested collection containing a clockwise polygon: the point is
+    // ignored, and the polygon is found by recursing into the nested collection.
+    Geometry nestedCW =
+        Constructors.geomFromWKT(
+            "GEOMETRYCOLLECTION (POINT (2 2), GEOMETRYCOLLECTION (POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))))",
+            0);
+    assertTrue(Functions.isPolygonCW(nestedCW));
+    assertFalse(Functions.isPolygonCCW(nestedCW));
+
+    Geometry nestedCCW =
+        Constructors.geomFromWKT(
+            "GEOMETRYCOLLECTION (POINT (2 2), GEOMETRYCOLLECTION (POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))))",
+            0);
+    assertFalse(Functions.isPolygonCW(nestedCCW));
+    assertTrue(Functions.isPolygonCCW(nestedCCW));
+
+    // A collection mixing a clockwise and a counter-clockwise polygon matches neither predicate.
+    Geometry mixedOrientation =
+        Constructors.geomFromWKT(
+            "GEOMETRYCOLLECTION (POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0)), POLYGON ((10 10, 11 10, 11 11, 10 11, 10 10)))",
+            0);
+    assertFalse(Functions.isPolygonCW(mixedOrientation));
+    assertFalse(Functions.isPolygonCCW(mixedOrientation));
+  }
+
+  @Test
+  public void testIsPolygonOrientationHandlesNullGeometry() {
+    assertFalse(Functions.isPolygonCW(null));
+    assertFalse(Functions.isPolygonCCW(null));
   }
 
   @Test
@@ -2010,6 +2559,35 @@ public class FunctionsTest extends TestBase {
     p2 = GEOMETRY_FACTORY.createPoint(new Coordinate(120, -89.999));
     assertTrue(Spheroid.distance(p1, p2) < 300);
     assertTrue(Spheroid.distance(p2, p1) < 300);
+  }
+
+  @Test
+  public void sphereAndSpheroidDistanceEmptyGeometries() throws ParseException {
+    Geometry point = GEOMETRY_FACTORY.createPoint(new Coordinate(0, 0));
+    Geometry[] empties = {
+      wktReader.read("POINT EMPTY"),
+      wktReader.read("LINESTRING EMPTY"),
+      wktReader.read("POLYGON EMPTY"),
+      wktReader.read("MULTIPOLYGON EMPTY"),
+      wktReader.read("GEOMETRYCOLLECTION EMPTY"),
+      wktReader.read("GEOMETRYCOLLECTION (POINT EMPTY)")
+    };
+
+    // Like the planar Functions.distance, return null if either geometry is empty
+    for (Geometry empty : empties) {
+      assertNull(Haversine.distance(point, empty));
+      assertNull(Haversine.distance(empty, point));
+      assertNull(Haversine.distance(point, empty, 6378137.0));
+      assertNull(Spheroid.distance(point, empty));
+      assertNull(Spheroid.distance(empty, point));
+      assertNull(Haversine.distance(empty, empty));
+      assertNull(Spheroid.distance(empty, empty));
+    }
+
+    // A geometry with an empty component is not empty, so it is still measured
+    Geometry partiallyEmpty = wktReader.read("GEOMETRYCOLLECTION (POLYGON EMPTY, POINT (1 0))");
+    assertEquals(111319.49079327357, Spheroid.distance(point, partiallyEmpty), 0.1);
+    assertEquals(111195.06627089888, Haversine.distance(point, partiallyEmpty), 0.1);
   }
 
   @Test
@@ -2502,6 +3080,34 @@ public class FunctionsTest extends TestBase {
         () -> {
           Functions.simplifyPolygonHull(finalGeom, 0.1);
         });
+  }
+
+  @Test
+  public void nDims() throws ParseException {
+    assertEquals(2, Functions.nDims(Constructors.geomFromWKT("POINT (1 2)", 0)));
+    assertEquals(3, Functions.nDims(Constructors.geomFromWKT("LINESTRING (1 2 3, 4 5 6)", 0)));
+    assertEquals(
+        3,
+        Functions.nDims(Constructors.geomFromWKT("POLYGON M ((1 2 3, 3 4 3, 5 6 3, 1 2 3))", 0)));
+    assertEquals(4, Functions.nDims(Constructors.geomFromWKT("POINT ZM (1 2 3 4)", 0)));
+  }
+
+  @Test
+  public void nDimsEmptyGeometries() throws ParseException {
+    String[] emptyWkts = {
+      "POINT EMPTY",
+      "LINESTRING EMPTY",
+      "POLYGON EMPTY",
+      "MULTIPOINT EMPTY",
+      "MULTILINESTRING EMPTY",
+      "MULTIPOLYGON EMPTY",
+      "GEOMETRYCOLLECTION EMPTY"
+    };
+    for (String wkt : emptyWkts) {
+      assertEquals(wkt, 2, Functions.nDims(Constructors.geomFromWKT(wkt, 0)));
+    }
+    assertEquals(2, Functions.nDims(GEOMETRY_FACTORY.createPoint()));
+    assertEquals(2, Functions.nDims(GEOMETRY_FACTORY.createGeometryCollection()));
   }
 
   @Test
@@ -3134,6 +3740,43 @@ public class FunctionsTest extends TestBase {
     assertNotEquals(first, second);
     assertEquals(first, first2);
     assertEquals(second, second2);
+  }
+
+  @Test
+  public void geometryNIsOneBased() throws ParseException {
+    // PostGIS semantics: n = 1 is the first element; 0, negatives and n > N are null.
+    Geometry multiPoint = geomFromWKT("MULTIPOINT ((1 1), (2 2), (3 3))", 4326);
+    assertEquals("POINT (1 1)", Functions.asWKT(Functions.geometryN(multiPoint, 1)));
+    assertEquals("POINT (3 3)", Functions.asWKT(Functions.geometryN(multiPoint, 3)));
+    assertEquals(4326, Functions.geometryN(multiPoint, 1).getSRID());
+    assertNull(Functions.geometryN(multiPoint, 0));
+    assertNull(Functions.geometryN(multiPoint, -1));
+    assertNull(Functions.geometryN(multiPoint, 4));
+
+    // A non-collection is its own first geometry.
+    Geometry point = geomFromWKT("POINT (1 1)", 0);
+    assertEquals("POINT (1 1)", Functions.asWKT(Functions.geometryN(point, 1)));
+    assertNull(Functions.geometryN(point, 0));
+    assertNull(Functions.geometryN(point, 2));
+  }
+
+  @Test
+  public void interiorRingNIsOneBased() throws ParseException {
+    // PostGIS semantics: n = 1 is the first hole; 0, negatives and n > N are null.
+    Geometry polygon =
+        geomFromWKT(
+            "POLYGON ((0 0, 6 0, 6 6, 0 6, 0 0), (1 1, 1 2, 2 2, 2 1, 1 1), (4 4, 4 5, 5 5, 5 4, 4 4))",
+            0);
+    assertEquals(
+        "LINESTRING (1 1, 1 2, 2 2, 2 1, 1 1)",
+        Functions.asWKT(Functions.interiorRingN(polygon, 1)));
+    assertEquals(
+        "LINESTRING (4 4, 4 5, 5 5, 5 4, 4 4)",
+        Functions.asWKT(Functions.interiorRingN(polygon, 2)));
+    assertNull(Functions.interiorRingN(polygon, 0));
+    assertNull(Functions.interiorRingN(polygon, -1));
+    assertNull(Functions.interiorRingN(polygon, 3));
+    assertNull(Functions.interiorRingN(geomFromWKT("POINT (0 0)", 0), 1));
   }
 
   @Test
@@ -4334,6 +4977,166 @@ public class FunctionsTest extends TestBase {
   }
 
   @Test
+  public void setSRIDPreservesEmptyPolygonHoles() throws ParseException {
+    Polygon source =
+        (Polygon) Constructors.geomFromWKT("POLYGON ((0 0, 10 0, 10 10, 0 0), EMPTY)", 100);
+
+    Polygon result = (Polygon) Functions.setSRID(source, 4326);
+
+    assertEquals(1, result.getNumInteriorRing());
+    assertTrue(result.getInteriorRingN(0).isEmpty());
+    assertEquals(source.getExteriorRing(), result.getExteriorRing());
+    assertNotSame(source.getInteriorRingN(0), result.getInteriorRingN(0));
+    assertGeometryTreeUsesFactory(result, result.getFactory(), 4326);
+    assertEquals(100, source.getSRID());
+    assertEquals(1, source.getNumInteriorRing());
+  }
+
+  @Test
+  public void setSRIDCopiesEmptyPolygonWithoutMutatingInput() throws ParseException {
+    Polygon source = (Polygon) Constructors.geomFromWKT("POLYGON EMPTY", 100);
+    source.setUserData("source metadata");
+    source.getExteriorRing().setUserData("shell metadata");
+
+    Polygon result = (Polygon) Functions.setSRID(source, 4326);
+
+    assertEquals(100, source.getSRID());
+    assertNotSame(source, result);
+    assertNotSame(source.getExteriorRing(), result.getExteriorRing());
+    assertTrue(result.isEmpty());
+    assertGeometryTreeUsesFactory(result, result.getFactory(), 4326);
+    assertNull(result.getUserData());
+    assertNull(result.getExteriorRing().getUserData());
+    assertEquals("source metadata", source.getUserData());
+    assertEquals("shell metadata", source.getExteriorRing().getUserData());
+  }
+
+  @Test
+  public void setSRIDPreservesNestedEmptyComponentsAndCopiesStructure() {
+    GeometryFactory sourceFactory =
+        new GeometryFactory(new PrecisionModel(), 100, CoordinateArraySequenceFactory.instance());
+    Point emptyPoint =
+        sourceFactory.createPoint(sourceFactory.getCoordinateSequenceFactory().create(0, 3, 0));
+    Polygon emptyPolygon =
+        sourceFactory.createPolygon(
+            sourceFactory.createLinearRing(
+                sourceFactory.getCoordinateSequenceFactory().create(0, 4, 1)));
+    Point populatedPoint = sourceFactory.createPoint(new Coordinate(1, 2));
+    GeometryCollection nested =
+        sourceFactory.createGeometryCollection(new Geometry[] {emptyPolygon, populatedPoint});
+    GeometryCollection source =
+        sourceFactory.createGeometryCollection(new Geometry[] {emptyPoint, nested});
+    source.setSRID(100);
+    emptyPoint.setSRID(101);
+    nested.setSRID(102);
+    emptyPolygon.setSRID(103);
+    populatedPoint.setSRID(104);
+    source.setUserData("root metadata");
+    emptyPoint.setUserData("child metadata");
+    nested.setUserData("nested metadata");
+
+    GeometryCollection result = (GeometryCollection) Functions.setSRID(source, 4326);
+
+    assertEquals(2, result.getNumGeometries());
+    assertEquals(2, result.getGeometryN(1).getNumGeometries());
+    assertGeometryTreeUsesFactory(result, result.getFactory(), 4326);
+    assertNull(result.getUserData());
+    assertNull(result.getGeometryN(0).getUserData());
+    assertNull(result.getGeometryN(1).getUserData());
+    assertEquals(3, ((Point) result.getGeometryN(0)).getCoordinateSequence().getDimension());
+    assertEquals(
+        4,
+        ((Polygon) result.getGeometryN(1).getGeometryN(0))
+            .getExteriorRing()
+            .getCoordinateSequence()
+            .getDimension());
+    assertEquals(
+        1,
+        ((Polygon) result.getGeometryN(1).getGeometryN(0))
+            .getExteriorRing()
+            .getCoordinateSequence()
+            .getMeasures());
+    assertNotSame(source, result);
+    assertNotSame(source.getGeometryN(0), result.getGeometryN(0));
+    Point resultPoint = (Point) result.getGeometryN(1).getGeometryN(1);
+    resultPoint.getCoordinateSequence().setOrdinate(0, 0, 9);
+    assertEquals(1, populatedPoint.getX(), 0);
+    assertEquals(100, source.getSRID());
+    assertEquals(101, emptyPoint.getSRID());
+    assertEquals(102, nested.getSRID());
+    assertEquals(103, emptyPolygon.getSRID());
+    assertEquals(104, populatedPoint.getSRID());
+    assertEquals("root metadata", source.getUserData());
+    assertEquals("child metadata", emptyPoint.getUserData());
+    assertEquals("nested metadata", nested.getUserData());
+  }
+
+  @Test
+  public void setSRIDPreservesPackedCoordinateSequenceFactoryAndEmptyLayouts() {
+    GeometryFactory sourceFactory =
+        new GeometryFactory(
+            new PrecisionModel(), 7, PackedCoordinateSequenceFactory.DOUBLE_FACTORY);
+    Point emptyXym =
+        sourceFactory.createPoint(sourceFactory.getCoordinateSequenceFactory().create(0, 3, 1));
+    LineString emptyXyz =
+        sourceFactory.createLineString(
+            sourceFactory.getCoordinateSequenceFactory().create(0, 3, 0));
+    LinearRing emptyXyzmShell =
+        sourceFactory.createLinearRing(
+            sourceFactory.getCoordinateSequenceFactory().create(0, 4, 1));
+    GeometryCollection source =
+        sourceFactory.createGeometryCollection(
+            new Geometry[] {
+              sourceFactory.createMultiPoint(new Point[] {emptyXym}),
+              sourceFactory.createMultiLineString(new LineString[] {emptyXyz}),
+              sourceFactory.createMultiPolygon(
+                  new Polygon[] {sourceFactory.createPolygon(emptyXyzmShell)})
+            });
+
+    GeometryCollection result = (GeometryCollection) Functions.setSRID(source, 3857);
+
+    assertSame(
+        PackedCoordinateSequenceFactory.DOUBLE_FACTORY,
+        result.getFactory().getCoordinateSequenceFactory());
+    assertEquals(1, result.getGeometryN(0).getNumGeometries());
+    assertEquals(1, result.getGeometryN(1).getNumGeometries());
+    assertEquals(1, result.getGeometryN(2).getNumGeometries());
+    CoordinateSequence pointSequence =
+        ((Point) result.getGeometryN(0).getGeometryN(0)).getCoordinateSequence();
+    CoordinateSequence lineSequence =
+        ((LineString) result.getGeometryN(1).getGeometryN(0)).getCoordinateSequence();
+    CoordinateSequence shellSequence =
+        ((Polygon) result.getGeometryN(2).getGeometryN(0))
+            .getExteriorRing()
+            .getCoordinateSequence();
+    assertEquals(3, pointSequence.getDimension());
+    assertEquals(1, pointSequence.getMeasures());
+    assertEquals(3, lineSequence.getDimension());
+    assertEquals(0, lineSequence.getMeasures());
+    assertEquals(4, shellSequence.getDimension());
+    assertEquals(1, shellSequence.getMeasures());
+    assertGeometryTreeUsesFactory(result, result.getFactory(), 3857);
+    assertEquals(7, source.getFactory().getSRID());
+  }
+
+  private static void assertGeometryTreeUsesFactory(
+      Geometry geometry, GeometryFactory factory, int srid) {
+    assertSame(factory, geometry.getFactory());
+    assertEquals(srid, geometry.getSRID());
+    assertEquals(srid, geometry.getFactory().getSRID());
+    for (int i = 0; i < geometry.getNumGeometries(); i++) {
+      Geometry child = geometry.getGeometryN(i);
+      if (child != geometry) assertGeometryTreeUsesFactory(child, factory, srid);
+    }
+    if (geometry instanceof Polygon) {
+      Polygon polygon = (Polygon) geometry;
+      assertGeometryTreeUsesFactory(polygon.getExteriorRing(), factory, srid);
+      for (int i = 0; i < polygon.getNumInteriorRing(); i++)
+        assertGeometryTreeUsesFactory(polygon.getInteriorRingN(i), factory, srid);
+    }
+  }
+
+  @Test
   public void closestPoint() {
     Point point1 = GEOMETRY_FACTORY.createPoint(new Coordinate(1, 1));
     LineString lineString1 =
@@ -4538,6 +5341,24 @@ public class FunctionsTest extends TestBase {
   }
 
   @Test
+  public void testZmFlagEmptyGeometries() throws ParseException {
+    String[] emptyWkts = {
+      "POINT EMPTY",
+      "LINESTRING EMPTY",
+      "POLYGON EMPTY",
+      "MULTIPOINT EMPTY",
+      "MULTILINESTRING EMPTY",
+      "MULTIPOLYGON EMPTY",
+      "GEOMETRYCOLLECTION EMPTY"
+    };
+    for (String wkt : emptyWkts) {
+      assertEquals(wkt, 0, Functions.zmFlag(Constructors.geomFromWKT(wkt, 0)));
+    }
+    assertEquals(0, Functions.zmFlag(GEOMETRY_FACTORY.createPoint()));
+    assertEquals(0, Functions.zmFlag(GEOMETRY_FACTORY.createGeometryCollection()));
+  }
+
+  @Test
   public void hausdorffDistanceDefaultGeom2D() throws Exception {
     Polygon polygon1 =
         GEOMETRY_FACTORY.createPolygon(coordArray3d(1, 0, 1, 1, 1, 2, 2, 1, 5, 2, 0, 1, 1, 0, 1));
@@ -4688,6 +5509,25 @@ public class FunctionsTest extends TestBase {
   }
 
   @Test
+  public void testAddMeasureUsesSegmentLengths() throws ParseException {
+    Geometry geom = Constructors.geomFromEWKT("LINESTRING (0 0, 3 0, 3 4)");
+    assertEquals(
+        "LINESTRING M(0 0 0, 3 0 3, 3 4 7)", Functions.asWKT(Functions.addMeasure(geom, 0, 7)));
+
+    geom = Constructors.geomFromEWKT("MULTILINESTRING ((0 0, 10 0), (0 1, 10 1))");
+    assertEquals(
+        "MULTILINESTRING M((0 0 0, 10 0 10), (0 1 10, 10 1 20))",
+        Functions.asWKT(Functions.addMeasure(geom, 0, 20)));
+
+    geom =
+        Constructors.geomFromEWKT(
+            "MULTILINESTRING ZM((0 0 1 99, 3 0 5 99, 3 4 9 99), (20 0 2 99, 30 0 3 99))");
+    assertEquals(
+        "MULTILINESTRING ZM((0 0 1 17, 3 0 5 14, 3 4 9 10), (20 0 2 10, 30 0 3 0))",
+        Functions.asWKT(Functions.addMeasure(geom, 17, 0)));
+  }
+
+  @Test
   public void voronoiPolygons() {
     MultiPoint multiPoint = GEOMETRY_FACTORY.createMultiPointFromCoords(coordArray(0, 0, 2, 2));
     Geometry actual1 = Functions.voronoiPolygons(multiPoint, 0, null);
@@ -4823,6 +5663,7 @@ public class FunctionsTest extends TestBase {
             Constructors.geomFromEWKT("POINT (61.64205411585366 104.55256764481707)"),
             45.18896951053177);
     assertEquals(expected, actual);
+    assertNull(Functions.maximumInscribedCircle(geom, Double.NaN));
 
     geom =
         Constructors.geomFromEWKT(
@@ -4865,6 +5706,37 @@ public class FunctionsTest extends TestBase {
             Constructors.geomFromEWKT("POINT (67.4 14.8)"),
             2.2681911662992174);
     assertTrue(expected.equals(actual));
+
+    geom = Constructors.geomFromWKT("POLYGON ((0 0, 1 0, 1 1, 0 0))", 3857);
+    actual = Functions.maximumInscribedCircle(geom, 2.0);
+    expected =
+        new InscribedCircle(
+            Constructors.geomFromWKT("POINT (0.75 0.5)", 3857),
+            Constructors.geomFromWKT("POINT (0.625 0.625)", 3857),
+            0.1767766952966369);
+    assertEquals(expected, actual);
+    assertEquals(3857, actual.center.getSRID());
+    assertEquals(3857, actual.nearest.getSRID());
+    assertEquals(
+        Functions.maximumInscribedCircle(geom), Functions.maximumInscribedCircle(geom, 0.0));
+
+    geom = Constructors.geomFromWKT("POLYGON ((0 0, 0 0, 0 0, 0 0))", 3857);
+    actual = Functions.maximumInscribedCircle(geom);
+    expected =
+        new InscribedCircle(
+            Constructors.geomFromWKT("POINT (0 0)", 3857),
+            Constructors.geomFromWKT("POINT (0 0)", 3857),
+            0.0);
+    assertEquals(expected, actual);
+    assertEquals(expected, Functions.maximumInscribedCircle(geom, 0.0));
+    assertEquals(expected, Functions.maximumInscribedCircle(geom, 2.0));
+
+    Geometry finalGeom = geom;
+    IllegalArgumentException error =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Functions.maximumInscribedCircle(finalGeom, -1.0));
+    assertEquals("Tolerance must be positive", error.getMessage());
   }
 
   @Test

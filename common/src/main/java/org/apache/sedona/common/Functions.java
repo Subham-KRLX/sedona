@@ -26,16 +26,19 @@ import com.uber.h3core.exceptions.H3Exception;
 import com.uber.h3core.util.LatLng;
 import java.util.*;
 import java.util.List;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.sedona.common.S2Geography.Geography;
 import org.apache.sedona.common.approximate.StraightSkeleton;
 import org.apache.sedona.common.geometryObjects.Box2D;
+import org.apache.sedona.common.geometryObjects.Box3D;
 import org.apache.sedona.common.geometryObjects.Circle;
 import org.apache.sedona.common.jts2geojson.GeoJSONWriter;
 import org.apache.sedona.common.sphere.Spheroid;
 import org.apache.sedona.common.subDivide.GeometrySubDivider;
 import org.apache.sedona.common.utils.*;
+import org.datasyslab.jts.geom.util.GeometryCopier;
 import org.locationtech.jts.algorithm.Angle;
 import org.locationtech.jts.algorithm.MinimumAreaRectangle;
 import org.locationtech.jts.algorithm.MinimumBoundingCircle;
@@ -626,6 +629,10 @@ public class Functions {
     return Box2D.fromGeometry(geometry);
   }
 
+  public static Box3D box3D(Geometry geometry) {
+    return Box3D.fromGeometry(geometry);
+  }
+
   public static Double distance(Geometry left, Geometry right) {
     if (left.isEmpty() || right.isEmpty()) {
       return null;
@@ -725,6 +732,10 @@ public class Functions {
     return box == null ? null : box.getXMin();
   }
 
+  public static Double xMin(Box3D box) {
+    return box == null ? null : box.getXMin();
+  }
+
   public static Double xMax(Geometry geometry) {
     Coordinate[] points = geometry.getCoordinates();
     double max = -Double.MAX_VALUE;
@@ -735,6 +746,10 @@ public class Functions {
   }
 
   public static Double xMax(Box2D box) {
+    return box == null ? null : box.getXMax();
+  }
+
+  public static Double xMax(Box3D box) {
     return box == null ? null : box.getXMax();
   }
 
@@ -751,6 +766,10 @@ public class Functions {
     return box == null ? null : box.getYMin();
   }
 
+  public static Double yMin(Box3D box) {
+    return box == null ? null : box.getYMin();
+  }
+
   public static Double yMax(Geometry geometry) {
     Coordinate[] points = geometry.getCoordinates();
     double max = -Double.MAX_VALUE;
@@ -764,6 +783,10 @@ public class Functions {
     return box == null ? null : box.getYMax();
   }
 
+  public static Double yMax(Box3D box) {
+    return box == null ? null : box.getYMax();
+  }
+
   public static Double zMax(Geometry geometry) {
     Coordinate[] points = geometry.getCoordinates();
     double max = -Double.MAX_VALUE;
@@ -774,6 +797,10 @@ public class Functions {
     return max == -Double.MAX_VALUE ? null : max;
   }
 
+  public static Double zMax(Box3D box) {
+    return box == null ? null : box.getZMax();
+  }
+
   public static Double zMin(Geometry geometry) {
     Coordinate[] points = geometry.getCoordinates();
     double min = Double.MAX_VALUE;
@@ -782,6 +809,10 @@ public class Functions {
       min = Math.min(points[i].getZ(), min);
     }
     return min == Double.MAX_VALUE ? null : min;
+  }
+
+  public static Double zMin(Box3D box) {
+    return box == null ? null : box.getZMin();
   }
 
   public static boolean hasM(Geometry geom) {
@@ -838,9 +869,13 @@ public class Functions {
     return geometry.reverse();
   }
 
+  /**
+   * Returns the 1-based nth geometry of a collection (PostGIS semantics). A non-collection is its
+   * own first geometry; an index outside 1..N returns null.
+   */
   public static Geometry geometryN(Geometry geometry, int n) {
-    if (n < geometry.getNumGeometries()) {
-      Geometry subGeom = geometry.getGeometryN(n);
+    if (n >= 1 && n <= geometry.getNumGeometries()) {
+      Geometry subGeom = geometry.getGeometryN(n - 1);
       if (subGeom.getSRID() == geometry.getSRID()) {
         return subGeom;
       }
@@ -849,11 +884,15 @@ public class Functions {
     return null;
   }
 
+  /**
+   * Returns the 1-based nth interior ring of a polygon (PostGIS semantics). An index outside 1..N
+   * returns null.
+   */
   public static Geometry interiorRingN(Geometry geometry, int n) {
     if (geometry instanceof Polygon) {
       Polygon polygon = (Polygon) geometry;
-      if (n < polygon.getNumInteriorRing()) {
-        Geometry interiorRing = polygon.getInteriorRingN(n);
+      if (n >= 1 && n <= polygon.getNumInteriorRing()) {
+        Geometry interiorRing = polygon.getInteriorRingN(n - 1);
         if (interiorRing instanceof LinearRing) {
           interiorRing = polygon.getFactory().createLineString(interiorRing.getCoordinates());
         }
@@ -914,6 +953,38 @@ public class Functions {
         + box.getXMax()
         + " "
         + box.getYMax()
+        + ")";
+  }
+
+  /**
+   * PostGIS-format text for a Box3D: {@code BOX3D(xmin ymin zmin, xmax ymax zmax)}. NULL on null
+   * input.
+   *
+   * <p>Values are emitted exactly as stored on the Box3D — this method does not normalize the
+   * corners. Sedona's Box3D allows inverted bounds (e.g. {@code xmin > xmax}); that ordering is
+   * reserved for the same future antimeridian-wraparound semantics noted on {@link
+   * #box2dAsText(Box2D)}. The text faithfully reflects what {@code ST_XMin} / {@code ST_XMax} /
+   * etc. would return.
+   *
+   * <p>Not WKT (WKT has no {@code BOX3D} type), so like {@link #box2dAsText(Box2D)} this lives
+   * outside the {@code asWKT} family to keep that API a true geometry serializer.
+   */
+  public static String box3dAsText(Box3D box) {
+    if (box == null) {
+      return null;
+    }
+    return "BOX3D("
+        + box.getXMin()
+        + " "
+        + box.getYMin()
+        + " "
+        + box.getZMin()
+        + ", "
+        + box.getXMax()
+        + " "
+        + box.getYMax()
+        + " "
+        + box.getZMax()
         + ")";
   }
 
@@ -986,6 +1057,10 @@ public class Functions {
   public static int nDims(Geometry geometry) {
     int count_dimension = 0;
     Coordinate geom = geometry.getCoordinate();
+    if (geom == null) {
+      // Empty geometries have no coordinate to inspect; report them as 2D like PostGIS does.
+      return 2;
+    }
     Double x_cord = geom.getX();
     Double y_cord = geom.getY();
     Double z_cord = geom.getZ();
@@ -1037,12 +1112,7 @@ public class Functions {
             geometry.getPrecisionModel(),
             srid,
             geometry.getFactory().getCoordinateSequenceFactory());
-    Geometry newGeom = factory.createGeometry(geometry);
-    // Workaround for JTS bug: GeometryEditor.editPolygon returns the original
-    // empty polygon without copying it to the new factory, so the SRID is not
-    // updated for POLYGON EMPTY (and similar empty geometry types).
-    newGeom.setSRID(srid);
-    return newGeom;
+    return GeometryCopier.copy(geometry, factory);
   }
 
   public static int getSRID(Geometry geometry) {
@@ -1073,6 +1143,12 @@ public class Functions {
     return geometry instanceof LineString
         && ((LineString) geometry).isClosed()
         && geometry.isSimple();
+  }
+
+  public static boolean isLineStringCCW(Geometry geometry) {
+    return geometry instanceof LineString
+        && geometry.getNumPoints() >= 4
+        && Orientation.isCCW(((LineString) geometry).getCoordinateSequence());
   }
 
   public static boolean isSimple(Geometry geometry) {
@@ -1232,6 +1308,10 @@ public class Functions {
 
   public static int zmFlag(Geometry geom) {
     Coordinate coords = geom.getCoordinate();
+    if (coords == null) {
+      // Empty geometries have no coordinate to inspect; report them as 2D like PostGIS does.
+      return 0;
+    }
     boolean hasZ = !Double.isNaN(coords.getZ());
     boolean hasM = !Double.isNaN(coords.getM());
     if (hasM && hasZ) {
@@ -1293,6 +1373,10 @@ public class Functions {
       return leftGeometry;
     }
     return leftGeometry.intersection(rightGeometry);
+  }
+
+  public static Geometry sharedPaths(Geometry leftGeometry, Geometry rightGeometry) {
+    return SharedPaths.compute(leftGeometry, rightGeometry);
   }
 
   public static Geometry makeValid(Geometry geometry, boolean keepCollapsed) {
@@ -1384,12 +1468,31 @@ public class Functions {
   }
 
   public static InscribedCircle maximumInscribedCircle(Geometry geometry) {
-    // Calculating the tolerance
-    Envelope envelope = geometry.getEnvelopeInternal();
-    double width = envelope.getWidth(), height = envelope.getHeight(), size, tolerance;
-    size = Math.max(width, height);
-    tolerance = size / 1000.0;
+    return maximumInscribedCircle(geometry, defaultMaximumInscribedCircleTolerance(geometry));
+  }
 
+  private static double defaultMaximumInscribedCircleTolerance(Geometry geometry) {
+    Envelope envelope = geometry.getEnvelopeInternal();
+    double size = Math.max(envelope.getWidth(), envelope.getHeight());
+    return size / 1000.0;
+  }
+
+  public static InscribedCircle maximumInscribedCircle(Geometry geometry, double tolerance) {
+    if (Double.isNaN(tolerance)) {
+      return null;
+    }
+    // JTS requires a positive tolerance. A zero value requests the same
+    // geometry-dependent default used by GEOS and the one-argument overload.
+    if (tolerance == 0.0) {
+      tolerance = defaultMaximumInscribedCircleTolerance(geometry);
+    }
+    // A non-empty zero-extent geometry has no positive automatic tolerance.
+    // GEOS returns the coincident center and boundary point for this case,
+    // while JTS rejects a zero tolerance before evaluating the geometry.
+    if (tolerance == 0.0 && !geometry.isEmpty()) {
+      Point point = geometry.getFactory().createPoint(geometry.getCoordinate());
+      return new InscribedCircle(point, point.copy(), 0.0);
+    }
     Geometry center, nearest;
     double radius;
 
@@ -1483,12 +1586,21 @@ public class Functions {
 
   /**
    * Forces a Polygon/MultiPolygon to use clockwise orientation for the exterior ring and a
-   * counter-clockwise for the interior ring(s).
+   * counter-clockwise for the interior ring(s). Polygonal members inside GeometryCollections are
+   * transformed recursively.
    *
    * @param geom
-   * @return a clockwise orientated (Multi)Polygon
+   * @return the geometry with polygonal components oriented clockwise
    */
   public static Geometry forcePolygonCW(Geometry geom) {
+    if (geom == null || geom.isEmpty()) {
+      return geom;
+    }
+
+    if (isPlainGeometryCollection(geom)) {
+      return forcePolygonOrientationInCollection((GeometryCollection) geom, true);
+    }
+
     if (isPolygonCW(geom)) {
       return geom;
     }
@@ -1536,30 +1648,29 @@ public class Functions {
   }
 
   /**
-   * This function accepts Polygon and MultiPolygon, if any other type is provided then it will
-   * return false. If the exterior ring is clockwise and the interior ring(s) are counter-clockwise
-   * then returns true, otherwise false.
+   * Recursively inspects the polygonal components of the input (Polygon, MultiPolygon, or any
+   * nested GeometryCollection), and returns true if every one of them has a clockwise exterior ring
+   * and counter-clockwise interior ring(s). Non-polygonal components (points, line strings) are
+   * ignored. Inputs with no polygonal components at all, including points, line strings, and empty
+   * geometry collections, vacuously return true, matching PostGIS semantics. Empty Polygon and
+   * MultiPolygon inputs also return true because they contain no rings with the opposite
+   * orientation.
    *
-   * @param geom Polygon or MultiPolygon
+   * @param geom any geometry
    * @return
    */
   public static boolean isPolygonCW(Geometry geom) {
-    if (geom instanceof MultiPolygon) {
-      MultiPolygon multiPolygon = (MultiPolygon) geom;
-
-      boolean arePolygonsCW = checkIfPolygonCW((Polygon) multiPolygon.getGeometryN(0));
-      for (int i = 1; i < multiPolygon.getNumGeometries(); i++) {
-        arePolygonsCW = arePolygonsCW && checkIfPolygonCW((Polygon) multiPolygon.getGeometryN(i));
-      }
-      return arePolygonsCW;
-    } else if (geom instanceof Polygon) {
-      return checkIfPolygonCW((Polygon) geom);
+    if (geom == null) {
+      return false;
     }
-    // False for remaining geometry types
-    return false;
+    return allPolygonalComponentsMatchOrientation(geom, Functions::checkIfPolygonCW);
   }
 
   private static boolean checkIfPolygonCW(Polygon geom) {
+    if (geom.isEmpty()) {
+      return true;
+    }
+
     LinearRing exteriorRing = geom.getExteriorRing();
     boolean isExteriorRingCW = !Orientation.isCCW(exteriorRing.getCoordinateSequence());
 
@@ -1574,6 +1685,30 @@ public class Functions {
     }
 
     return isExteriorRingCW && isInteriorRingCW;
+  }
+
+  /**
+   * Recursively walks a geometry's polygonal components (Polygon, MultiPolygon, or any nested
+   * GeometryCollection) and returns true only if every one of them satisfies {@code
+   * ringOrientationCheck}. Non-polygonal components (points, line strings) are ignored, and inputs
+   * with no polygonal components at all vacuously return true.
+   */
+  private static boolean allPolygonalComponentsMatchOrientation(
+      Geometry geom, Predicate<Polygon> ringOrientationCheck) {
+    if (geom instanceof Polygon) {
+      return ringOrientationCheck.test((Polygon) geom);
+    } else if (geom instanceof GeometryCollection) {
+      GeometryCollection collection = (GeometryCollection) geom;
+      for (int i = 0; i < collection.getNumGeometries(); i++) {
+        if (!allPolygonalComponentsMatchOrientation(
+            collection.getGeometryN(i), ringOrientationCheck)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    // No polygonal component to violate the orientation for remaining geometry types
+    return true;
   }
 
   public static Geometry triangulatePolygon(Geometry geom) {
@@ -1597,12 +1732,21 @@ public class Functions {
 
   /**
    * Forces a Polygon/MultiPolygon to use counter-clockwise orientation for the exterior ring and a
-   * clockwise for the interior ring(s).
+   * clockwise for the interior ring(s). Polygonal members inside GeometryCollections are
+   * transformed recursively.
    *
    * @param geom
-   * @return a counter-clockwise orientated (Multi)Polygon
+   * @return the geometry with polygonal components oriented counter-clockwise
    */
   public static Geometry forcePolygonCCW(Geometry geom) {
+    if (geom == null || geom.isEmpty()) {
+      return geom;
+    }
+
+    if (isPlainGeometryCollection(geom)) {
+      return forcePolygonOrientationInCollection((GeometryCollection) geom, false);
+    }
+
     if (isPolygonCCW(geom)) {
       return geom;
     }
@@ -1621,6 +1765,34 @@ public class Functions {
     }
     // Non-polygonal geometries are returned unchanged
     return geom;
+  }
+
+  private static boolean isPlainGeometryCollection(Geometry geometry) {
+    return geometry instanceof GeometryCollection
+        && !(geometry instanceof MultiPoint)
+        && !(geometry instanceof MultiLineString)
+        && !(geometry instanceof MultiPolygon);
+  }
+
+  private static Geometry forcePolygonOrientationInCollection(
+      GeometryCollection collection, boolean clockwise) {
+    Geometry[] orientedGeometries = new Geometry[collection.getNumGeometries()];
+    boolean changed = false;
+    for (int i = 0; i < collection.getNumGeometries(); i++) {
+      Geometry geometry = collection.getGeometryN(i);
+      Geometry orientedGeometry = clockwise ? forcePolygonCW(geometry) : forcePolygonCCW(geometry);
+      orientedGeometries[i] = orientedGeometry;
+      changed |= orientedGeometry != geometry;
+    }
+
+    if (!changed) {
+      return collection;
+    }
+    GeometryCollection orientedCollection =
+        collection.getFactory().createGeometryCollection(orientedGeometries);
+    orientedCollection.setSRID(collection.getSRID());
+    orientedCollection.setUserData(collection.getUserData());
+    return orientedCollection;
   }
 
   private static Geometry transformCCW(Polygon polygon) {
@@ -1650,31 +1822,29 @@ public class Functions {
   }
 
   /**
-   * This function accepts Polygon and MultiPolygon, if any other type is provided then it will
-   * return false. If the exterior ring is counter-clockwise and the interior ring(s) are clockwise
-   * then returns true, otherwise false.
+   * Recursively inspects the polygonal components of the input (Polygon, MultiPolygon, or any
+   * nested GeometryCollection), and returns true if every one of them has a counter-clockwise
+   * exterior ring and clockwise interior ring(s). Non-polygonal components (points, line strings)
+   * are ignored. Inputs with no polygonal components at all, including points, line strings, and
+   * empty geometry collections, vacuously return true, matching PostGIS semantics. Empty Polygon
+   * and MultiPolygon inputs also return true because they contain no rings with the opposite
+   * orientation.
    *
-   * @param geom Polygon or MultiPolygon
+   * @param geom any geometry
    * @return
    */
   public static boolean isPolygonCCW(Geometry geom) {
-    if (geom instanceof MultiPolygon) {
-      MultiPolygon multiPolygon = (MultiPolygon) geom;
-
-      boolean arePolygonsCCW = checkIfPolygonCCW(((Polygon) multiPolygon.getGeometryN(0)));
-      for (int i = 1; i < multiPolygon.getNumGeometries(); i++) {
-        arePolygonsCCW =
-            arePolygonsCCW && checkIfPolygonCCW((Polygon) multiPolygon.getGeometryN(i));
-      }
-      return arePolygonsCCW;
-    } else if (geom instanceof Polygon) {
-      return checkIfPolygonCCW((Polygon) geom);
+    if (geom == null) {
+      return false;
     }
-    // False for remaining geometry types
-    return false;
+    return allPolygonalComponentsMatchOrientation(geom, Functions::checkIfPolygonCCW);
   }
 
   private static boolean checkIfPolygonCCW(Polygon geom) {
+    if (geom.isEmpty()) {
+      return true;
+    }
+
     LinearRing exteriorRing = geom.getExteriorRing();
     boolean isExteriorRingCCW = Orientation.isCCW(exteriorRing.getCoordinateSequence());
 
@@ -1894,6 +2064,65 @@ public class Functions {
       tbdCells.forEach(cells::remove);
     }
     return cells.toArray(new Long[0]);
+  }
+
+  /**
+   * Returns the parent of an H3 cell at the requested resolution.
+   *
+   * @param cell the H3 cell
+   * @param resolution the resolution of the parent cell
+   * @return the parent H3 cell
+   */
+  public static long h3ToParent(long cell, int resolution) {
+    return H3Utils.h3.cellToParent(cell, resolution);
+  }
+
+  /**
+   * Returns the children of an H3 cell at the requested resolution.
+   *
+   * @param cell the H3 cell
+   * @param resolution the resolution of the child cells, between the input cell's resolution and 15
+   * @return the child H3 cells, or the input cell when the resolutions are equal
+   */
+  public static Long[] h3ToChildren(long cell, int resolution) {
+    return H3Utils.h3.cellToChildren(cell, resolution).toArray(new Long[0]);
+  }
+
+  /**
+   * Returns the center child of an H3 cell at the requested resolution.
+   *
+   * @param cell the H3 cell
+   * @param resolution the resolution of the center child, between the input cell's resolution and
+   *     15
+   * @return the center child H3 cell, or the input cell when the resolutions are equal
+   */
+  public static long h3ToCenterChild(long cell, int resolution) {
+    return H3Utils.h3.cellToCenterChild(cell, resolution);
+  }
+
+  /**
+   * Compacts H3 cells by recursively replacing complete child sets with their parents.
+   *
+   * @param cells unique H3 cells at the same resolution
+   * @return the compacted H3 cells, which may have different resolutions
+   */
+  public static Long[] h3Compact(long[] cells) {
+    return H3Utils.h3
+        .compactCells(Arrays.stream(cells).boxed().collect(Collectors.toList()))
+        .toArray(new Long[0]);
+  }
+
+  /**
+   * Expands a collection of H3 cells to the requested resolution.
+   *
+   * @param cells the H3 cells, which may have different resolutions
+   * @param resolution the target resolution, at least that of every input cell and at most 15
+   * @return the H3 cells at the target resolution
+   */
+  public static Long[] h3Uncompact(long[] cells, int resolution) {
+    return H3Utils.h3
+        .uncompactCells(Arrays.stream(cells).boxed().collect(Collectors.toList()), resolution)
+        .toArray(new Long[0]);
   }
 
   /**

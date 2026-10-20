@@ -15,8 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import math
+import struct
+
 import pytest
 import shapely
+from packaging.version import parse as parse_version
 from shapely.geometry import (
     GeometryCollection,
     LineString,
@@ -30,6 +34,7 @@ from shapely.geometry.base import BaseGeometry
 from shapely.wkt import loads as wkt_loads
 
 from sedona.spark.utils import geometry_serde
+from sedona.spark.utils import geometry_serde_general
 
 
 class TestGeomSerdeSpeedup:
@@ -49,6 +54,61 @@ class TestGeomSerdeSpeedup:
         ]
         self._test_serde_roundtrip(linestrings)
 
+    def test_nan_first_z_serialization_keeps_dimension(self):
+        geometry = wkt_loads("LINESTRING Z (0 0 NaN, 1 1 2)")
+
+        buffer = geometry_serde.serialize(geometry)
+        coordinate_type = (buffer[0] & 0x0F) >> 1
+
+        assert coordinate_type == geometry_serde_general.CoordinateType.XYZ
+
+    @pytest.mark.parametrize(
+        "wkt",
+        [
+            "POINT EMPTY",
+            "POINT Z EMPTY",
+            "LINESTRING EMPTY",
+            "LINESTRING Z EMPTY",
+            "POLYGON EMPTY",
+            "POLYGON Z EMPTY",
+            "GEOMETRYCOLLECTION (LINESTRING EMPTY)",
+            "GEOMETRYCOLLECTION (POINT EMPTY, LINESTRING EMPTY, POLYGON EMPTY)",
+            "GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (LINESTRING EMPTY))",
+            "GEOMETRYCOLLECTION Z (POINT Z EMPTY, LINESTRING Z EMPTY, POLYGON Z EMPTY)",
+            "GEOMETRYCOLLECTION (POINT EMPTY, LINESTRING Z EMPTY, POLYGON Z EMPTY)",
+            "GEOMETRYCOLLECTION (GEOMETRYCOLLECTION Z (POINT Z EMPTY, POLYGON Z EMPTY))",
+        ],
+    )
+    def test_empty_geometry_roundtrip_keeps_dimension(self, wkt):
+        geometry = wkt_loads(wkt)
+        actual = self.serde_roundtrip(geometry)
+
+        # Spatial equality does not distinguish the dimensions of empty geometries.
+        assert actual.wkb == geometry.wkb
+
+    @pytest.mark.parametrize("geom_type", ["POINT", "LINESTRING", "POLYGON"])
+    @pytest.mark.parametrize(
+        "coord_type", [1, 2, 3, 4], ids=["XY", "XYZ", "XYM", "XYZM"]
+    )
+    def test_decode_empty_geometry_keeps_stored_layout(self, geom_type, coord_type):
+        if coord_type in (3, 4) and (
+            parse_version(shapely.__version__) < parse_version("2.1")
+            or getattr(shapely, "geos_version", (0, 0, 0)) < (3, 12, 0)
+        ):
+            pytest.skip("M coordinates require Shapely 2.1 and GEOS 3.12 or newer")
+
+        # Build the stored header directly so the serializer cannot hide a decoder bug.
+        buffer = geometry_serde_general.generate_header_bytes(
+            getattr(geometry_serde_general.GeometryTypeID, geom_type), coord_type, 0
+        )
+        actual, offset = geometry_serde.deserialize(buffer)
+        dimension = ["", "Z", "M", "ZM"][coord_type - 1]
+        expected = wkt_loads(f"{geom_type} {dimension} EMPTY")
+
+        assert offset == len(buffer)
+        assert actual.wkb == expected.wkb
+        assert geometry_serde.serialize(actual) == buffer
+
     def test_multi_point(self):
         multi_points = [
             wkt_loads("MULTIPOINT EMPTY"),
@@ -58,6 +118,58 @@ class TestGeomSerdeSpeedup:
             MultiPoint([(10, 20, 30), (30, 40, 50), (50, 60, 70)]),
         ]
         self._test_serde_roundtrip(multi_points)
+
+    @pytest.mark.parametrize(
+        "coord_type", [1, 2, 3, 4], ids=["XY", "XYZ", "XYM", "XYZM"]
+    )
+    @pytest.mark.parametrize("srid", [0, 4326])
+    def test_multipoint_empty_members_are_empty(self, coord_type, srid):
+        if coord_type in (3, 4) and (
+            parse_version(shapely.__version__) < parse_version("2.1")
+            or getattr(shapely, "geos_version", (0, 0, 0)) < (3, 12, 0)
+        ):
+            pytest.skip("M coordinates require Shapely 2.1 and GEOS 3.12 or newer")
+        dimension = [2, 3, 3, 4][coord_type - 1]
+        ordinates = (
+            [math.nan] * dimension
+            + list(range(1, dimension + 1))
+            + [math.nan] * dimension
+        )
+        header = struct.pack(
+            "BBBBi",
+            0x40 | (coord_type << 1) | bool(srid),
+            srid >> 16,
+            (srid >> 8) & 255,
+            srid & 255,
+            3,
+        )
+        buffer = header + struct.pack("d" * len(ordinates), *ordinates)
+
+        actual, offset = geometry_serde.deserialize(buffer + b"trailing bytes")
+
+        assert offset == len(buffer)
+        assert len(actual.geoms) == 3
+        assert actual.geoms[0].is_empty
+        assert not actual.geoms[1].is_empty
+        assert actual.geoms[2].is_empty
+        layout = ["", "Z", "M", "ZM"][coord_type - 1]
+        expected_empty = wkt_loads(f"POINT {layout} EMPTY")
+        assert actual.geoms[0].wkb == expected_empty.wkb
+        assert actual.geoms[2].wkb == expected_empty.wkb
+        assert geometry_serde.serialize(actual) == buffer
+
+    @pytest.mark.parametrize("coordinates", [(math.nan, 1.0), (math.nan, 1.0, 2.0)])
+    def test_multipoint_partially_nan_point_is_not_empty(self, coordinates):
+        coord_type = len(coordinates) - 1
+        buffer = struct.pack("BBBBi", 0x40 | (coord_type << 1), 0, 0, 0, 1)
+        buffer += struct.pack("d" * len(coordinates), *coordinates)
+
+        actual, offset = geometry_serde.deserialize(buffer)
+
+        assert offset == len(buffer)
+        assert len(actual.geoms) == 1
+        assert not actual.geoms[0].is_empty
+        assert geometry_serde.serialize(actual) == buffer
 
     def test_multi_linestring(self):
         multi_linestrings = [
@@ -146,18 +258,91 @@ class TestGeomSerdeSpeedup:
         point2 = TestGeomSerdeSpeedup.serde_roundtrip(point)
         assert shapely.get_srid(point2) == 1000
 
+    @pytest.mark.skipif(
+        parse_version(shapely.__version__) < parse_version("2.1")
+        or getattr(shapely, "geos_version", (0, 0, 0)) < (3, 12, 0),
+        reason="M coordinates require Shapely 2.1 and GEOS 3.12 or newer",
+    )
+    @pytest.mark.parametrize(
+        "wkt",
+        [
+            "POINT M (1 2 3)",
+            "POINT ZM (1 2 3 4)",
+            "POINT M EMPTY",
+            "POINT ZM EMPTY",
+            "LINESTRING M (0 0 1, 2 3 4)",
+            "LINESTRING ZM (0 0 1 2, 3 4 5 6)",
+            "LINESTRING M EMPTY",
+            "LINESTRING ZM EMPTY",
+            "POLYGON M ((0 0 1, 2 0 2, 0 2 3, 0 0 1))",
+            "POLYGON M EMPTY",
+            "POLYGON ZM EMPTY",
+            "GEOMETRYCOLLECTION ZM (POINT ZM EMPTY, LINESTRING ZM EMPTY, POLYGON ZM EMPTY)",
+            "GEOMETRYCOLLECTION ZM (POINT ZM (1 2 3 4), "
+            "LINESTRING ZM (0 0 1 2, 3 4 5 6))",
+        ],
+    )
+    def test_m_roundtrip(self, wkt):
+        geometry = shapely.from_wkt(wkt)
+        actual = TestGeomSerdeSpeedup.serde_roundtrip(geometry)
+
+        assert shapely.to_wkt(actual) == shapely.to_wkt(geometry)
+        assert actual.has_z == geometry.has_z
+        assert actual.has_m == geometry.has_m
+        assert actual.wkb == geometry.wkb
+
+    @pytest.mark.skipif(
+        parse_version(shapely.__version__) < parse_version("2.1")
+        or getattr(shapely, "geos_version", (0, 0, 0)) < (3, 12, 0),
+        reason="M coordinates require Shapely 2.1 and GEOS 3.12 or newer",
+    )
+    @pytest.mark.parametrize("wkt", ["POINT M (1 2 3)", "POINT ZM (1 2 3 4)"])
+    def test_general_serializer_rejects_m_instead_of_losing_it(self, wkt):
+        geometry = shapely.from_wkt(wkt)
+
+        with pytest.raises(ValueError, match="requires geomserde_speedup"):
+            geometry_serde_general.serialize(geometry)
+
+    @pytest.mark.parametrize(
+        "coord_type",
+        [
+            geometry_serde_general.CoordinateType.XYM,
+            geometry_serde_general.CoordinateType.XYZM,
+        ],
+    )
+    def test_general_deserializer_rejects_m_instead_of_losing_it(self, coord_type):
+        buffer = geometry_serde_general.create_buffer_for_geom(
+            geometry_serde_general.GeometryTypeID.POINT,
+            coord_type,
+            8 + geometry_serde_general.CoordinateType.bytes_per_coord(coord_type),
+            1,
+        )
+
+        with pytest.raises(ValueError, match="requires geomserde_speedup"):
+            geometry_serde_general.deserialize(buffer)
+
+    def test_general_serializer_does_not_query_m_on_older_geos(self, monkeypatch):
+        def fail_if_queried(_geometry):
+            raise AssertionError("has_m should not be queried with GEOS < 3.12")
+
+        monkeypatch.setattr(shapely, "geos_version", (3, 11, 0), raising=False)
+        monkeypatch.setattr(
+            BaseGeometry, "has_m", property(fail_if_queried), raising=False
+        )
+        monkeypatch.setattr(
+            geometry_serde_general, "serialize_point", lambda _geometry: b"xy"
+        )
+
+        buffer = geometry_serde_general.serialize(Point(1, 2))
+
+        assert buffer == b"xy"
+
     @staticmethod
     def _test_serde_roundtrip(geoms):
         for geom in geoms:
             geom_actual = TestGeomSerdeSpeedup.serde_roundtrip(geom)
             assert geom_actual.equals_exact(geom, 1e-6)
-            # GEOSGeom_createEmptyLineString in libgeos creates LineString with
-            # Z dimension, This bug has been fixed by
-            # https://github.com/libgeos/geos/pull/745
-            geom_actual_wkt = geom_actual.wkt.replace(
-                "LINESTRING Z EMPTY", "LINESTRING EMPTY"
-            )
-            assert geom.wkt == geom_actual_wkt
+            assert geom.wkt == geom_actual.wkt
 
     @staticmethod
     def serde_roundtrip(geom: BaseGeometry) -> BaseGeometry:

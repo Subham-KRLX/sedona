@@ -65,6 +65,34 @@ public class TestPredicates extends TestBase {
   }
 
   @Test
+  public void test_ST_EqualsExact() {
+    registerUDF("ST_EqualsExact", byte[].class, byte[].class, double.class);
+    verifySqlSingleRes(
+        "SELECT SEDONA.ST_EqualsExact(SEDONA.ST_GeomFromWKT('POINT (0 0)'), SEDONA.ST_GeomFromWKT('POINT (0.03 0.04)'), 0.051)",
+        true);
+    verifySqlSingleRes(
+        "SELECT SEDONA.ST_EqualsExact(SEDONA.ST_GeomFromWKT('POINT (0 0)'), SEDONA.ST_GeomFromWKT('POINT (0.03 0.04)'), 0.049)",
+        false);
+    verifySqlSingleRes(
+        "SELECT SEDONA.ST_EqualsExact(SEDONA.ST_GeomFromWKT('LINESTRING (0 0, 1 1)'), SEDONA.ST_GeomFromWKT('LINESTRING (1 1, 0 0)'), 0.0)",
+        false);
+  }
+
+  @Test
+  public void test_ST_EqualsIdentical() {
+    registerUDF("ST_EqualsIdentical", byte[].class, byte[].class);
+    verifySqlSingleRes(
+        "SELECT SEDONA.ST_EqualsIdentical(SEDONA.ST_GeomFromWKT('POINT Z (1 2 3)'), SEDONA.ST_GeomFromWKT('POINT Z (1 2 3)'))",
+        true);
+    verifySqlSingleRes(
+        "SELECT SEDONA.ST_EqualsIdentical(SEDONA.ST_GeomFromWKT('POINT Z (1 2 3)'), SEDONA.ST_GeomFromWKT('POINT Z (1 2 4)'))",
+        false);
+    verifySqlSingleRes(
+        "SELECT SEDONA.ST_EqualsIdentical(SEDONA.ST_GeomFromWKT('POINT Z (1 2 3)'), SEDONA.ST_GeomFromWKT('POINT M (1 2 3)'))",
+        false);
+  }
+
+  @Test
   public void test_ST_Intersects() {
     registerUDF("ST_Intersects", byte[].class, byte[].class);
     verifySqlSingleRes(

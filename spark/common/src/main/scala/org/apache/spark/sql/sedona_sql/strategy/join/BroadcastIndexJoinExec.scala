@@ -122,8 +122,7 @@ case class BroadcastIndexJoinExec(
     case (None, _, false) => s"ST_$spatialPredicate($windowExpression, $objectExpression)"
     case (None, _, true) => s"RS_$spatialPredicate($windowExpression, $objectExpression)"
     case (Some(r), _, true) =>
-      throw new UnsupportedOperationException(
-        "Distance joins are not supported for raster predicates")
+      s"RS_DWithin($windowExpression, $objectExpression, $r)"
   }
 
   override def simpleString(maxFields: Int): String =
@@ -321,13 +320,36 @@ case class BroadcastIndexJoinExec(
             (shape, row)
           }
         })
-      case Some(distanceExpression) =>
+      case Some(distanceExpression) if isRasterPredicate =>
+        val boundDistance =
+          BindReferences.bindReference(distanceExpression, streamed.output)
         streamResultsRaw.map(row => {
-          val geom = boundStreamShape.eval(row).asInstanceOf[Array[Byte]]
-          if (geom == null) {
+          val serialized = boundStreamShape.eval(row).asInstanceOf[Array[Byte]]
+          if (serialized == null) {
             (null, row)
           } else {
-            val geometry = GeometrySerializer.deserialize(geom)
+            val baseShape = if (boundStreamShape.dataType.isInstanceOf[RasterUDT]) {
+              val raster = RasterSerializer.deserialize(serialized)
+              JoinedGeometryRaster.rasterToWGS84Envelope(raster)
+            } else {
+              val geom = GeometrySerializer.deserialize(serialized)
+              JoinedGeometryRaster.geometryToWGS84Envelope(geom)
+            }
+            val radius = boundDistance.eval(row).asInstanceOf[Double]
+            // Treat `radius` as meters; mid-latitude rasters get a tight Haversine bound while
+            // polar / antimeridian footprints fall back to a world envelope so the R-tree filter
+            // never excludes pairs the per-row S2 predicate would match. See
+            // `TraitJoinQueryBase.expandRasterFilterEnvelope` for the shared rule.
+            val expanded = expandRasterFilterEnvelope(baseShape, radius)
+            (expanded, row)
+          }
+        })
+      case Some(distanceExpression) =>
+        streamResultsRaw.map(row => {
+          val geometry = TraitJoinQueryBase.shapeToGeometry(boundStreamShape, row)
+          if (geometry == null) {
+            (null, row)
+          } else {
             val radius = BindReferences
               .bindReference(distanceExpression, streamed.output)
               .eval(row)
@@ -351,23 +373,21 @@ case class BroadcastIndexJoinExec(
         })
       case _ =>
         streamResultsRaw.map(row => {
-          val serializedObject = boundStreamShape.eval(row).asInstanceOf[Array[Byte]]
-          if (serializedObject == null) {
-            (null, row)
-          } else {
-            val shape = if (isRasterPredicate) {
-              if (boundStreamShape.dataType.isInstanceOf[RasterUDT]) {
-                val raster = RasterSerializer.deserialize(serializedObject)
-                JoinedGeometryRaster.rasterToWGS84Envelope(raster)
-              } else {
-                val geom = GeometrySerializer.deserialize(serializedObject)
-                JoinedGeometryRaster.geometryToWGS84Envelope(geom)
-              }
+          val shape = if (isRasterPredicate) {
+            // Raster path keeps the legacy bytes-only handling — Box2D doesn't apply here.
+            val serializedObject = boundStreamShape.eval(row).asInstanceOf[Array[Byte]]
+            if (serializedObject == null) null
+            else if (boundStreamShape.dataType.isInstanceOf[RasterUDT]) {
+              val raster = RasterSerializer.deserialize(serializedObject)
+              JoinedGeometryRaster.rasterToWGS84Envelope(raster)
             } else {
-              GeometrySerializer.deserialize(serializedObject)
+              val geom = GeometrySerializer.deserialize(serializedObject)
+              JoinedGeometryRaster.geometryToWGS84Envelope(geom)
             }
-            (shape, row)
+          } else {
+            TraitJoinQueryBase.shapeToGeometry(boundStreamShape, row)
           }
+          (shape, row)
         })
     }
   }

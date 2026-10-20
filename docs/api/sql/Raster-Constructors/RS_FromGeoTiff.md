@@ -21,15 +21,35 @@
 
 Introduction: Returns a raster geometry from a GeoTiff file.
 
+A finite `GDAL_NODATA` tag, or the `nan` value GDAL writes for floating point rasters, becomes the no data value of every band (see [RS_BandNoDataValue](../Raster-Band-Accessors/RS_BandNoDataValue.md)). An infinite `GDAL_NODATA` value (`inf` or `-inf`) cannot be represented as a band no data value and is ignored, so `RS_BandNoDataValue` returns `null` for such files.
+
 Format: `RS_FromGeoTiff(asc: ARRAY[Byte])`
 
 Return type: `Raster`
 
 Since: `v1.4.0`
 
-SQL Example
+Python example
 
-```scala
-var df = sedona.read.format("binaryFile").load("/some/path/*.tiff")
+```python
+from pyspark.sql import functions as f
+
+df = sedona.read.format("binaryFile").load("/some/path/*.tiff")
 df = df.withColumn("raster", f.expr("RS_FromGeoTiff(content)"))
 ```
+
+A single serialized `Raster` value must fit in a Java byte array, which limits its size to roughly 2 GiB, including pixel data and metadata. A compressed GeoTIFF can be much smaller than its decoded raster. The number of pixels that fits depends on the band count, data types, and metadata.
+
+For large GeoTIFFs, use the [raster reader](../../../tutorial/raster.md#tile-size-overrides) with explicit tile dimensions:
+
+```python
+df = (
+    sedona.read.format("raster")
+    .option("retile", "true")
+    .option("tileWidth", "256")
+    .option("tileHeight", "256")
+    .load("/some/path/*.tiff")
+)
+```
+
+If the file bytes are already in a `binaryFile` DataFrame, nest `RS_FromGeoTiff` directly inside [RS_TileExplode](../Raster-Tiles/RS_TileExplode.md) to avoid serializing the whole raster as one value.

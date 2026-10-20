@@ -178,7 +178,7 @@ public class PixelFunctions {
   public static Geometry getPixelAsPoint(GridCoverage2D raster, int colX, int rowY)
       throws TransformException, FactoryException {
     int srid = RasterAccessors.srid(raster);
-    Point2D point2D = RasterUtils.getWorldCornerCoordinatesWithRangeCheck(raster, colX, rowY);
+    Point2D point2D = RasterUtils.getWorldCornerCoordinates(raster, colX, rowY);
     Coordinate pointCoord = new Coordinate(point2D.getX(), point2D.getY());
     if (srid != 0) {
       GeometryFactory factory = new GeometryFactory(new PrecisionModel(), srid);
@@ -240,7 +240,9 @@ public class PixelFunctions {
       int x = xCoordinates[i];
       int y = yCoordinates[i];
 
-      GridCoordinates2D gridCoord = new GridCoordinates2D(x, y);
+      // Pixel coordinates are 1-based (PostGIS semantics), like RS_PixelAsPoint; GeoTools
+      // grid space is 0-based.
+      GridCoordinates2D gridCoord = new GridCoordinates2D(x - 1, y - 1);
 
       try {
         pixelBuffer = rasterGeom.evaluate(gridCoord, pixelBuffer);

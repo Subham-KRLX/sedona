@@ -15,15 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import glob
+import json
 import os
+import sqlite3
 import tempfile
+import warnings
 import pytest
 import shapely
 import pandas as pd
 import geopandas as gpd
+import pyarrow.parquet as pq
 import pyspark.pandas as ps
+import sedona.spark.geopandas as sgpd
 from functools import partial
 from sedona.spark.geopandas import GeoDataFrame, GeoSeries, read_file, read_parquet
+from sedona.spark.geopandas._crs import read_crs_metadata
 from tests import tests_resource
 from tests.geopandas.test_geopandas_base import TestGeopandasBase
 from shapely.geometry import (
@@ -39,6 +46,217 @@ from shapely.geometry import (
 from packaging.version import parse as parse_version
 
 TEST_DATA_DIR = os.path.join("..", "spark", "common", "src", "test", "resources")
+
+
+@pytest.fixture
+def layer_catalog(tmp_path):
+    """An empty vector layer, attributes and tiles, with no readable geometries."""
+    path = tmp_path / "layers.gpkg"
+    with sqlite3.connect(path) as conn:
+        conn.executescript("""
+            CREATE TABLE gpkg_contents (
+                table_name TEXT, data_type TEXT, identifier TEXT, description TEXT,
+                last_change DATETIME DEFAULT '2026-01-01T00:00:00Z',
+                min_x DOUBLE, min_y DOUBLE,
+                max_x DOUBLE, max_y DOUBLE, srs_id INTEGER);
+            CREATE TABLE gpkg_geometry_columns (
+                table_name TEXT, column_name TEXT, geometry_type_name TEXT,
+                srs_id INTEGER, z INTEGER, m INTEGER);
+            CREATE TABLE "empty ' points" (fid INTEGER, geom BLOB);
+            CREATE TABLE notes (text TEXT);
+            CREATE TABLE imagery (tile_data BLOB);
+            CREATE TABLE unregistered (text TEXT);
+            INSERT INTO gpkg_contents (table_name, data_type) VALUES
+                ('notes', 'attributes'), ('imagery', 'tiles'),
+                ('empty '' points', 'features');
+            INSERT INTO gpkg_geometry_columns VALUES
+                ('empty '' points', 'geom', 'POINT', 0, 0, 0);
+            """)
+    return path
+
+
+class TestListLayers(TestGeopandasBase):
+    @pytest.fixture(autouse=True)
+    def initialize_sedona(self):
+        # list_layers uses default_session(), so register Sedona before each test.
+        self.spark
+
+    @pytest.mark.parametrize("z", [0, 1, 2])
+    @pytest.mark.parametrize("m", [0, 1, 2])
+    def test_declared_core_types_and_dimensions(self, layer_catalog, z, m):
+        cases = [
+            ("GEOMETRY", "Unknown", "Unknown"),
+            ("POINT", "Point", "Point Z"),
+            ("LINESTRING", "LineString", "LineString Z"),
+            ("POLYGON", "Polygon", "Polygon Z"),
+            ("MULTIPOINT", "MultiPoint", "MultiPoint Z"),
+            ("MULTILINESTRING", "MultiLineString", "MultiLineString Z"),
+            ("MULTIPOLYGON", "MultiPolygon", "MultiPolygon Z"),
+            ("GEOMETRYCOLLECTION", "GeometryCollection", "GeometryCollection Z"),
+        ]
+        with sqlite3.connect(layer_catalog) as conn:
+            conn.execute("DELETE FROM gpkg_contents")
+            conn.execute("DELETE FROM gpkg_geometry_columns")
+            for declared, _, _ in cases:
+                conn.execute(f'CREATE TABLE "{declared}" (fid INTEGER, geom BLOB)')
+                # Unreadable geometry bytes prove enumeration never decodes features.
+                conn.execute(f"INSERT INTO \"{declared}\" VALUES (1, X'00')")
+                conn.execute(
+                    "INSERT INTO gpkg_contents (table_name, data_type) VALUES (?, 'features')",
+                    (declared,),
+                )
+                conn.execute(
+                    "INSERT INTO gpkg_geometry_columns VALUES (?, 'geom', ?, 0, ?, ?)",
+                    (declared, declared, z, m),
+                )
+        expected = pd.DataFrame(
+            [(name, xy if z == 0 else xyz) for name, xy, xyz in sorted(cases)],
+            columns=["name", "geometry_type"],
+        )
+        pd.testing.assert_frame_equal(sgpd.list_layers(layer_catalog), expected)
+
+    @pytest.mark.parametrize("data_type", ["attributes", "aspatial"])
+    def test_lists_empty_layers_and_attributes_not_tiles(
+        self, layer_catalog, data_type
+    ):
+        with sqlite3.connect(layer_catalog) as conn:
+            conn.execute(
+                "UPDATE gpkg_contents SET data_type = ? WHERE table_name = 'notes'",
+                (data_type,),
+            )
+        expected = pd.DataFrame(
+            {"name": ["empty ' points", "notes"], "geometry_type": ["Point", None]}
+        )
+        pd.testing.assert_frame_equal(sgpd.list_layers(layer_catalog), expected)
+        pd.testing.assert_frame_equal(sgpd.list_layers(str(layer_catalog)), expected)
+
+    def test_geometry_metadata_is_opt_in(self, layer_catalog):
+        reader = self.spark.read.format("geopackage").option("showMetadata", "true")
+        original = reader.load(str(layer_catalog))
+        assert original.columns == [
+            "table_name",
+            "data_type",
+            "identifier",
+            "description",
+            "last_change",
+            "min_x",
+            "min_y",
+            "max_x",
+            "max_y",
+            "srs_id",
+        ]
+        assert original.count() == 3
+        enriched = reader.option("includeGeometryType", "true").load(str(layer_catalog))
+        assert enriched.columns == original.columns + ["geometry_type"]
+        assert enriched.count() == 3
+        assert enriched.schema["geometry_type"].nullable
+        rows = enriched.select(
+            "table_name", "geometry_type", "_metadata.file_name"
+        ).collect()
+        assert {r.table_name: r.geometry_type for r in rows} == {
+            "empty ' points": "Point",
+            "notes": None,
+            "imagery": None,
+        }
+        assert all(r.file_name == "layers.gpkg" for r in rows)
+
+    @pytest.mark.parametrize("data_type", ["attributes", "aspatial", "tiles", None])
+    def test_catalog_without_geometry_columns(self, layer_catalog, data_type):
+        with sqlite3.connect(layer_catalog) as conn:
+            conn.execute("DELETE FROM gpkg_contents")
+            conn.execute("DROP TABLE gpkg_geometry_columns")
+            if data_type:
+                conn.execute(
+                    "INSERT INTO gpkg_contents (table_name, data_type) VALUES ('notes', ?)",
+                    (data_type,),
+                )
+        expected = pd.DataFrame(
+            [("notes", None)] if data_type in ("attributes", "aspatial") else [],
+            columns=["name", "geometry_type"],
+        )
+        pd.testing.assert_frame_equal(sgpd.list_layers(layer_catalog), expected)
+
+    @pytest.mark.parametrize(
+        "change, details",
+        [
+            ("DROP TABLE gpkg_geometry_columns", ("missing gpkg_geometry_columns",)),
+            ("DELETE FROM gpkg_geometry_columns", ("found 0",)),
+            ("UPDATE gpkg_geometry_columns SET z = 3", ("z=3",)),
+            ("UPDATE gpkg_geometry_columns SET m = -1", ("m=-1",)),
+            ("UPDATE gpkg_geometry_columns SET z = NULL", ("z=null",)),
+            (
+                "UPDATE gpkg_geometry_columns SET column_name = NULL",
+                ("column_name=null",),
+            ),
+            (
+                "UPDATE gpkg_geometry_columns SET geometry_type_name = NULL",
+                ("geometry_type_name=null",),
+            ),
+            (
+                "UPDATE gpkg_geometry_columns SET geometry_type_name = 'INVALID'",
+                ("geometry_type_name=INVALID", "column_name=geom", "z=0", "m=0"),
+            ),
+            (
+                "INSERT INTO gpkg_geometry_columns SELECT * FROM gpkg_geometry_columns",
+                ("found 2",),
+            ),
+            (
+                "INSERT INTO gpkg_geometry_columns "
+                "SELECT table_name, column_name, 'POLYGON', srs_id, z, m "
+                "FROM gpkg_geometry_columns",
+                ("found 2",),
+            ),
+            (
+                "INSERT INTO gpkg_geometry_columns "
+                "SELECT table_name, column_name, 'INVALID', srs_id, 3, m "
+                "FROM gpkg_geometry_columns",
+                ("found 2",),
+            ),
+        ],
+    )
+    def test_invalid_feature_metadata_fails(self, layer_catalog, change, details):
+        with sqlite3.connect(layer_catalog) as conn:
+            conn.execute(change)
+        with pytest.raises(
+            Exception, match="Invalid GeoPackage feature metadata"
+        ) as exc:
+            sgpd.list_layers(layer_catalog)
+        for detail in details:
+            assert detail in str(exc.value)
+
+    def test_rejects_multiple_files(self, layer_catalog):
+        import shutil
+
+        shutil.copyfile(layer_catalog, layer_catalog.with_name("second.gpkg"))
+        with pytest.raises(Exception, match="exactly one GeoPackage file"):
+            sgpd.list_layers(str(layer_catalog.parent / "*.gpkg"))
+
+    def test_geometry_type_option_requires_metadata(self, layer_catalog):
+        with pytest.raises(
+            Exception, match="includeGeometryType requires showMetadata"
+        ):
+            self.spark.read.format("geopackage").option("tableName", "notes").option(
+                "includeGeometryType", "true"
+            ).load(str(layer_catalog))
+
+    @pytest.mark.parametrize("filename", [b"file.gpkg", None, 1, ["file.gpkg"]])
+    def test_rejects_non_path_inputs(self, filename):
+        with pytest.raises(TypeError, match="string or path-like"):
+            sgpd.list_layers(filename)
+
+    def test_rejects_other_formats(self):
+        with pytest.raises(ValueError, match="GeoPackage"):
+            sgpd.list_layers("data.geojson")
+
+    def test_missing_file_fails(self, tmp_path):
+        with pytest.raises(Exception, match="PATH_NOT_FOUND|does not exist"):
+            sgpd.list_layers(tmp_path / "missing.gpkg")
+
+    def test_invalid_file_fails(self, tmp_path):
+        path = tmp_path / "invalid.gpkg"
+        path.write_bytes(b"not a SQLite database")
+        with pytest.raises(Exception, match="not a database"):
+            sgpd.list_layers(path)
 
 
 @pytest.mark.skipif(
@@ -132,13 +350,67 @@ class TestIO(TestGeopandasBase):
         table_name = "GB_Hex_5km_GS_CompressibleGround_v8"
         expected_cnt = 4233
         df = read_func(datafile, table_name=table_name)
+        assert df.active_geometry_name == "geom"
         assert df["geom"].count() == expected_cnt
 
         # Ensure inference works
         table_name = "GB_Hex_5km_GS_Landslides_v8"
         expected_cnt = 4228
         df = read_func(datafile, table_name=table_name)
+        assert df.active_geometry_name == "geom"
         assert df["geom"].count() == expected_cnt
+
+    def test_read_file_warns_only_about_unsupported_arguments(self):
+        datafile = os.path.join(TEST_DATA_DIR, "geopackage/features.gpkg")
+        table_name = "GB_Hex_5km_GS_Landslides_v8"
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            read_file(datafile, table_name=table_name)
+        assert not [w for w in caught if "not supported in Sedona" in str(w.message)]
+
+        with pytest.warns(UserWarning, match="not supported in Sedona") as caught:
+            read_file(datafile, table_name=table_name, rows=10)
+        messages = [str(w.message) for w in caught]
+        assert any("rows" in m and "table_name" not in m for m in messages)
+
+    def test_geoseries_from_geopackage_uses_source_geometry_name(self):
+        datafile = os.path.join(TEST_DATA_DIR, "geopackage/features.gpkg")
+
+        result = GeoSeries.from_file(
+            datafile,
+            format="geopackage",
+            table_name="GB_Hex_5km_GS_CompressibleGround_v8",
+        )
+
+        assert result.name == "geom"
+        assert result.count() == 4233
+
+    def test_file_constructors_do_not_eagerly_infer_unknown_crs(self, monkeypatch):
+        source = GeoDataFrame(
+            self.spark.range(1).selectExpr(
+                "ST_SetSRID(ST_Point(0D, 0D), 4326) AS geometry"
+            )
+        )
+        assert read_crs_metadata(source.geometry._internal.data_fields[0])[0] is False
+        monkeypatch.setattr(sgpd.io, "read_file", lambda *args, **kwargs: source)
+
+        constructors = (GeoDataFrame.from_file, GeoSeries.from_file)
+        for position, constructor in enumerate(constructors):
+            job_group = (
+                "test_file_constructors_do_not_eagerly_infer_unknown_crs_" f"{position}"
+            )
+            self.sc.setJobGroup(job_group, "file constructor CRS handling")
+            try:
+                result = constructor("unused.parquet", format="geoparquet")
+                job_ids = self.sc.statusTracker().getJobIdsForGroup(job_group)
+            finally:
+                self.sc.setJobGroup(None, None)
+
+            assert len(job_ids) == 0
+            geometry = result.geometry if isinstance(result, GeoDataFrame) else result
+            assert read_crs_metadata(geometry._internal.data_fields[0])[0] is False
+            assert geometry.crs.to_epsg() == 4326
 
     #########################################################
     # File writing tests
@@ -171,6 +443,94 @@ class TestIO(TestGeopandasBase):
         # Ensure reading from geopandas creates the same resulting GeoDataFrame
         gpd_df = gpd.read_parquet(temp_file_path)
         self.check_sgpd_df_equals_gpd_df(sgpd_df, gpd_df)
+
+    def test_to_feather(self):
+        sgpd_df = GeoDataFrame(
+            {"geometry": [Point(0, 0), LineString([(0, 0), (1, 1)])], "int": [1, 2]}
+        )
+
+        temp_file_path = self._get_next_temp_file_path("feather")
+        sgpd_df.to_feather(temp_file_path)
+
+        # Ensure reading from geopandas creates the same resulting GeoDataFrame
+        gpd_df = gpd.read_feather(temp_file_path)
+        self.check_sgpd_df_equals_gpd_df(sgpd_df, gpd_df)
+
+        # Ensure the file round-trips back through sedona's own GeoDataFrame constructor
+        sgpd_result = GeoDataFrame(gpd.read_feather(temp_file_path))
+        self.check_sgpd_df_equals_gpd_df(sgpd_result, gpd_df)
+
+    def test_to_feather_compression_kwarg(self):
+        sgpd_df = GeoDataFrame({"geometry": [Point(0, 0), Point(1, 1)], "int": [1, 2]})
+
+        temp_file_path = self._get_next_temp_file_path("feather")
+        sgpd_df.to_feather(temp_file_path, compression="uncompressed")
+
+        gpd_df = gpd.read_feather(temp_file_path)
+        self.check_sgpd_df_equals_gpd_df(sgpd_df, gpd_df)
+
+    @pytest.mark.parametrize("index", [True, False])
+    def test_to_feather_index(self, index):
+        sgpd_df = GeoDataFrame(
+            {"geometry": [Point(0, 0), LineString([(0, 0), (1, 1)])], "int": [1, 2]},
+            index=["a", "b"],
+        )
+        temp_file_path = self._get_next_temp_file_path("feather")
+        sgpd_df.to_feather(temp_file_path, index=index)
+
+        gpd_df = gpd.read_feather(temp_file_path)
+        if index:
+            self.check_sgpd_df_equals_gpd_df(sgpd_df, gpd_df)
+        else:
+            self.check_index_equal(gpd_df, pd.RangeIndex(start=0, stop=2, step=1))
+
+    def test_to_parquet_writes_crs_of_spark_backed_frame(self):
+        # The CRS is assigned on the frame while the geometries themselves carry SRID 0
+        spark_df = self.spark.sql(
+            "SELECT id, ST_Point(CAST(id AS DOUBLE), 1.0) AS geometry FROM range(4)"
+        )
+        sgpd_df = GeoDataFrame(spark_df, geometry="geometry", crs="EPSG:4326")
+
+        temp_file_path = self._get_next_temp_file_path("parquet")
+        sgpd_df.to_parquet(temp_file_path)
+
+        assert gpd.read_parquet(temp_file_path).crs == "EPSG:4326"
+
+    def test_to_parquet_keeps_each_geometry_column_crs(self):
+        # The active column's CRS comes from frame metadata, the second column's from its SRID
+        spark_df = self.spark.sql(
+            "SELECT ST_Point(1.0, 2.0) AS geometry, "
+            "ST_SetSRID(ST_Point(100000.0, 200000.0), 3857) AS projected FROM range(1)"
+        )
+        sgpd_df = GeoDataFrame(spark_df, geometry="geometry", crs="EPSG:4326")
+
+        temp_file_path = self._get_next_temp_file_path("parquet")
+        sgpd_df.to_parquet(temp_file_path)
+
+        # Spark also writes empty part files, and those hold no geometry to derive a CRS
+        # from, so the column metadata is read from the part that has the rows.
+        written = [
+            json.loads(pq.read_metadata(part).metadata[b"geo"])["columns"]
+            for part in sorted(glob.glob(os.path.join(temp_file_path, "*.parquet")))
+            if pq.read_metadata(part).num_rows
+        ]
+        assert len(written) == 1
+        columns = written[0]
+        assert columns["geometry"]["crs"]["id"] == {"authority": "EPSG", "code": 4326}
+        assert columns["projected"]["crs"]["id"] == {"authority": "EPSG", "code": 3857}
+
+    def test_to_parquet_keeps_crs_after_rename_geometry(self):
+        spark_df = self.spark.sql(
+            "SELECT id, ST_Point(CAST(id AS DOUBLE), 1.0) AS geometry FROM range(4)"
+        )
+        sgpd_df = GeoDataFrame(
+            spark_df, geometry="geometry", crs="EPSG:4326"
+        ).rename_geometry("shape")
+
+        temp_file_path = self._get_next_temp_file_path("parquet")
+        sgpd_df.to_parquet(temp_file_path)
+
+        assert gpd.read_parquet(temp_file_path).crs == "EPSG:4326"
 
     @pytest.mark.parametrize(
         "write_func",

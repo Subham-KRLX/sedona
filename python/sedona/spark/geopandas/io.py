@@ -18,6 +18,7 @@
 import os
 from typing import Union
 import warnings
+import pandas as pd
 import pyspark.pandas as ps
 from sedona.spark.geopandas import GeoDataFrame
 from pyspark.pandas.utils import default_session, scol_for
@@ -25,6 +26,72 @@ from pyspark.pandas.internal import SPARK_DEFAULT_INDEX_NAME, NATURAL_ORDER_COLU
 from pyspark.pandas.frame import InternalFrame
 from pyspark.pandas.utils import validate_mode, log_advice
 from pandas.api.types import is_integer_dtype
+from sedona.spark.sql.types import GeometryType
+
+
+def list_layers(filename: Union[str, os.PathLike]) -> pd.DataFrame:
+    """
+    List vector layers and nonspatial tables in a GeoPackage.
+
+    .. versionadded:: 2.0.0
+
+    Parameters
+    ----------
+    filename : str or path-like
+        Path to one GeoPackage (``.gpkg``) file, including Hadoop-supported
+        paths such as ``s3a://bucket/data.gpkg``. Bytes and file-like objects
+        are not supported. A glob must resolve to exactly one file.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns ``name`` and ``geometry_type``, sorted by name. Registered
+        nonspatial tables, including legacy ``aspatial`` tables, have ``None``
+        as their geometry type. Raster tile tables are excluded.
+
+    Notes
+    -----
+    Unlike GeoPandas, this currently supports GeoPackage only. It uses
+    Sedona's Spark reader, not Pyogrio. Only layer metadata is collected to
+    the driver; no feature geometries are read. The reader copies remote
+    GeoPackages in full to executor-local temporary storage, so remote
+    I/O and temporary disk space scale with the file size.
+
+    Types describe declared metadata, including empty layers. Concrete
+    types permitting Z use a `` Z`` suffix; M is not represented, matching
+    GeoPandas with Pyogrio.
+    Generic geometry layers report ``Unknown``. Only core GeoPackage
+    geometry types are supported.
+
+    Examples
+    --------
+    >>> layers = list_layers("city.gpkg")
+    >>> layers.columns.tolist()
+    ['name', 'geometry_type']
+    """
+    if not isinstance(filename, (str, os.PathLike)):
+        raise TypeError("filename must be a string or path-like object")
+    filename = os.fspath(filename)
+    if not isinstance(filename, str):
+        raise TypeError(
+            "filename must be a string or path-like object returning a string"
+        )
+    if not filename.lower().endswith(".gpkg"):
+        raise ValueError("list_layers currently supports GeoPackage (.gpkg) files only")
+
+    metadata = (
+        default_session()
+        .read.format("geopackage")
+        .option("showMetadata", "true")
+        .option("includeGeometryType", "true")
+        .load(filename)
+    )
+    layers = (
+        metadata.where("data_type IN ('features', 'attributes', 'aspatial')")
+        .selectExpr("table_name AS name", "geometry_type")
+        .toPandas()
+    )
+    return layers.sort_values("name").reset_index(drop=True)
 
 
 def _to_file(
@@ -116,7 +183,11 @@ def _to_file(
 
         crs = CRS.from_user_input(crs)
 
-    spark_df = df._internal.spark_frame.drop(NATURAL_ORDER_COLUMN_NAME)
+    # The frame is resolved once so that the columns written and the column names used
+    # for the options below are the same: renames live in the internal fields and only
+    # reach the Spark frame when it is resolved.
+    internal = df._internal.resolved_copy
+    spark_df = internal.spark_frame.drop(NATURAL_ORDER_COLUMN_NAME)
 
     if index is None:
         # Determine if index attribute(s) should be saved to file
@@ -132,6 +203,24 @@ def _to_file(
 
     if spark_fmt == "geoparquet":
         writer = spark_df.write.format("geoparquet")
+
+        # A CRS assigned on a frame lives in column metadata, not necessarily in the
+        # geometry SRIDs the writer derives CRS from, so pass it through explicitly.
+        # geoparquet.crs would apply to every geometry column, so each column gets its
+        # own option and anything the caller set is left alone.
+        if "geoparquet.crs" not in kwargs:
+            from sedona.spark.geopandas._crs import read_crs_metadata
+
+            for column_name, field in zip(
+                internal.data_spark_column_names, internal.data_fields
+            ):
+                option = f"geoparquet.crs.{column_name}"
+                if option in kwargs or not isinstance(field.spark_type, GeometryType):
+                    continue
+
+                has_crs_metadata, column_crs = read_crs_metadata(field)
+                if has_crs_metadata and column_crs is not None:
+                    writer = writer.option(option, column_crs.to_json())
 
     elif spark_fmt == "geojson":
         writer = spark_df.write.format("geojson")
@@ -163,14 +252,21 @@ def read_file(filename: str, format: Union[str, None] = None, **kwargs):
             - "geojson"
             - "geopackage"
             - "geoparquet"
+    **kwargs
+        Reader options. Only ``table_name`` is used: the name of the table to
+        read, required when ``format`` is "geopackage". Sedona warns about any
+        other keyword argument, since other GeoPandas reader options are not
+        supported.
+
     See also
     --------
     GeoDataFrame.to_file : write GeoDataFrame to file
     """
 
     # We warn the user if they try to use arguments that GeoPandas supports but not Sedona.
-    if kwargs:
-        warnings.warn(f"The given arguments are not supported in Sedona: {kwargs}")
+    unsupported = {k: v for k, v in kwargs.items() if k != "table_name"}
+    if unsupported:
+        warnings.warn(f"The given arguments are not supported in Sedona: {unsupported}")
 
     spark = default_session()
 
@@ -231,7 +327,25 @@ def read_file(filename: str, format: Union[str, None] = None, **kwargs):
         index_spark_columns = [scol_for(sdf, SPARK_DEFAULT_INDEX_NAME)]
 
     internal = InternalFrame(spark_frame=sdf, index_spark_columns=index_spark_columns)
-    return GeoDataFrame(ps.DataFrame(internal))
+    result = GeoDataFrame(ps.DataFrame(internal))
+
+    # Most readers use "geometry", but formats such as GeoPackage retain the
+    # source geometry column name (for example, "geom"). Selecting the sole
+    # GeometryType makes single-geometry file constructors usable without
+    # inspecting rows or triggering CRS inference. Prefer the conventional
+    # name when present; an ambiguous multi-geometry source needs reader-level
+    # primary-column metadata before one can be selected safely.
+    geometry_columns = [
+        field.name
+        for field in sdf.schema.fields
+        if isinstance(field.dataType, GeometryType)
+    ]
+    if "geometry" in geometry_columns:
+        result._geometry_column_name = "geometry"
+    elif len(geometry_columns) == 1:
+        result._geometry_column_name = geometry_columns[0]
+
+    return result
 
 
 def read_parquet(
@@ -254,6 +368,7 @@ def read_parquet(
     Parameters
     ----------
     path : str, path object
+        Path to a GeoParquet file or a directory of GeoParquet files.
     columns : list-like of strings, default=None
         Not currently supported in Sedona
     storage_options : dict, optional
@@ -262,6 +377,9 @@ def read_parquet(
         Not currently supported in Sedona
     to_pandas_kwargs : dict, optional
         Not currently supported in Sedona
+    **kwargs
+        Not currently supported in Sedona. Any keyword argument is ignored with
+        a warning.
 
     Returns
     -------
@@ -269,16 +387,10 @@ def read_parquet(
 
     Examples
     --------
-    from sedona.spark.geopandas import read_parquet
+    >>> from sedona.spark.geopandas import read_parquet
     >>> df = read_parquet("data.parquet")  # doctest: +SKIP
-
-    Specifying columns to read:
-
-    >>> df = read_parquet(
-    ...     "data.parquet",
-    ... )  # doctest: +SKIP
     """
     if kwargs:
         warnings.warn(f"The given arguments are not supported in Sedona: {kwargs}")
 
-    return read_file(path, format="geoparquet", **kwargs)
+    return read_file(path, format="geoparquet")

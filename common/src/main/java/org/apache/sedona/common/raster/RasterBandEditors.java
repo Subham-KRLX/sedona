@@ -38,22 +38,25 @@ import org.locationtech.jts.geom.Geometry;
 
 public class RasterBandEditors {
   /**
-   * Adds no-data value to the raster.
+   * Adds no-data value to the raster. Only the band's metadata changes; pixel values are left as
+   * they are. Use {@link #replaceBandNoDataValue} to carry the existing no-data pixels over to the
+   * new value.
    *
    * @param raster Source raster to add no-data value
    * @param bandIndex Band index to add no-data value
    * @param noDataValue Value to set as no-data value, if null then remove existing no-data value
-   * @param replace if true replaces the previous no-data value with the specified no-data value
    * @return Raster with no-data value
    */
   public static GridCoverage2D setBandNoDataValue(
-      GridCoverage2D raster, int bandIndex, Double noDataValue, boolean replace) {
+      GridCoverage2D raster, int bandIndex, Double noDataValue) {
     RasterUtils.ensureBand(raster, bandIndex);
     Double rasterNoData = RasterBandAccessors.getBandNoDataValue(raster, bandIndex);
 
     // Remove no-Data if it is null
     if (noDataValue == null) {
-      if (RasterBandAccessors.getBandNoDataValue(raster) == null) {
+      // Consult the target band, not band 1: otherwise clearing band N is a no-op
+      // whenever band 1 happens to have no no-data value.
+      if (rasterNoData == null) {
         return raster;
       }
       GridSampleDimension[] sampleDimensions = raster.getSampleDimensions();
@@ -69,45 +72,55 @@ public class RasterBandEditors {
     GridSampleDimension[] bands = raster.getSampleDimensions();
     bands[bandIndex - 1] =
         RasterUtils.createSampleDimensionWithNoDataValue(bands[bandIndex - 1], noDataValue);
-
-    if (replace) {
-      if (rasterNoData == null) {
-        throw new IllegalArgumentException(
-            "The raster provided doesn't have a no-data value. Please provide a raster that has a no-data value to use `replace` option.");
-      }
-
-      Raster rasterData = RasterUtils.getRaster(raster.getRenderedImage());
-      int dataTypeCode = rasterData.getDataBuffer().getDataType();
-      int numBands = RasterAccessors.numBands(raster);
-      int height = RasterAccessors.getHeight(raster);
-      int width = RasterAccessors.getWidth(raster);
-      WritableRaster wr =
-          RasterFactory.createBandedRaster(dataTypeCode, width, height, numBands, null);
-      double[] bandData =
-          rasterData.getSamples(0, 0, width, height, bandIndex - 1, (double[]) null);
-      for (int i = 0; i < bandData.length; i++) {
-        if (bandData[i] == rasterNoData) {
-          bandData[i] = noDataValue;
-        }
-      }
-      wr.setSamples(0, 0, width, height, bandIndex - 1, bandData);
-      return RasterUtils.clone(wr, null, bands, raster, null, true);
-    }
-
     return RasterUtils.clone(raster.getRenderedImage(), null, bands, raster, null, true);
   }
 
   /**
-   * Adds no-data value to the raster.
+   * Moves a band's no-data value to {@code noDataValue}, rewriting every pixel that holds the
+   * current no-data value to the new one first. Pixels already equal to the new value also become
+   * no-data. To preserve the same no-data mask, choose a value exactly representable in the band's
+   * pixel type and absent from valid pixels. A pixel holds the current no-data value by {@link
+   * RasterUtils#isNoData}: compared numerically, with any NaN matching a NaN no-data value.
    *
-   * @param raster Source raster to add no-data value
-   * @param bandIndex Band index to add no-data value
-   * @param noDataValue Value to set as no-data value, if null then remove existing no-data value
-   * @return Raster with no-data value
+   * @param raster Source raster
+   * @param bandIndex Band whose no-data value is replaced (1-based)
+   * @param noDataValue The new no-data value
+   * @return Raster with the band's no-data pixels and no-data value moved to {@code noDataValue}
+   * @throws IllegalArgumentException if the band has no no-data value to replace
    */
-  public static GridCoverage2D setBandNoDataValue(
-      GridCoverage2D raster, int bandIndex, Double noDataValue) {
-    return setBandNoDataValue(raster, bandIndex, noDataValue, false);
+  public static GridCoverage2D replaceBandNoDataValue(
+      GridCoverage2D raster, int bandIndex, double noDataValue) {
+    RasterUtils.ensureBand(raster, bandIndex);
+    Double rasterNoData = RasterBandAccessors.getBandNoDataValue(raster, bandIndex);
+    if (rasterNoData == null) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Band %d has no no-data value to replace; set one with RS_SetBandNoDataValue first",
+              bandIndex));
+    }
+    if (rasterNoData.equals(noDataValue)) {
+      return raster;
+    }
+    GridSampleDimension[] bands = raster.getSampleDimensions();
+    bands[bandIndex - 1] =
+        RasterUtils.createSampleDimensionWithNoDataValue(bands[bandIndex - 1], noDataValue);
+
+    Raster rasterData = RasterUtils.getRaster(raster.getRenderedImage());
+    int dataTypeCode = rasterData.getDataBuffer().getDataType();
+    int numBands = RasterAccessors.numBands(raster);
+    int height = RasterAccessors.getHeight(raster);
+    int width = RasterAccessors.getWidth(raster);
+    WritableRaster wr =
+        RasterFactory.createBandedRaster(dataTypeCode, width, height, numBands, null);
+    wr.setRect(rasterData);
+    double[] bandData = rasterData.getSamples(0, 0, width, height, bandIndex - 1, (double[]) null);
+    for (int i = 0; i < bandData.length; i++) {
+      if (RasterUtils.isNoData(bandData[i], rasterNoData)) {
+        bandData[i] = noDataValue;
+      }
+    }
+    wr.setSamples(0, 0, width, height, bandIndex - 1, bandData);
+    return RasterUtils.clone(wr, null, bands, raster, null, true);
   }
 
   /**
@@ -118,7 +131,7 @@ public class RasterBandEditors {
    * @return Raster with no-data value
    */
   public static GridCoverage2D setBandNoDataValue(GridCoverage2D raster, Double noDataValue) {
-    return setBandNoDataValue(raster, 1, noDataValue, false);
+    return setBandNoDataValue(raster, 1, noDataValue);
   }
 
   /**
@@ -365,9 +378,30 @@ public class RasterBandEditors {
       writableRaster.setSamples(0, 0, rasterWidth, rasterHeight, 0, array);
     }
 
-    // rasterize the geometry to iterate over the clipped raster
+    // rasterize the geometry to iterate over the clipped raster. The mask is read as a
+    // 0-background mask below (a pixel value of 0 marks "outside the geometry"), so pass an
+    // explicit null noDataValue to keep that zero background. The noDataValue-less overloads would
+    // instead inherit the reference band's nodata value and fill the background with it, which the
+    // mask logic would then misread as covered pixels.
     GridCoverage2D maskRaster =
-        RasterConstructors.asRaster(geometry, raster, bandType, allTouched, 150);
+        RasterConstructors.asRaster(geometry, raster, bandType, allTouched, 150, null);
+    if (maskRaster == null) {
+      // The geometry only touches the raster's boundary and burns none of its pixels, so every
+      // pixel is outside it: the clipped raster is all nodata, and there is nothing to crop it to.
+      if (crop) {
+        if (lenient) {
+          return null;
+        }
+        throw new IllegalArgumentException("Geometry does not cover any pixel of the raster.");
+      }
+      return RasterUtils.clone(
+          writableRaster,
+          raster.getGridGeometry(),
+          new GridSampleDimension[] {raster.getSampleDimension(band - 1)},
+          raster,
+          noDataValue,
+          true);
+    }
     Raster maskData = RasterUtils.getRaster(maskRaster.getRenderedImage());
     double[] maskMetadata = RasterAccessors.metadata(maskRaster);
     int maskWidth = (int) maskMetadata[2], maskHeight = (int) maskMetadata[3];

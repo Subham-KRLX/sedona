@@ -39,13 +39,22 @@ specifying `bandIndices` as `ARRAY(bandIndex)`.Band indices are 1-based.
 
 If `padWithNoData` = false, edge tiles on the right and bottom sides of the raster may have different dimensions than the rest of
 the tiles. If `padWithNoData` = true, all tiles will have the same dimensions with the possibility that edge tiles being padded with
-NODATA values. If raster band(s) do not have NODATA value(s) specified, one can be specified by setting `noDataVal`.
+NODATA values. If raster band(s) do not have NODATA value(s) specified, one can be specified by setting `noDataVal`. A `NaN` `noDataVal` pads floating point bands with `NaN` and declares `NaN` as the NODATA value of the padded tiles.
 
 The returned records have the following schema:
 
 - `x`: The index of the tile along X axis (0-based).
 - `y`: The index of the tile along Y axis (0-based).
 - `tile`: The tile.
+
+For large GeoTIFFs in a `binaryFile` DataFrame, nest `RS_FromGeoTiff` directly inside `RS_TileExplode`:
+
+```sql
+SELECT RS_TileExplode(RS_FromGeoTiff(content), 256, 256)
+FROM binary_rasters
+```
+
+Here, `binary_rasters` is a view of the `binaryFile` DataFrame. `RS_TileExplode` accepts a `Raster`, so raw TIFF bytes such as `content` must first pass through `RS_FromGeoTiff`. Nesting the calls avoids serializing the whole raster as one value. Materializing the whole raster first, for example by caching or writing it, can exceed the [single raster size limit](../Raster-Constructors/RS_FromGeoTiff.md) before tiling runs. Each resulting tile must also fit within that limit.
 
 SQL example:
 

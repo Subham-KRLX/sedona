@@ -21,6 +21,7 @@ import struct
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+import shapely
 from shapely.geometry import (
     GeometryCollection,
     LinearRing,
@@ -33,7 +34,13 @@ from shapely.geometry import (
 )
 from shapely.geometry.base import BaseGeometry
 from shapely.wkb import dumps as wkb_dumps
+from shapely.wkb import loads as wkb_loads
 from shapely.wkt import loads as wkt_loads
+
+try:
+    from shapely import geos_version
+except ImportError:
+    from shapely.geos import geos_version
 
 CoordType = Union[
     Tuple[float, float], Tuple[float, float, float], Tuple[float, float, float, float]
@@ -83,6 +90,19 @@ class CoordinateType:
             return CoordinateType.XYZ
         else:
             raise ValueError(f"Invalid coordinate dimension: {geom._ndim}")
+
+    @staticmethod
+    def type_of_empty(geom) -> int:
+        # GEOS < 3.9 cannot write empty Points as WKB. Keep the fallback's
+        # existing XY encoding on those versions without calling the writer.
+        if isinstance(geom, Point) and geos_version < (3, 9, 0):
+            return CoordinateType.XY
+        # Shapely 1.x reports _ndim == 2 even for explicit XYZ empty geometries.
+        # Their WKB still records Z, so read its type flag instead.
+        wkb = wkb_dumps(geom)
+        byte_order = "<I" if wkb[0] else ">I"
+        geometry_type = struct.unpack_from(byte_order, wkb, 1)[0]
+        return CoordinateType.XYZ if geometry_type & 0x80000000 else CoordinateType.XY
 
     @staticmethod
     def bytes_per_coord(coord_type: int) -> int:
@@ -162,6 +182,12 @@ class GeometryBuffer:
         self.coords_offset += self.bytes_per_coord
         return coord
 
+    def read_empty(self, geometry_type: str) -> BaseGeometry:
+        # Constructors such as Point() create empty GeometryCollections in
+        # Shapely 1.x. WKT preserves both the primitive type and its dimension.
+        dimension = " Z" if self.coord_type == CoordinateType.XYZ else ""
+        return wkt_loads(f"{geometry_type}{dimension} EMPTY")
+
     def read_int(self) -> int:
         value = struct.unpack_from("i", self.buffer, self.ints_offset)[0]
         if value > len(self.buffer):
@@ -182,6 +208,17 @@ def serialize(geom: BaseGeometry) -> Optional[Union[bytes, bytearray]]:
     """
     if geom is None:
         return None
+
+    # Shapely 2.1 exposes ``has_m`` even when linked against GEOS < 3.12,
+    # but evaluating that property then raises for every geometry. Avoid the
+    # property entirely when the linked GEOS cannot represent measures.
+    if getattr(shapely, "geos_version", (0, 0, 0)) >= (3, 12, 0) and getattr(
+        geom, "has_m", False
+    ):
+        raise ValueError(
+            "Serializing M or ZM geometries requires geomserde_speedup "
+            "with GEOS 3.12 or newer"
+        )
 
     if isinstance(geom, Point):
         return serialize_point(geom)
@@ -214,6 +251,11 @@ def deserialize(buffer: bytes) -> Optional[BaseGeometry]:
     preamble_byte = buffer[0]
     geom_type = (preamble_byte >> 4) & 0x0F
     coord_type = (preamble_byte >> 1) & 0x07
+    if coord_type in (CoordinateType.XYM, CoordinateType.XYZM):
+        raise ValueError(
+            "Deserializing M or ZM geometries requires geomserde_speedup "
+            "with GEOS 3.12 or newer"
+        )
     num_coords = struct.unpack_from("i", buffer, 4)[0]
     if num_coords > len(buffer):
         raise ValueError("num_coords cannot be larger than buffer size")
@@ -310,15 +352,14 @@ def serialize_point(geom: Point) -> bytes:
         coords = coords[0]
         return struct.pack(pack_format, preamble_byte, 0, 0, 0, 1, *coords)
     else:
-        return struct.pack("BBBBi", 18, 0, 0, 0, 0)
+        return generate_header_bytes(
+            GeometryTypeID.POINT, CoordinateType.type_of_empty(geom), 0
+        )
 
 
 def deserialize_point(geom_buffer: GeometryBuffer) -> Point:
     if geom_buffer.num_coords == 0:
-        # Here we don't call Point() directly since it would create an empty GeometryCollection
-        # in shapely 1.x. You'll find similar code for creating empty geometries in other
-        # deserialization functions.
-        return wkt_loads("POINT EMPTY")
+        return geom_buffer.read_empty("POINT")
     coord = geom_buffer.read_coordinate()
     return Point(coord)
 
@@ -349,13 +390,18 @@ def deserialize_multi_point(geom_buffer: GeometryBuffer) -> MultiPoint:
     if geom_buffer.num_coords == 0:
         return wkt_loads("MULTIPOINT EMPTY")
     coords = geom_buffer.read_coordinates(geom_buffer.num_coords)
-    points = []
-    for coord in coords:
-        if math.isnan(coord[0]):
-            # Shapely does not allow creating MultiPoint with empty components
-            pass
-        else:
-            points.append(Point(coord))
+    points = [
+        (
+            geom_buffer.read_empty("POINT")
+            if math.isnan(coord[0]) and math.isnan(coord[1])
+            else Point(coord)
+        )
+        for coord in coords
+    ]
+    if any(point.is_empty for point in points):
+        return _multipart_with_empty_members(
+            GeometryTypeID.MULTIPOINT, geom_buffer.coord_type, points
+        )
     return MultiPoint(points)
 
 
@@ -368,12 +414,14 @@ def serialize_linestring(geom: LineString) -> bytes:
         )
         return header + array.array("d", [x for c in coords for x in c]).tobytes()
     else:
-        return generate_header_bytes(GeometryTypeID.LINESTRING, 1, 0)
+        return generate_header_bytes(
+            GeometryTypeID.LINESTRING, CoordinateType.type_of_empty(geom), 0
+        )
 
 
 def deserialize_linestring(geom_buffer: GeometryBuffer) -> LineString:
     if geom_buffer.num_coords == 0:
-        return wkt_loads("LINESTRING EMPTY")
+        return geom_buffer.read_empty("LINESTRING")
     coords = geom_buffer.read_coordinates(geom_buffer.num_coords)
     return LineString(coords)
 
@@ -402,13 +450,13 @@ def serialize_multi_linestring(geom: MultiLineString) -> bytes:
 
 def deserialize_multi_linestring(geom_buffer: GeometryBuffer) -> MultiLineString:
     num_linestrings = geom_buffer.read_int()
-    linestrings = []
-    for k in range(0, num_linestrings):
-        linestring = geom_buffer.read_linestring()
-        if not linestring.is_empty:
-            linestrings.append(linestring)
+    linestrings = [geom_buffer.read_linestring() for _ in range(num_linestrings)]
     if not linestrings:
         return wkt_loads("MULTILINESTRING EMPTY")
+    if any(linestring.is_empty for linestring in linestrings):
+        return _multipart_with_empty_members(
+            GeometryTypeID.MULTILINESTRING, geom_buffer.coord_type, linestrings
+        )
     return MultiLineString(linestrings)
 
 
@@ -420,7 +468,9 @@ def serialize_polygon(geom: Polygon) -> bytes:
     num_rings = struct.unpack_from(int_format, wkb_string, 5)[0]
 
     if num_rings == 0:
-        return generate_header_bytes(GeometryTypeID.POLYGON, CoordinateType.XY, 0)
+        return generate_header_bytes(
+            GeometryTypeID.POLYGON, CoordinateType.type_of_empty(geom), 0
+        )
 
     coord_bytes = b""
     ring_lengths = []
@@ -447,7 +497,7 @@ def serialize_polygon(geom: Polygon) -> bytes:
 
 def deserialize_polygon(geom_buffer: GeometryBuffer) -> Polygon:
     if geom_buffer.num_coords == 0:
-        return wkt_loads("POLYGON EMPTY")
+        return geom_buffer.read_empty("POLYGON")
     return geom_buffer.read_polygon()
 
 
@@ -491,14 +541,36 @@ def serialize_multi_polygon(geom: MultiPolygon) -> bytes:
 
 def deserialize_multi_polygon(geom_buffer: GeometryBuffer) -> MultiPolygon:
     num_polygons = geom_buffer.read_int()
-    polygons = []
-    for k in range(0, num_polygons):
-        polygon = geom_buffer.read_polygon()
-        if not polygon.is_empty:
-            polygons.append(polygon)
+    polygons = [geom_buffer.read_polygon() for _ in range(num_polygons)]
     if not polygons:
-        return wkt_loads("MULTIPOLYGON EMPTY")
-    return MultiPolygon(polygons)
+        return geom_buffer.read_empty("MULTIPOLYGON")
+    if not any(polygon.is_empty for polygon in polygons):
+        return MultiPolygon(polygons)
+
+    return _multipart_with_empty_members(
+        GeometryTypeID.MULTIPOLYGON, geom_buffer.coord_type, polygons
+    )
+
+
+def _multipart_with_empty_members(geometry_type, coord_type, members):
+    # Multipart constructors reject or discard empty members. WKB retains their
+    # positions, using the shared coordinate layout from the internal format.
+    z_flag = 0x80000000 if coord_type == CoordinateType.XYZ else 0
+    header = struct.pack("<BII", 1, geometry_type | z_flag, len(members))
+    # OGC multipart type IDs are three greater than their member type IDs.
+    empty_member = struct.pack("<BI", 1, (geometry_type - 3) | z_flag)
+    if geometry_type == GeometryTypeID.MULTIPOINT:
+        # Older GEOS versions cannot write empty Points as WKB.
+        dimension = CoordinateType.components_per_coord(coord_type)
+        empty_member += struct.pack("<" + "d" * dimension, *([math.nan] * dimension))
+    else:
+        empty_member += struct.pack("<I", 0)
+    return wkb_loads(
+        header
+        + b"".join(
+            empty_member if member.is_empty else wkb_dumps(member) for member in members
+        )
+    )
 
 
 def serialize_geometry_collection(geom: GeometryCollection) -> bytearray:

@@ -208,6 +208,9 @@ object st_functions {
   def ST_Box2D(geometry: Column): Column = wrapExpression[ST_Box2D](geometry)
   def ST_Box2D(geometry: String): Column = wrapExpression[ST_Box2D](geometry)
 
+  def ST_Box3D(geometry: Column): Column = wrapExpression[ST_Box3D](geometry)
+  def ST_Box3D(geometry: String): Column = wrapExpression[ST_Box3D](geometry)
+
   def ST_Envelope(geometry: Column): Column = wrapExpression[ST_Envelope](geometry)
   def ST_Envelope(geometry: String): Column = wrapExpression[ST_Envelope](geometry)
 
@@ -241,7 +244,9 @@ object st_functions {
   def ST_FlipCoordinates(geometry: Column): Column = wrapExpression[ST_FlipCoordinates](geometry)
   def ST_FlipCoordinates(geometry: String): Column = wrapExpression[ST_FlipCoordinates](geometry)
 
+  @deprecated("Use ST_Force2D instead", "2.0.0")
   def ST_Force_2D(geometry: Column): Column = wrapExpression[ST_Force_2D](geometry)
+  @deprecated("Use ST_Force2D instead", "2.0.0")
   def ST_Force_2D(geometry: String): Column = wrapExpression[ST_Force_2D](geometry)
 
   def ST_Force2D(geometry: Column): Column = wrapExpression[ST_Force2D](geometry)
@@ -296,6 +301,64 @@ object st_functions {
   def ST_H3ToGeom(cellIds: Column): Column = wrapExpression[ST_H3ToGeom](cellIds)
 
   def ST_H3ToGeom(cellIds: Array[Long]): Column = wrapExpression[ST_H3ToGeom](cellIds)
+
+  def ST_H3ToParent(cell: Column, resolution: Column): Column =
+    wrapExpression[ST_H3ToParent](cell, resolution)
+
+  def ST_H3ToParent(cell: Column, resolution: Integer): Column =
+    wrapExpression[ST_H3ToParent](cell, resolution)
+
+  def ST_H3ToParent(cell: Long, resolution: Integer): Column =
+    wrapExpression[ST_H3ToParent](cell, resolution)
+
+  def ST_H3ToChildren(cell: Column, resolution: Column): Column =
+    wrapExpression[ST_H3ToChildren](cell, resolution)
+
+  def ST_H3ToChildren(cell: Column, resolution: Integer): Column =
+    wrapExpression[ST_H3ToChildren](cell, resolution)
+
+  def ST_H3ToChildren(cell: Long, resolution: Integer): Column =
+    wrapExpression[ST_H3ToChildren](cell, resolution)
+
+  def ST_H3ToCenterChild(cell: Column, resolution: Column): Column =
+    wrapExpression[ST_H3ToCenterChild](cell, resolution)
+
+  def ST_H3ToCenterChild(cell: Column, resolution: Integer): Column =
+    wrapExpression[ST_H3ToCenterChild](cell, resolution)
+
+  def ST_H3ToCenterChild(cell: Long, resolution: Integer): Column =
+    wrapExpression[ST_H3ToCenterChild](cell, resolution)
+
+  def ST_H3Uncompact(cells: Column, resolution: Column): Column =
+    wrapExpression[ST_H3Uncompact](cells, resolution)
+
+  def ST_H3Uncompact(cells: Column, resolution: Integer): Column =
+    wrapExpression[ST_H3Uncompact](cells, resolution)
+
+  def ST_H3Uncompact(cells: Array[Long], resolution: Integer): Column =
+    wrapExpression[ST_H3Uncompact](cells, resolution)
+
+  def ST_H3Compact(cells: Column): Column = wrapExpression[ST_H3Compact](cells)
+
+  def ST_H3Compact(cells: Array[Long]): Column = wrapExpression[ST_H3Compact](cells)
+
+  def ST_HilbertDistance(
+      geometry: Column,
+      xmin: Column,
+      ymin: Column,
+      xmax: Column,
+      ymax: Column,
+      level: Column): Column =
+    wrapExpression[ST_HilbertDistance](geometry, xmin, ymin, xmax, ymax, level)
+
+  def ST_HilbertDistance(
+      geometry: String,
+      xmin: Double,
+      ymin: Double,
+      xmax: Double,
+      ymax: Double,
+      level: Int): Column =
+    wrapExpression[ST_HilbertDistance](geometry, xmin, ymin, xmax, ymax, level)
 
   // Bing Tile functions
   def ST_BingTile(tileX: Column, tileY: Column, zoomLevel: Column): Column =
@@ -530,6 +593,10 @@ object st_functions {
     wrapExpression[ST_MaximumInscribedCircle](geometry)
   def ST_MaximumInscribedCircle(geometry: String): Column =
     wrapExpression[ST_MaximumInscribedCircle](geometry)
+  def ST_MaximumInscribedCircle(geometry: Column, tolerance: Column): Column =
+    wrapExpression[ST_MaximumInscribedCircle](geometry, tolerance)
+  def ST_MaximumInscribedCircle(geometry: String, tolerance: Double): Column =
+    wrapExpression[ST_MaximumInscribedCircle](geometry, tolerance)
 
   def ST_MaxDistance(geom1: Column, geom2: Column): Column =
     wrapExpression[ST_MaxDistance](geom1, geom2)
@@ -580,6 +647,11 @@ object st_functions {
 
   def ST_IsPolygonCCW(geometry: Column): Column = wrapExpression[ST_IsPolygonCCW](geometry)
   def ST_IsPolygonCCW(geometry: String): Column = wrapExpression[ST_IsPolygonCCW](geometry)
+
+  def ST_IsLineStringCCW(geometry: Column): Column =
+    wrapExpression[ST_IsLineStringCCW](geometry)
+  def ST_IsLineStringCCW(geometry: String): Column =
+    wrapExpression[ST_IsLineStringCCW](geometry)
 
   def ST_ForcePolygonCCW(geometry: Column): Column = wrapExpression[ST_ForcePolygonCCW](geometry)
   def ST_ForcePolygonCCW(geometry: String): Column = wrapExpression[ST_ForcePolygonCCW](geometry)
@@ -741,6 +813,9 @@ object st_functions {
     wrapExpression[ST_SimplifyPreserveTopology](geometry, distanceTolerance)
   def ST_SimplifyPreserveTopology(geometry: String, distanceTolerance: Double): Column =
     wrapExpression[ST_SimplifyPreserveTopology](geometry, distanceTolerance)
+
+  def ST_SharedPaths(a: Column, b: Column): Column = wrapExpression[ST_SharedPaths](a, b)
+  def ST_SharedPaths(a: String, b: String): Column = wrapExpression[ST_SharedPaths](a, b)
 
   def ST_Split(input: Column, blade: Column): Column = wrapExpression[ST_Split](input, blade)
   def ST_Split(input: String, blade: String): Column = wrapExpression[ST_Split](input, blade)

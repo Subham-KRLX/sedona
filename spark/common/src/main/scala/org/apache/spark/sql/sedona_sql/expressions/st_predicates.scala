@@ -24,12 +24,6 @@ import org.apache.spark.sql.Column
 import org.apache.spark.sql.sedona_sql.DataFrameShims._
 
 object st_predicates {
-  def ST_BoxContains(a: Column, b: Column): Column = wrapExpression[ST_BoxContains](a, b)
-  def ST_BoxContains(a: String, b: String): Column = wrapExpression[ST_BoxContains](a, b)
-
-  def ST_BoxIntersects(a: Column, b: Column): Column = wrapExpression[ST_BoxIntersects](a, b)
-  def ST_BoxIntersects(a: String, b: String): Column = wrapExpression[ST_BoxIntersects](a, b)
-
   def ST_Contains(a: Column, b: Column): Column = wrapExpression[ST_Contains](a, b)
   def ST_Contains(a: String, b: String): Column = wrapExpression[ST_Contains](a, b)
 
@@ -41,6 +35,16 @@ object st_predicates {
 
   def ST_Equals(a: Column, b: Column): Column = wrapExpression[ST_Equals](a, b)
   def ST_Equals(a: String, b: String): Column = wrapExpression[ST_Equals](a, b)
+
+  def ST_EqualsExact(a: Column, b: Column, tolerance: Column): Column =
+    wrapExpression[ST_EqualsExact](a, b, tolerance)
+  def ST_EqualsExact(a: String, b: String, tolerance: Double): Column =
+    wrapExpression[ST_EqualsExact](a, b, tolerance)
+
+  def ST_EqualsIdentical(a: Column, b: Column): Column =
+    wrapExpression[ST_EqualsIdentical](a, b)
+  def ST_EqualsIdentical(a: String, b: String): Column =
+    wrapExpression[ST_EqualsIdentical](a, b)
 
   def ST_Intersects(a: Column, b: Column): Column = wrapExpression[ST_Intersects](a, b)
   def ST_Intersects(a: String, b: String): Column = wrapExpression[ST_Intersects](a, b)
@@ -80,6 +84,11 @@ object st_predicates {
     wrapExpression[ST_DWithin](a, b, distance, useSphere)
   def ST_DWithin(a: String, b: String, distance: Double, useSphere: Boolean): Column =
     wrapExpression[ST_DWithin](a, b, distance, useSphere)
+
+  def ST_3DDWithin(a: Column, b: Column, distance: Column): Column =
+    wrapExpression[ST_3DDWithin](a, b, distance)
+  def ST_3DDWithin(a: String, b: String, distance: Double): Column =
+    wrapExpression[ST_3DDWithin](a, b, distance)
 
   def ST_KNN(a: Column, b: Column, distance: Column): Column =
     wrapExpression[ST_KNN](a, b, distance)

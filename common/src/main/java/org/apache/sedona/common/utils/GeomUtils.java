@@ -23,13 +23,13 @@ import static org.locationtech.jts.geom.Coordinate.NULL_ORDINATE;
 import java.nio.ByteOrder;
 import java.util.*;
 import org.apache.sedona.common.Functions;
+import org.datasyslab.jts.io.WKTWriter;
 import org.locationtech.jts.algorithm.Angle;
 import org.locationtech.jts.algorithm.distance.DiscreteFrechetDistance;
 import org.locationtech.jts.algorithm.distance.DiscreteHausdorffDistance;
 import org.locationtech.jts.geom.*;
 import org.locationtech.jts.io.ByteOrderValues;
 import org.locationtech.jts.io.WKBWriter;
-import org.locationtech.jts.io.WKTWriter;
 import org.locationtech.jts.operation.polygonize.Polygonizer;
 import org.locationtech.jts.operation.union.UnaryUnionOp;
 import org.locationtech.spatial4j.context.jts.JtsSpatialContext;
@@ -175,36 +175,46 @@ public class GeomUtils {
     if (srid != 0) {
       sridString = "SRID=" + String.valueOf(srid) + ";";
     }
-    return sridString + new WKTWriter(4).write(geometry);
+    return sridString + writeWKT(geometry);
   }
 
   public static String getWKT(Geometry geometry) {
     if (geometry == null) {
       return null;
     }
+    return writeWKT(geometry);
+  }
+
+  private static String writeWKT(Geometry geometry) {
     return new WKTWriter(4).write(geometry);
   }
 
   public static String getHexEWKB(Geometry geometry, int endian) {
-    WKBWriter writer =
-        new WKBWriter(GeomUtils.getDimension(geometry), endian, geometry.getSRID() != 0);
-    return WKBWriter.toHex(writer.write(geometry));
+    return WKBWriter.toHex(
+        createDimensionPreservingWKBWriter(endian, geometry.getSRID() != 0).write(geometry));
   }
 
   public static byte[] getEWKB(Geometry geometry) {
     if (geometry == null) {
       return null;
     }
-    WKBWriter writer = createWKBWriter(GeomUtils.getDimension(geometry), geometry.getSRID() != 0);
-    return writer.write(geometry);
+    return createDimensionPreservingWKBWriter(NATIVE_WKB_BYTE_ORDER, geometry.getSRID() != 0)
+        .write(geometry);
   }
 
   public static byte[] getWKB(Geometry geometry) {
     if (geometry == null) {
       return null;
     }
-    WKBWriter writer = createWKBWriter(GeomUtils.getDimension(geometry), false);
-    return writer.write(geometry);
+    return createDimensionPreservingWKBWriter(NATIVE_WKB_BYTE_ORDER, false).write(geometry);
+  }
+
+  private static org.datasyslab.jts.io.WKBWriter createDimensionPreservingWKBWriter(
+      int byteOrder, boolean includeSRID) {
+    org.datasyslab.jts.io.WKBWriter writer =
+        new org.datasyslab.jts.io.WKBWriter(4, byteOrder, includeSRID);
+    writer.setPreserveCoordinateDimensions(true);
+    return writer;
   }
 
   private static final int NATIVE_WKB_BYTE_ORDER =
@@ -574,12 +584,13 @@ public class GeomUtils {
     CoordinateList newCoordinates = new CoordinateList();
 
     Coordinate c1 = coordinates[0];
-    double measure, measureRange = measureEnd - measureStart;
+    double length = 0, measure, measureRange = measureEnd - measureStart;
     int numCoordinates = coordinates.length;
 
     for (int i = 0; i < numCoordinates; i++) {
       Coordinate c2 = coordinates[i];
-      double length = c1.distance(c2);
+      length += c1.distance(c2);
+      c1 = c2;
 
       if (totalLength > 0.0) {
         measure = measureStart + measureRange * (length / totalLength);
@@ -607,7 +618,7 @@ public class GeomUtils {
     for (int i = 0; i < geom.getNumGeometries(); i++) {
       double subMeasureStart, subMeasureEnd, subLength = 0;
       LineString lineString = (LineString) geom.getGeometryN(i);
-      if (lineString.getCoordinates().length > 1) subLength = lineString.getCoordinates().length;
+      if (lineString.getCoordinates().length > 1) subLength = lineString.getLength();
 
       subMeasureStart = measureStart + measureRange * length / totalLength;
       subMeasureEnd = measureStart + measureRange * (length + subLength) / totalLength;

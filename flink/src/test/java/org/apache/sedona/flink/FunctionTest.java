@@ -23,14 +23,20 @@ import static org.apache.flink.table.api.Expressions.*;
 import static org.junit.Assert.*;
 
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.commons.codec.binary.Hex;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.table.api.Table;
 import org.apache.flink.types.Row;
 import org.apache.sedona.common.geometryObjects.Box2D;
+import org.apache.sedona.common.geometryObjects.Box3D;
+import org.apache.sedona.common.utils.H3Utils;
 import org.apache.sedona.flink.expressions.Functions;
 import org.apache.sedona.flink.expressions.FunctionsProj4;
 import org.datasyslab.proj4sedona.core.Proj;
@@ -461,6 +467,36 @@ public class FunctionTest extends TestBase {
   }
 
   @Test
+  public void testBox3D() {
+    Table t =
+        tableEnv.sqlQuery(
+            "SELECT ST_Box3D(ST_GeomFromText('LINESTRING Z(0 0 -3, 5 10 7)')) AS bbox");
+    Box3D bbox = (Box3D) first(t).getField(0);
+    assertEquals(0.0, bbox.getXMin(), 0.0);
+    assertEquals(0.0, bbox.getYMin(), 0.0);
+    assertEquals(-3.0, bbox.getZMin(), 0.0);
+    assertEquals(5.0, bbox.getXMax(), 0.0);
+    assertEquals(10.0, bbox.getYMax(), 0.0);
+    assertEquals(7.0, bbox.getZMax(), 0.0);
+
+    // XY-only geometry folds Z to 0 per PostGIS.
+    Table tXY =
+        tableEnv.sqlQuery("SELECT ST_Box3D(ST_GeomFromText('LINESTRING(0 0, 5 10)')) AS bbox");
+    Box3D xy = (Box3D) first(tXY).getField(0);
+    assertEquals(0.0, xy.getZMin(), 0.0);
+    assertEquals(0.0, xy.getZMax(), 0.0);
+
+    // null and empty inputs propagate to NULL.
+    Table tNull =
+        tableEnv.sqlQuery(
+            "SELECT ST_Box3D(ST_GeomFromText('LINESTRING EMPTY')) AS empty_bbox,"
+                + " ST_Box3D(ST_GeomFromText(CAST(NULL AS STRING))) AS null_bbox");
+    Row row = first(tNull);
+    assertNull(row.getField(0));
+    assertNull(row.getField(1));
+  }
+
+  @Test
   public void testBox2DAsTextAndAccessors() {
     Table t =
         tableEnv.sqlQuery(
@@ -473,6 +509,24 @@ public class FunctionTest extends TestBase {
     assertEquals(2.0, row.getField(2));
     assertEquals(4.0, row.getField(3));
     assertEquals(5.0, row.getField(4));
+  }
+
+  @Test
+  public void testBox3DAsTextAndAccessors() {
+    Table t =
+        tableEnv.sqlQuery(
+            "WITH bx AS ("
+                + " SELECT ST_Box3D(ST_GeomFromText('LINESTRING Z(0 0 -3, 5 10 7)')) AS b)"
+                + " SELECT ST_AsText(b), ST_XMin(b), ST_YMin(b), ST_ZMin(b),"
+                + " ST_XMax(b), ST_YMax(b), ST_ZMax(b) FROM bx");
+    Row row = first(t);
+    assertEquals("BOX3D(0.0 0.0 -3.0, 5.0 10.0 7.0)", row.getField(0));
+    assertEquals(0.0, row.getField(1));
+    assertEquals(0.0, row.getField(2));
+    assertEquals(-3.0, row.getField(3));
+    assertEquals(5.0, row.getField(4));
+    assertEquals(10.0, row.getField(5));
+    assertEquals(7.0, row.getField(6));
   }
 
   @Test
@@ -768,6 +822,20 @@ public class FunctionTest extends TestBase {
   }
 
   @Test
+  public void testDistanceSphereAndSpheroidEmptyGeometries() {
+    Table tbl =
+        tableEnv.sqlQuery(
+            "SELECT ST_DistanceSphere(ST_GeomFromWKT('POINT (0 0)'), ST_GeomFromWKT('POLYGON EMPTY')),"
+                + " ST_DistanceSphere(ST_GeomFromWKT('POINT EMPTY'), ST_GeomFromWKT('POINT (0 0)'), 6378137.0),"
+                + " ST_DistanceSpheroid(ST_GeomFromWKT('POINT (0 0)'), ST_GeomFromWKT('LINESTRING EMPTY')),"
+                + " ST_DistanceSpheroid(ST_GeomFromWKT('GEOMETRYCOLLECTION EMPTY'), ST_GeomFromWKT('POINT (0 0)'))");
+    Row row = first(tbl);
+    for (int i = 0; i < row.getArity(); i++) {
+      assertNull(row.getField(i));
+    }
+  }
+
+  @Test
   public void test3dDistance() {
     Table pointTable =
         tableEnv.sqlQuery(
@@ -783,6 +851,37 @@ public class FunctionTest extends TestBase {
     table = table.select(call(Functions.ST_Intersection.class.getSimpleName(), $("g1"), $("g2")));
     Geometry result = (Geometry) first(table).getField(0);
     assertEquals("POINT (0 0)", result.toString());
+  }
+
+  @Test
+  public void testSharedPaths() {
+    Table table =
+        tableEnv.sqlQuery(
+            "SELECT ST_SharedPaths(ST_GeomFromWKT('LINESTRING (0 0, 10 0)'), "
+                + "ST_GeomFromWKT('LINESTRING (15 0, 5 0)'))");
+    Geometry result = (Geometry) first(table).getField(0);
+    assertEquals(
+        "GEOMETRYCOLLECTION (MULTILINESTRING EMPTY, MULTILINESTRING ((5 0, 10 0)))",
+        result.toString());
+  }
+
+  @Test
+  public void testHilbertDistance() {
+    Table result =
+        tableEnv.sqlQuery(
+            "SELECT "
+                + "ST_HilbertDistance(ST_GeomFromWKT('POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))'), 0.0, 0.0, 1.0, 1.0, 2), "
+                + "ST_HilbertDistance(ST_GeomFromWKT('POINT (1 0)'), 0.0, 0.0, 1.0, 1.0, 16), "
+                + "ST_HilbertDistance(ST_GeomFromWKT('POINT Z (1 0 42)'), 0.0, 0.0, 1.0, 1.0, 0), "
+                + "ST_HilbertDistance(ST_GeomFromText(CAST(NULL AS STRING)), 0.0, 0.0, 1.0, 1.0, 2), "
+                + "ST_HilbertDistance(ST_GeomFromWKT('POINT (1 0)'), CAST(NULL AS DOUBLE), 0.0, 1.0, 1.0, 2)");
+    Row row = first(result);
+
+    assertEquals(2L, row.getField(0));
+    assertEquals(4294967295L, row.getField(1));
+    assertEquals(0L, row.getField(2));
+    assertNull(row.getField(3));
+    assertNull(row.getField(4));
   }
 
   @Test
@@ -1058,7 +1157,7 @@ public class FunctionTest extends TestBase {
             "SELECT ST_GeomFromWKT('GEOMETRYCOLLECTION(POINT(10 10), POINT(30 30), LINESTRING(15 15, 20 20))') AS collection");
     Table resultTable =
         collectionTable.select(
-            call(Functions.ST_GeometryN.class.getSimpleName(), $("collection"), 1));
+            call(Functions.ST_GeometryN.class.getSimpleName(), $("collection"), 2));
     Point point = (Point) first(resultTable).getField(0);
     assertEquals("POINT (30 30)", point.toString());
   }
@@ -1070,7 +1169,7 @@ public class FunctionTest extends TestBase {
             "SELECT ST_GeomFromText('POLYGON((7 9,8 7,11 6,15 8,16 6,17 7,17 10,18 12,17 14,15 15,11 15,10 13,9 12,7 9),(9 9,10 10,11 11,11 10,10 8,9 9),(12 14,15 14,13 11,12 14))') AS polygon");
     Table resultTable =
         polygonTable.select(
-            call(Functions.ST_InteriorRingN.class.getSimpleName(), $("polygon"), 1));
+            call(Functions.ST_InteriorRingN.class.getSimpleName(), $("polygon"), 2));
     LineString lineString = (LineString) first(resultTable).getField(0);
     assertEquals("LINESTRING (12 14, 15 14, 13 11, 12 14)", lineString.toString());
   }
@@ -2088,6 +2187,18 @@ public class FunctionTest extends TestBase {
   }
 
   @Test
+  public void testSplitMultiPointByPolygon() {
+    // ST_Split on a MultiPoint by a Polygon partitions points by polygon coverage.
+    Table table =
+        tableEnv.sqlQuery(
+            "SELECT ST_Split(ST_GeomFromWKT('MULTIPOINT ((1 1), (5 5), (15 15))'),"
+                + " ST_GeomFromWKT('POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))'))");
+    assertEquals(
+        "GEOMETRYCOLLECTION (MULTIPOINT ((1 1), (5 5)), MULTIPOINT ((15 15)))",
+        ((Geometry) first(table).getField(0)).norm().toText());
+  }
+
+  @Test
   public void testSubdivide() {
     Table table =
         tableEnv.sqlQuery(
@@ -2256,6 +2367,215 @@ public class FunctionTest extends TestBase {
     assertTrue(actual[0].intersects(target));
     assertTrue(actual[11].intersects(target));
     assertTrue(actual[20].intersects(target));
+  }
+
+  @Test
+  public void testH3ToParent() {
+    Table pointTable =
+        tableEnv.sqlQuery(
+            "SELECT ST_H3CellIDs(ST_GeomFromWKT('POINT(1 2)'), 8, true)[1], ST_H3ToParent(ST_H3CellIDs(ST_GeomFromWKT('POINT(1 2)'), 8, true)[1], 5)");
+    Row result = first(pointTable);
+    long child = (Long) Objects.requireNonNull(result.getField(0));
+    long parent = (Long) Objects.requireNonNull(result.getField(1));
+
+    assertEquals(5, H3Utils.h3.getResolution(parent));
+    assertTrue(H3Utils.h3.cellToChildren(parent, 8).contains(child));
+
+    Table nullTable = tableEnv.sqlQuery("SELECT ST_H3ToParent(CAST(NULL AS BIGINT), 5)");
+    assertNull(first(nullTable).getField(0));
+  }
+
+  @Test
+  public void testH3ToChildren() {
+    long parent = H3Utils.coordinateToCell(new Coordinate(1, 2), 5);
+    Long[] children =
+        (Long[]) first(tableEnv.sqlQuery("SELECT ST_H3ToChildren(" + parent + ", 7)")).getField(0);
+    assertNotNull(children);
+    assertEquals(49, children.length);
+    assertEquals(49, new HashSet<>(Arrays.asList(children)).size());
+    for (long child : children) {
+      assertEquals(7, H3Utils.h3.getResolution(child));
+      assertEquals(parent, H3Utils.h3.cellToParent(child, 5));
+    }
+    assertArrayEquals(
+        new Long[] {parent},
+        (Long[]) first(tableEnv.sqlQuery("SELECT ST_H3ToChildren(" + parent + ", 5)")).getField(0));
+
+    long pentagon = H3Utils.h3.getPentagons(5).iterator().next();
+    Long[] pentagonChildren =
+        (Long[])
+            first(tableEnv.sqlQuery("SELECT ST_H3ToChildren(" + pentagon + ", 6)")).getField(0);
+    assertNotNull(pentagonChildren);
+    assertEquals(6, pentagonChildren.length);
+    for (long child : pentagonChildren) {
+      assertEquals(pentagon, H3Utils.h3.cellToParent(child, 5));
+    }
+
+    Row nulls =
+        first(
+            tableEnv.sqlQuery(
+                "SELECT ST_H3ToChildren(CAST(NULL AS BIGINT), 6), "
+                    + "ST_H3ToChildren("
+                    + parent
+                    + ", CAST(NULL AS INT)), "
+                    + "ST_H3ToChildren(CAST(NULL AS BIGINT), CAST(NULL AS INT))"));
+    for (int i = 0; i < 3; i++) {
+      assertNull(nulls.getField(i));
+    }
+  }
+
+  @Test
+  public void testH3ToCenterChild() {
+    long parent = 601041811137363967L;
+    Row result =
+        first(
+            tableEnv.sqlQuery(
+                "SELECT ST_H3ToCenterChild(cell, resolution), ST_H3ToCenterChild(cell, 5), "
+                    + "ST_H3ToParent(ST_H3ToCenterChild(cell, 15), 5) "
+                    + "FROM (VALUES ("
+                    + parent
+                    + ", 6)) AS input(cell, resolution)"));
+    assertEquals(605545409825210367L, result.getField(0));
+    assertEquals(parent, result.getField(1));
+    assertEquals(parent, result.getField(2));
+
+    long pentagon = H3Utils.h3.getPentagons(5).iterator().next();
+    long child =
+        (Long)
+            Objects.requireNonNull(
+                first(tableEnv.sqlQuery("SELECT ST_H3ToCenterChild(" + pentagon + ", 8)"))
+                    .getField(0));
+    assertTrue(H3Utils.h3.isPentagon(child));
+    assertEquals(8, H3Utils.h3.getResolution(child));
+    assertEquals(pentagon, H3Utils.h3.cellToParent(child, 5));
+
+    Row nulls =
+        first(
+            tableEnv.sqlQuery(
+                "SELECT ST_H3ToCenterChild(CAST(NULL AS BIGINT), 6), "
+                    + "ST_H3ToCenterChild("
+                    + parent
+                    + ", CAST(NULL AS INT)), "
+                    + "ST_H3ToCenterChild(CAST(NULL AS BIGINT), CAST(NULL AS INT))"));
+    for (int i = 0; i < 3; i++) {
+      assertNull(nulls.getField(i));
+    }
+    Table nullable =
+        tableEnv.sqlQuery(
+            "SELECT ST_H3ToCenterChild(cell, resolution) "
+                + "FROM (VALUES (CAST(NULL AS BIGINT), 6), ("
+                + parent
+                + ", CAST(NULL AS INT))) AS input(cell, resolution)");
+    assertNull(first(nullable).getField(0));
+    assertNull(last(nullable).getField(0));
+  }
+
+  @Test
+  public void testH3Compact() {
+    long parent = H3Utils.coordinateToCell(new Coordinate(1, 2), 5);
+    long other = H3Utils.coordinateToCell(new Coordinate(10, 20), 7);
+    Long[] children = H3Utils.h3.cellToChildren(parent, 7).toArray(new Long[0]);
+    assertArrayEquals(
+        new Long[] {parent},
+        (Long[])
+            first(tableEnv.sqlQuery("SELECT ST_H3Compact(ST_H3ToChildren(" + parent + ", 7))"))
+                .getField(0));
+
+    Long[] withOther = Arrays.copyOf(children, children.length + 1);
+    withOther[children.length] = other;
+    List<Long[]> input = Arrays.asList(withOther, Arrays.copyOf(children, 6), new Long[0]);
+    for (Long[] sample : input) {
+      Long[] cells =
+          (Long[])
+              first(
+                      tableEnv
+                          .fromDataStream(
+                              env.fromCollection(
+                                  Collections.singletonList(sample),
+                                  Types.OBJECT_ARRAY(Types.LONG)))
+                          .select(call("ST_H3Compact", $("f0"))))
+                  .getField(0);
+      Set<Long> expected =
+          sample.length == withOther.length
+              ? new HashSet<>(Arrays.asList(parent, other))
+              : new HashSet<>(Arrays.asList(sample));
+      assertNotNull(cells);
+      assertEquals(expected.size(), cells.length);
+      assertEquals(expected, new HashSet<>(Arrays.asList(cells)));
+    }
+
+    long pentagon = H3Utils.h3.getPentagons(5).iterator().next();
+    assertArrayEquals(
+        new Long[] {pentagon},
+        (Long[])
+            first(tableEnv.sqlQuery("SELECT ST_H3Compact(ST_H3ToChildren(" + pentagon + ", 7))"))
+                .getField(0));
+    assertArrayEquals(
+        new Long[] {parent},
+        (Long[])
+            first(tableEnv.sqlQuery("SELECT ST_H3Compact(ARRAY[" + parent + "])")).getField(0));
+    assertNull(
+        first(tableEnv.sqlQuery("SELECT ST_H3Compact(CAST(NULL AS ARRAY<BIGINT>))")).getField(0));
+  }
+
+  @Test
+  public void testH3Uncompact() {
+    long parent = H3Utils.coordinateToCell(new Coordinate(1, 2), 5);
+    long other = H3Utils.coordinateToCell(new Coordinate(10, 20), 6);
+    Long[] cells =
+        (Long[])
+            first(
+                    tableEnv.sqlQuery(
+                        "SELECT ST_H3Uncompact(cells, resolution) FROM (VALUES (ARRAY["
+                            + parent
+                            + ", "
+                            + other
+                            + "], 6)) AS input(cells, resolution)"))
+                .getField(0);
+    assertNotNull(cells);
+    assertEquals(8, cells.length);
+    Set<Long> expected = new HashSet<>(H3Utils.h3.cellToChildren(parent, 6));
+    expected.add(other);
+    assertEquals(expected, new HashSet<>(Arrays.asList(cells)));
+    assertArrayEquals(
+        new Long[] {parent},
+        (Long[])
+            first(tableEnv.sqlQuery("SELECT ST_H3Uncompact(ARRAY[" + parent + "], 5)"))
+                .getField(0));
+    assertArrayEquals(
+        new Long[0],
+        (Long[])
+            first(
+                    tableEnv
+                        .fromDataStream(
+                            env.fromCollection(
+                                Collections.singletonList(new Long[0]),
+                                Types.OBJECT_ARRAY(Types.LONG)))
+                        .select(call("ST_H3Uncompact", $("f0"), 6)))
+                .getField(0));
+
+    long pentagon = H3Utils.h3.getPentagons(5).iterator().next();
+    Long[] pentagonCells =
+        (Long[])
+            first(tableEnv.sqlQuery("SELECT ST_H3Uncompact(ARRAY[" + pentagon + "], 7)"))
+                .getField(0);
+    assertNotNull(pentagonCells);
+    assertEquals(41, pentagonCells.length);
+    for (long cell : pentagonCells) {
+      assertEquals(pentagon, H3Utils.h3.cellToParent(cell, 5));
+    }
+
+    Row nulls =
+        first(
+            tableEnv.sqlQuery(
+                "SELECT ST_H3Uncompact(CAST(NULL AS ARRAY<BIGINT>), 6), "
+                    + "ST_H3Uncompact(ARRAY["
+                    + parent
+                    + "], CAST(NULL AS INT)), "
+                    + "ST_H3Uncompact(CAST(NULL AS ARRAY<BIGINT>), CAST(NULL AS INT))"));
+    for (int i = 0; i < 3; i++) {
+      assertNull(nulls.getField(i));
+    }
   }
 
   @Test
@@ -2535,6 +2855,21 @@ public class FunctionTest extends TestBase {
   }
 
   @Test
+  public void testIsLineStringCCW() {
+    Table result =
+        tableEnv.sqlQuery(
+            "SELECT "
+                + "ST_IsLineStringCCW(ST_GeomFromWKT('LINESTRING (0 0, 1 0, 1 1, 0 1, 0 0)')), "
+                + "ST_IsLineStringCCW(ST_GeomFromWKT('LINESTRING (0 1, 0 -1, -1 -2, 3 -2)')), "
+                + "ST_IsLineStringCCW(ST_GeomFromWKT('POINT (0 0)'))");
+    Row row = first(result);
+
+    assertTrue((boolean) row.getField(0));
+    assertFalse((boolean) row.getField(1));
+    assertFalse((boolean) row.getField(2));
+  }
+
+  @Test
   public void testGeneratePoints() {
     Table polyTable =
         tableEnv.sqlQuery(
@@ -2624,6 +2959,58 @@ public class FunctionTest extends TestBase {
                         call(Functions.ST_IsPolygonCCW.class.getSimpleName(), $("polyCW"))))
                 .getField(0);
     assertFalse(actual);
+  }
+
+  @Test
+  public void testIsPolygonOrientationForEmptyGeometries() {
+    Table result =
+        tableEnv.sqlQuery(
+            "SELECT "
+                + "ST_IsPolygonCW(ST_GeomFromWKT('POLYGON EMPTY')), "
+                + "ST_IsPolygonCCW(ST_GeomFromWKT('POLYGON EMPTY')), "
+                + "ST_IsPolygonCW(ST_GeomFromWKT('MULTIPOLYGON EMPTY')), "
+                + "ST_IsPolygonCCW(ST_GeomFromWKT('MULTIPOLYGON EMPTY'))");
+
+    Row row = first(result);
+    for (int i = 0; i < row.getArity(); i++) {
+      assertTrue((boolean) row.getField(i));
+    }
+  }
+
+  @Test
+  public void testIsPolygonOrientationForNonPolygonalAndCollectionGeometries() {
+    // Non-polygonal geometries and geometry collections with no polygonal components have
+    // nothing to violate the orientation, so PostGIS parity requires true here. A collection
+    // is also recursed into to find a nested polygonal component.
+    Table result =
+        tableEnv.sqlQuery(
+            "SELECT "
+                + "ST_IsPolygonCW(ST_GeomFromWKT('POINT (0 0)')), "
+                + "ST_IsPolygonCCW(ST_GeomFromWKT('POINT (0 0)')), "
+                + "ST_IsPolygonCW(ST_GeomFromWKT('LINESTRING (0 0, 1 0, 0 0)')), "
+                + "ST_IsPolygonCCW(ST_GeomFromWKT('LINESTRING (0 0, 1 0, 0 0)')), "
+                + "ST_IsPolygonCW(ST_GeomFromWKT('GEOMETRYCOLLECTION EMPTY')), "
+                + "ST_IsPolygonCCW(ST_GeomFromWKT('GEOMETRYCOLLECTION EMPTY')), "
+                + "ST_IsPolygonCW(ST_GeomFromWKT("
+                + "'GEOMETRYCOLLECTION (POINT (2 2), GEOMETRYCOLLECTION (POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))))'))");
+
+    Row row = first(result);
+    for (int i = 0; i < row.getArity(); i++) {
+      assertTrue((boolean) row.getField(i));
+    }
+  }
+
+  @Test
+  public void testIsPolygonOrientationNullPropagation() {
+    Table result =
+        tableEnv.sqlQuery(
+            "SELECT "
+                + "ST_IsPolygonCW(ST_GeomFromWKT(CAST(NULL AS STRING))), "
+                + "ST_IsPolygonCCW(ST_GeomFromWKT(CAST(NULL AS STRING)))");
+
+    Row row = first(result);
+    assertNull(row.getField(0));
+    assertNull(row.getField(1));
   }
 
   @Test

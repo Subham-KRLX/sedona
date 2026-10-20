@@ -15,14 +15,28 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from datetime import date
+from decimal import Decimal
+import typing
+import warnings
+
 import shapely
 import numpy as np
 import pytest
 import pandas as pd
 import geopandas as gpd
+import pyspark
 import pyspark.pandas as ps
 import sedona.spark.geopandas as sgpd
+from pyspark import TaskContext
+from pyspark.pandas.internal import InternalFrame, NATURAL_ORDER_COLUMN_NAME
+from pyspark.pandas.utils import scol_for
+from pyspark.sql import functions as F
 from sedona.spark.geopandas import GeoSeries, GeoDataFrame
+from sedona.spark.geopandas._crs import read_crs_metadata
+from sedona.spark.geopandas.geoseries import _to_bool
+from sedona.spark.sql import st_constructors as stc
+from sedona.spark.sql import st_functions as stf
 from tests.geopandas.test_geopandas_base import TestGeopandasBase
 from shapely import wkt
 from shapely.geometry import (
@@ -38,6 +52,78 @@ from shapely.geometry import (
 )
 import pytest
 from packaging.version import parse as parse_version
+
+requires_geopandas_shared_paths = pytest.mark.skipif(
+    parse_version(gpd.__version__) < parse_version("1.0.0"),
+    reason=f"Tests require geopandas>=1.0.0, but found v{gpd.__version__}",
+)
+
+requires_geopandas_geom_equals_identical = pytest.mark.skipif(
+    parse_version(gpd.__version__) < parse_version("1.1.0")
+    or parse_version(shapely.__version__) < parse_version("2.1.0"),
+    reason=(
+        "Tests require geopandas>=1.1.0 and shapely>=2.1.0, but found "
+        f"geopandas {gpd.__version__} and shapely {shapely.__version__}"
+    ),
+)
+
+requires_shapely_m_support = pytest.mark.skipif(
+    parse_version(shapely.__version__) < parse_version("2.1.0")
+    or getattr(shapely, "geos_version", (0, 0, 0)) < (3, 12, 0),
+    reason=(
+        "M and ZM geometry tests require shapely>=2.1.0 and GEOS>=3.12.0, "
+        f"but found shapely {shapely.__version__} and GEOS "
+        f"{getattr(shapely, 'geos_version_string', 'unknown')}"
+    ),
+)
+
+
+class TestGeoSeriesFillnaCompatibility(TestGeopandasBase):
+    def test_fillna_accepts_local_geoseries_replacement(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        _ = self.spark
+        left_index = pd.Index([3, 2, 1, 0], name="feature_id")
+        source = GeoSeries(
+            [Point(7, 7), None, None, None],
+            index=left_index,
+            name="geometry",
+            crs="EPSG:4326",
+        )
+        replacement = gpd.GeoSeries(
+            [Point(3, 3), None, Point(4, 4), Point(99, 99)],
+            index=pd.Index([1, 2, 3, 99], name="other_id"),
+            crs="EPSG:3857",
+        )
+        expected = gpd.GeoSeries(
+            [Point(7, 7), None, Point(3, 3), None],
+            index=left_index,
+            name="geometry",
+            crs="EPSG:4326",
+        )
+
+        result = source.fillna(replacement)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    def test_fillna_limit_scalar_wkb_literal(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        _ = self.spark
+        result = GeoSeries([Point(0, 0), None, None]).fillna(Point(1, 1), limit=1)
+        expected = gpd.GeoSeries([Point(0, 0), Point(1, 1), None])
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize("values", [[], [Point(0, 0), Point(2, 2)]])
+    def test_fillna_limit_without_missing_rows(self, values):
+        from geopandas.testing import assert_geoseries_equal
+
+        _ = self.spark
+        result = GeoSeries(values).fillna(Point(1, 1), limit=1)
+        expected = gpd.GeoSeries(values)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
 
 
 @pytest.mark.skipif(
@@ -66,6 +152,508 @@ class TestGeoSeries(TestGeopandasBase):
         s = sgpd.GeoSeries([])
         assert s.count() == 0
 
+    def test_to_bool_fills_nullable_boolean_series(self):
+        nullable = self.spark.createDataFrame(
+            [(0, True), (1, None), (2, False)],
+            "id long, value boolean",
+        ).pandas_api(index_col="id")["value"]
+
+        self.check_pd_series_equal(
+            _to_bool(nullable),
+            pd.Series(
+                [True, False, False],
+                index=pd.Index([0, 1, 2], name="id"),
+                name="value",
+            ),
+        )
+        self.check_pd_series_equal(
+            _to_bool(nullable, default=True),
+            pd.Series(
+                [True, True, False],
+                index=pd.Index([0, 1, 2], name="id"),
+                name="value",
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ("geometries", "expected_edges"),
+        [
+            (
+                [
+                    wkt.loads("POLYGON ((0 0, 1 1, 1 0, 0 0))"),
+                    wkt.loads("POLYGON ((0 0, 0.5 0.5, 1 1, 0 1, 0 0))"),
+                ],
+                [
+                    wkt.loads("LINESTRING (0 0, 1 1)"),
+                    wkt.loads("LINESTRING (0 0, 0.5 0.5, 1 1)"),
+                ],
+            ),
+            (
+                [box(0, 0, 1, 1), box(0.5, 0, 1.5, 1)],
+                [
+                    wkt.loads("LINESTRING (0 0, 1 0, 1 1, 0 1)"),
+                    wkt.loads("LINESTRING (1.5 1, 0.5 1, 0.5 0, 1.5 0)"),
+                ],
+            ),
+        ],
+    )
+    def test_coverage_validation_reports_expected_edges(
+        self, geometries, expected_edges
+    ):
+        series = GeoSeries(geometries)
+
+        actual = series.invalid_coverage_edges().to_geopandas()
+
+        assert series.is_valid_coverage() is False
+        assert len(actual) == len(expected_edges)
+        assert all(
+            actual_geometry.equals_exact(expected_geometry, tolerance=0)
+            for actual_geometry, expected_geometry in zip(actual, expected_edges)
+        )
+
+    @pytest.mark.parametrize(
+        ("geometries", "expected_valid"),
+        [
+            ([box(0, 0, 1, 1), box(0, 0, 1, 1)], False),
+            (
+                [
+                    wkt.loads(
+                        "POLYGON ((0 0, 3 0, 3 3, 0 3, 0 0), "
+                        "(1 1, 1 2, 2 2, 2 1, 1 1))"
+                    ),
+                    box(1, 1, 2, 2),
+                ],
+                True,
+            ),
+            (
+                [
+                    MultiPolygon([box(0, 0, 1, 1), box(2, 0, 3, 1)]),
+                    box(1, 0, 2, 1),
+                ],
+                True,
+            ),
+        ],
+        ids=["duplicates", "hole-fill", "multipolygon-middle"],
+    )
+    def test_coverage_validation_edge_matrix(self, geometries, expected_valid):
+        series = GeoSeries(geometries)
+
+        actual = series.invalid_coverage_edges().to_geopandas()
+
+        assert series.is_valid_coverage() is expected_valid
+        assert [edge.is_empty for edge in actual] == [expected_valid] * 2
+
+    @pytest.mark.parametrize(
+        "geometries",
+        [
+            [],
+            [
+                None,
+                Point(0, 0),
+                LineString([(0, 0), (1, 1)]),
+                Polygon(),
+                Polygon([(0, 0), (1, 1), (1, 0), (0, 1), (0, 0)]),
+            ],
+        ],
+    )
+    def test_coverage_validation_empty_or_without_interactions(self, geometries):
+        if geometries:
+            # Spark 3 cannot infer a geometry column when the first local value
+            # is null. Construct from a non-null first value, then restore the
+            # intended physical order through a distributed operation.
+            series = GeoSeries(
+                geometries[1:] + geometries[:1],
+                index=list(range(1, len(geometries))) + [0],
+            )
+            series = GeoSeries(series.sort_index())
+        else:
+            series = GeoSeries([])
+
+        actual = series.invalid_coverage_edges().to_geopandas()
+
+        assert actual.name is None
+        assert len(actual) == len(geometries)
+        if geometries:
+            assert actual.iloc[0] is None
+            assert all(
+                geometry.geom_type == "LineString" and geometry.is_empty
+                for geometry in actual.iloc[1:]
+            )
+        assert series.is_valid_coverage() is True
+
+    def test_geodataframe_delegates_coverage_validation_to_active_geometry(self):
+        series = GeoSeries([box(0, 0, 1, 1), box(0.5, 0, 1.5, 1)])
+        frame = series.to_geoframe(name="shape")
+
+        actual = frame.invalid_coverage_edges().to_geopandas()
+
+        assert all(not geometry.is_empty for geometry in actual)
+        assert frame.is_valid_coverage() is False
+
+    def test_coverage_validation_gap_width(self):
+        series = GeoSeries([box(0, 0, 1, 1), box(1.2, 0, 2.2, 1)])
+
+        at_zero = series.invalid_coverage_edges(gap_width=0).to_geopandas()
+        at_threshold = series.invalid_coverage_edges(gap_width=0.2).to_geopandas()
+
+        assert all(geometry.is_empty for geometry in at_zero)
+        assert all(not geometry.is_empty for geometry in at_threshold)
+        assert series.is_valid_coverage(gap_width=0) is True
+        assert series.is_valid_coverage(gap_width=0.2) is False
+
+    @pytest.mark.parametrize("null_position", [0, 1])
+    def test_coverage_validation_preserves_null_position_and_index(self, null_position):
+        geometries = [box(0, 0, 1, 1), box(0.5, 0, 1.5, 1)]
+        geometries.insert(null_position, None)
+        index = pd.MultiIndex.from_tuples(
+            [("duplicate", 7)] * 3,
+            names=["group", "feature_id"],
+        )
+        source_frame = self.spark.createDataFrame(
+            [
+                (geometry.wkt if geometry is not None else None, "duplicate", 7)
+                for geometry in geometries
+            ],
+            "wkt string, group string, feature_id long",
+        ).select(
+            "group",
+            "feature_id",
+            stc.ST_GeomFromWKT("wkt").alias("source_geometry"),
+        )
+        source = GeoSeries(
+            source_frame.pandas_api(index_col=["group", "feature_id"])[
+                "source_geometry"
+            ],
+            crs="EPSG:3857",
+        )
+
+        result = source.invalid_coverage_edges()
+        actual = result.to_geopandas()
+
+        assert actual.name is None
+        assert actual.crs == source.crs
+        pd.testing.assert_index_equal(actual.index, index)
+        assert actual.iloc[null_position] is None
+        assert all(geometry is None or not geometry.is_empty for geometry in actual)
+        srids = {
+            row.srid
+            for row in result._internal.spark_frame.select(
+                stf.ST_SRID(result.spark.column).alias("srid")
+            )
+            .where(F.col("srid").isNotNull())
+            .collect()
+        }
+        assert srids == {3857}
+
+    def test_coverage_validation_preserves_multiplied_alignment_rows(self):
+        index = pd.Index(["duplicate", "duplicate"], name="feature")
+        left = GeoSeries(
+            [box(0, 0, 2, 2), box(10, 0, 12, 2)],
+            index=index,
+        )
+        right = GeoSeries(
+            [
+                MultiPolygon([box(0, 0, 2, 2), box(10, 0, 12, 2)]),
+                MultiPolygon([box(0, 0, 1, 2), box(10, 0, 11, 2)]),
+                box(20, 0, 21, 1),
+            ],
+            index=pd.Index(["duplicate", "duplicate", "right-only"], name="feature"),
+        )
+        multiplied = left.intersection(right)
+        old_order = [
+            row.order
+            for row in multiplied._internal.spark_frame.select(
+                F.col(NATURAL_ORDER_COLUMN_NAME).alias("order")
+            ).collect()
+        ]
+        assert len(set(old_order)) < len(old_order)
+        assert any(order is None for order in old_order)
+
+        targets = multiplied.to_geopandas()
+        actual = multiplied.invalid_coverage_edges().to_geopandas()
+
+        assert len(actual) == 5
+        pd.testing.assert_index_equal(
+            actual.index.sort_values(), targets.index.sort_values()
+        )
+        assert actual.loc["right-only"] is None
+        remaining_edges = list(actual.loc["duplicate"])
+        for target in targets.loc["duplicate"]:
+            matching_edge = next(
+                (
+                    position
+                    for position, edge in enumerate(remaining_edges)
+                    if not edge.is_empty and target.boundary.covers(edge)
+                ),
+                None,
+            )
+            assert matching_edge is not None
+            remaining_edges.pop(matching_edge)
+        assert remaining_edges == []
+
+    def test_coverage_validation_handles_polygonal_collections_and_ignored_rows(self):
+        series = GeoSeries(
+            [
+                GeometryCollection([box(0, 0, 1, 1)]),
+                box(0.5, 0, 1.5, 1),
+                Polygon(),
+                Point(0.5, 0.5),
+                LineString([(0, 0), (1, 1)]),
+                GeometryCollection(),
+                None,
+            ]
+        )
+
+        actual = series.invalid_coverage_edges().to_geopandas()
+
+        assert not actual.iloc[0].is_empty
+        assert not actual.iloc[1].is_empty
+        assert all(
+            geometry.geom_type == "LineString" and geometry.is_empty
+            for geometry in actual.iloc[2:6]
+        )
+        assert actual.iloc[6] is None
+        assert series.is_valid_coverage() is False
+
+    @pytest.mark.parametrize("gap_width", [None, "1", [1], np.array([0.2])])
+    def test_coverage_validation_rejects_non_scalar_gap_width(self, gap_width):
+        series = GeoSeries([box(0, 0, 1, 1)])
+
+        with pytest.raises(TypeError, match="numeric scalar"):
+            series.invalid_coverage_edges(gap_width=gap_width)
+        with pytest.raises(TypeError, match="numeric scalar"):
+            series.is_valid_coverage(gap_width=gap_width)
+
+    @pytest.mark.parametrize(
+        "gap_width", [-1, float("nan"), float("inf"), float("-inf")]
+    )
+    def test_coverage_validation_rejects_invalid_gap_width(self, gap_width):
+        series = GeoSeries([box(0, 0, 1, 1)])
+
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            series.invalid_coverage_edges(gap_width=gap_width)
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            series.is_valid_coverage(gap_width=gap_width)
+
+    @pytest.mark.parametrize("gap_width", [True, np.int64(0), np.float64(0.0)])
+    def test_coverage_validation_accepts_numeric_scalars(self, gap_width):
+        series = GeoSeries([box(0, 0, 1, 1)])
+
+        assert series.is_valid_coverage(gap_width=gap_width) is True
+
+    def test_coverage_validation_plan_is_native_and_lazy(self, monkeypatch):
+        series = GeoSeries([box(0, 0, 1, 1), box(0.5, 0, 1.5, 1)])
+        spark_dataframe_type = type(series._internal.spark_frame)
+
+        def unexpected_driver_collection(*args, **kwargs):
+            raise AssertionError("coverage construction must stay distributed")
+
+        monkeypatch.setattr(
+            spark_dataframe_type, "collect", unexpected_driver_collection
+        )
+        monkeypatch.setattr(
+            spark_dataframe_type, "toPandas", unexpected_driver_collection
+        )
+
+        result = series.invalid_coverage_edges()
+        plan = (
+            result._internal.spark_frame._jdf.queryExecution().executedPlan().toString()
+        )
+
+        assert "DistanceJoin" in plan or "BroadcastIndexJoin" in plan
+        assert "ST_DWithin" in plan
+        assert "CartesianProduct" not in plan
+        assert "BatchEvalPython" not in plan
+        assert "ArrowEvalPython" not in plan
+        assert "PythonUDF" not in plan
+
+    def test_is_valid_coverage_uses_one_summary_action(self, monkeypatch):
+        series = GeoSeries([box(0, 0, 1, 1), box(0.5, 0, 1.5, 1)])
+        spark_dataframe_type = type(series._internal.spark_frame)
+        original_first = spark_dataframe_type.first
+        action_count = 0
+
+        def counting_first(frame):
+            nonlocal action_count
+            action_count += 1
+            return original_first(frame)
+
+        monkeypatch.setattr(spark_dataframe_type, "first", counting_first)
+
+        result = series.invalid_coverage_edges()
+        assert action_count == 0
+        assert result is not None
+        assert series.is_valid_coverage() is False
+        assert action_count == 1
+
+    def test_coverage_validation_survives_shuffled_distributed_plan(self):
+        row_count = 10_004
+        left_rows = self.spark.range(row_count, numPartitions=8).repartition(8, "id")
+        right_rows = self.spark.range(row_count, numPartitions=7).repartition(7, "id")
+        source_rows = (
+            left_rows.alias("left")
+            .hint("shuffle_hash")
+            .join(
+                right_rows.alias("right").hint("shuffle_hash"),
+                F.col("left.id") == F.col("right.id"),
+                "inner",
+            )
+            .select(F.col("left.id").alias("id"))
+            .groupBy("id")
+            .count()
+            .drop("count")
+            .repartition(8, "id")
+        )
+        row_id = F.col("id")
+        block_x = F.floor(row_id / F.lit(4)).cast("double") * F.lit(10.0)
+        row_kind = row_id % F.lit(4)
+        left_polygon = stc.ST_PolygonFromEnvelope(
+            block_x, F.lit(0.0), block_x + F.lit(1.0), F.lit(1.0)
+        )
+        right_polygon = stc.ST_PolygonFromEnvelope(
+            block_x + F.lit(0.5),
+            F.lit(0.0),
+            block_x + F.lit(1.5),
+            F.lit(1.0),
+        )
+        geometry = (
+            F.when(row_kind == 0, left_polygon)
+            .when(row_kind == 1, stc.ST_Point(block_x, F.lit(0.5)))
+            .when(row_kind == 2, F.lit(None))
+            .otherwise(right_polygon)
+        )
+        source_frame = source_rows.select(
+            row_id,
+            geometry.alias("geometry"),
+        )
+        source = GeoSeries(source_frame.pandas_api(index_col="id")["geometry"])
+
+        actual = source.invalid_coverage_edges().to_geopandas().sort_index()
+
+        assert len(actual) == row_count
+        expected_index = pd.Index(
+            np.arange(row_count, dtype=np.int64),
+            name="id",
+        )
+        pd.testing.assert_index_equal(actual.index, expected_index)
+        for source_id, geometry in actual.items():
+            if source_id % 4 == 2:
+                assert geometry is None
+            elif source_id % 4 == 1:
+                assert geometry.is_empty
+            else:
+                assert not geometry.is_empty
+
+    def test_coverage_validation_preserves_map_index(self):
+        row_id = F.col("id")
+        block_x = F.floor(row_id / F.lit(2)).cast("double") * F.lit(10.0)
+        geometry = F.when(
+            row_id % F.lit(2) == 0,
+            stc.ST_PolygonFromEnvelope(
+                block_x, F.lit(0.0), block_x + F.lit(1.0), F.lit(1.0)
+            ),
+        ).otherwise(
+            stc.ST_PolygonFromEnvelope(
+                block_x + F.lit(0.5),
+                F.lit(0.0),
+                block_x + F.lit(1.5),
+                F.lit(1.0),
+            )
+        )
+        source_frame = self.spark.range(4, numPartitions=2).select(
+            F.create_map(F.lit("id"), row_id).alias("feature"),
+            geometry.alias("geometry"),
+        )
+        source = GeoSeries(source_frame.pandas_api(index_col="feature")["geometry"])
+
+        result = source.invalid_coverage_edges()
+        actual = result._internal.spark_frame.select(
+            result._internal.index_spark_columns[0].alias("feature"),
+            stf.ST_IsEmpty(result.spark.column).alias("is_empty"),
+        ).collect()
+
+        assert sorted((row.feature["id"], row.is_empty) for row in actual) == [
+            (0, False),
+            (1, False),
+            (2, False),
+            (3, False),
+        ]
+
+    def test_coverage_validation_preserves_sequence_index_lineage(self):
+        row_count = 1_000
+        rows = self.spark.range(row_count, numPartitions=8)
+        row_id = F.col("id")
+        block_x = F.floor(row_id / F.lit(2)).cast("double") * F.lit(10.0)
+        geometry = F.when(
+            row_id % F.lit(2) == 0,
+            stc.ST_PolygonFromEnvelope(
+                block_x, F.lit(0.0), block_x + F.lit(1.0), F.lit(1.0)
+            ),
+        ).otherwise(
+            stc.ST_PolygonFromEnvelope(
+                block_x + F.lit(0.5),
+                F.lit(0.0),
+                block_x + F.lit(1.5),
+                F.lit(1.0),
+            )
+        )
+        source_frame = rows.select(geometry.alias("geometry"))
+        with ps.option_context("compute.default_index_type", "sequence"):
+            source = GeoSeries(source_frame.pandas_api()["geometry"])
+
+        targets = source.to_geopandas().sort_index()
+        actual = source.invalid_coverage_edges().to_geopandas().sort_index()
+
+        pd.testing.assert_index_equal(actual.index, targets.index)
+        assert len(actual) == row_count
+        assert all(
+            not edge.is_empty and target.boundary.covers(edge)
+            for target, edge in zip(targets, actual)
+        )
+
+    def test_coverage_validation_preserves_generated_distributed_sequence_index(self):
+        row_count = 200
+        num_partitions = 4
+        partition_size = row_count // num_partitions
+
+        def rotate_for_stage(rows):
+            rows = list(rows)
+            if rows:
+                shift = (TaskContext.get().stageId() + 1) % len(rows)
+                rows = rows[shift:] + rows[:shift]
+            return iter(rows)
+
+        row_ids = self.spark.sparkContext.parallelize(
+            range(row_count), num_partitions
+        ).mapPartitions(rotate_for_stage)
+        rows = self.spark.createDataFrame(
+            row_ids.map(lambda row_id: (row_id,)), "id long"
+        )
+        x = F.col("id").cast("double") * F.lit(3.0)
+        is_polygon = F.pmod(F.col("id"), F.lit(partition_size)) < F.lit(
+            partition_size // 2
+        )
+        geometry = F.when(
+            is_polygon,
+            stc.ST_PolygonFromEnvelope(x, F.lit(0.0), x + F.lit(1.0), F.lit(1.0)),
+        ).otherwise(stc.ST_Point(x, F.lit(0.0)))
+        source_frame = rows.select(geometry.alias("geometry"))
+
+        with ps.option_context("compute.default_index_type", "distributed-sequence"):
+            source = GeoSeries(source_frame.pandas_api()["geometry"])
+
+        result = source.invalid_coverage_edges()
+        index_column = result._internal.index_spark_columns[0]
+        indexes = [
+            row["generated_index"]
+            for row in result._internal.spark_frame.select(
+                index_column.alias("generated_index")
+            ).collect()
+        ]
+
+        assert len(indexes) == row_count
+        assert sorted(indexes) == list(range(row_count))
+
     def test_non_geom_fails(self):
         with pytest.raises(TypeError):
             GeoSeries([0, 1, 2])
@@ -89,6 +677,127 @@ class TestGeoSeries(TestGeopandasBase):
     def test_constructor(self, obj):
         sgpd_series = sgpd.GeoSeries(obj)
         assert isinstance(sgpd_series, sgpd.GeoSeries)
+
+    @pytest.mark.parametrize(
+        "wrap",
+        [list, tuple, np.asarray, pd.Series, gpd.GeoSeries, gpd.array.from_shapely],
+        ids=["list", "tuple", "numpy", "pandas", "geopandas", "geometry_array"],
+    )
+    def test_constructor_leading_null_local_inputs(self, wrap):
+        from geopandas.testing import assert_geoseries_equal
+
+        _ = self.spark
+        values = [None, Point(1, 0), None, Point()]
+        result = GeoSeries(wrap(values))
+
+        assert_geoseries_equal(
+            result.to_geopandas(), gpd.GeoSeries(values), check_index_type=False
+        )
+        assert result.crs is None
+
+    @pytest.mark.parametrize(
+        "missing", [None, np.nan, pd.NA, pd.NaT, np.datetime64("NaT")]
+    )
+    def test_constructor_leading_missing_values(self, missing):
+        from geopandas.testing import assert_geoseries_equal
+
+        _ = self.spark
+        result = GeoSeries([missing, Point(1, 0), missing])
+
+        assert_geoseries_equal(
+            result.to_geopandas(),
+            gpd.GeoSeries([None, Point(1, 0), None]),
+            check_index_type=False,
+        )
+
+    @pytest.mark.parametrize(
+        "name, inherited_crs, crs",
+        [
+            (None, None, None),
+            ("geometry", "EPSG:4326", None),
+            (("geometry", "shape"), "EPSG:4326", "EPSG:3857"),
+        ],
+    )
+    def test_constructor_leading_null_metadata(self, name, inherited_crs, crs):
+        from geopandas.testing import assert_geoseries_equal
+
+        _ = self.spark
+        index = pd.MultiIndex.from_tuples(
+            [("b", 2), ("a", 1), ("b", 2)], names=["letter", "number"]
+        )
+        values = [None, Point(1, 0, 2), Point(3, 4)]
+        local = gpd.GeoSeries(values, index=index, name=name, crs=inherited_crs)
+        result = GeoSeries(local, crs=crs)
+        expected = gpd.GeoSeries(
+            values, index=index, name=name, crs=crs or inherited_crs
+        )
+
+        assert result.name == name
+        assert_geoseries_equal(result.to_geopandas(), expected)
+        assert_geoseries_equal(
+            local, gpd.GeoSeries(values, index=index, name=name, crs=inherited_crs)
+        )
+
+    @pytest.mark.parametrize("values", [[], [None, None], [Point(1, 0), None]])
+    def test_constructor_null_and_empty_controls(self, values):
+        from geopandas.testing import assert_geoseries_equal
+
+        _ = self.spark
+        assert_geoseries_equal(
+            GeoSeries(values).to_geopandas(),
+            gpd.GeoSeries(values),
+            check_index_type=False,
+        )
+
+    @pytest.mark.parametrize(
+        "wkt",
+        [
+            "POINT Z EMPTY",
+            "LINESTRING Z EMPTY",
+            "POLYGON Z EMPTY",
+            "POINT Z (1 2 NaN)",
+            "POINT Z (1 2 3)",
+            "POINT (1 2)",
+        ],
+    )
+    def test_constructor_leading_null_preserves_declared_dimensions(self, wkt):
+        import shapely
+
+        if not hasattr(shapely, "geos_version") or shapely.geos_version < (3, 12, 0):
+            pytest.skip("Declared NaN Z requires GEOS 3.12 or newer")
+        _ = self.spark
+        geometry = shapely.from_wkt(wkt)
+        local = gpd.GeoSeries(
+            [None, geometry, None, Point(4, 5)],
+            index=pd.Index([9, 2, 9, 1], name="row"),
+            name="shape",
+        )
+        result = GeoSeries(local).to_geopandas()
+        pd.testing.assert_index_equal(result.index, local.index)
+        assert result.name == local.name
+        assert result.iloc[0] is None and result.iloc[2] is None
+        assert shapely.get_coordinate_dimension(
+            result.iloc[1]
+        ) == shapely.get_coordinate_dimension(geometry)
+        assert result.iloc[1].is_empty == geometry.is_empty
+        assert result.iloc[3].equals(Point(4, 5))
+        if not geometry.is_empty:
+            assert result.iloc[1].x == geometry.x and result.iloc[1].y == geometry.y
+
+    def test_constructor_leading_null_preserves_embedded_srid(self):
+        from shapely import wkb
+        from sedona.spark.sql.types import GeometryType
+
+        _ = self.spark
+        point = wkb.loads(wkb.dumps(Point(1, 2, 3), srid=4326))
+        result = GeoSeries([None, point])
+
+        assert result.spark.data_type == GeometryType()
+        assert result.crs is None
+        assert result.spark.transform(stf.ST_SRID).to_pandas().dropna().tolist() == [
+            4326
+        ]
+        assert result.spark.transform(stf.ST_Z).to_pandas().dropna().tolist() == [3]
 
     def test_constructor_pandas_on_spark(self):
         obj = ps.Series([Point(x, x) for x in range(3)])
@@ -134,6 +843,14 @@ class TestGeoSeries(TestGeopandasBase):
 
         # This is challenging to support due to gdf.__setitem__ casting GeoSeries into pspd.Series
         # assert gdf.has_sindex
+
+    def test_renamed_series_sindex_uses_resolved_physical_column(self):
+        series = GeoSeries([Point(x, x) for x in range(5)], name="source")
+        series.rename("geometry", inplace=True)
+
+        result = series.sindex.query(box(1, 1, 3, 3))
+
+        assert result == [Point(1, 1), Point(2, 2), Point(3, 3)]
 
     def test_invalidate_sindex(self):
         geoseries = GeoSeries([Point(0, 0), None, Point(2, 2)])
@@ -291,6 +1008,37 @@ class TestGeoSeries(TestGeopandasBase):
         expected = gpd.GeoSeries([Point(1, 1), Point(2, 2), Point(3, 3)])
         self.check_sgpd_equals_gpd(s, expected)
 
+    @pytest.mark.parametrize(
+        "constructor,value",
+        [
+            (GeoSeries.from_wkt, "POINT (1 1)"),
+            (GeoSeries.from_wkb, Point(1, 1).wkb),
+        ],
+        ids=["wkt", "wkb"],
+    )
+    def test_wkt_wkb_keyword_arguments(self, constructor, value):
+        assert constructor([value], name="geom").name == "geom"
+        with pytest.raises(
+            TypeError, match="Unsupported GeoSeries.from_wk[tb] arguments: dtype"
+        ):
+            constructor([value], dtype="geometry")
+
+    @pytest.mark.parametrize(
+        "constructor,value",
+        [
+            (GeoSeries.from_wkt, "POINT (1 1)"),
+            (GeoSeries.from_wkb, Point(1, 1).wkb),
+        ],
+        ids=["wkt", "wkb"],
+    )
+    def test_wkt_wkb_from_renamed_pandas_on_spark_series(self, constructor, value):
+        source = ps.Series([value], name="source")
+        source.rename("renamed", inplace=True)
+
+        result = constructor(source)
+
+        assert result.to_geopandas().iloc[0] == Point(1, 1)
+
     def test_from_xy(self):
         x = [2.5, 5, -3.0]
         y = [0.5, 1, 1.5]
@@ -358,6 +1106,11 @@ class TestGeoSeries(TestGeopandasBase):
             ]
         )
         self.check_sgpd_equals_gpd(result, expected)
+
+        numeric_name = sgpd.GeoSeries(gpd.GeoSeries([Point(1, 1), None], name=0))
+        numeric_name_result = numeric_name.fillna(Point(0, 0))
+        numeric_name_expected = gpd.GeoSeries([Point(1, 1), Point(0, 0)], name=0)
+        self.check_sgpd_equals_gpd(numeric_name_result, numeric_name_expected)
         result = s.fillna(Polygon([(0, 1), (2, 1), (1, 2)]))
         expected = gpd.GeoSeries(
             [
@@ -403,8 +1156,966 @@ class TestGeoSeries(TestGeopandasBase):
         expected = gpd.GeoSeries([Point(0, 0), GeometryCollection()], name="geometry")
         self.check_sgpd_equals_gpd(result, expected)
 
-    def test_explode(self):
-        pass
+    def test_fillna_series_replacement_preserves_nulls(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        index = pd.Index(["a", "b"], name="feature_id")
+        source = GeoSeries(
+            [None, None],
+            index=index,
+            name="geometry",
+            crs="EPSG:4326",
+        )
+        replacement = gpd.GeoSeries(
+            [Point(1, 1), None],
+            index=index,
+            crs="EPSG:3857",
+        )
+        replacement = GeoSeries(replacement)
+        expected = gpd.GeoSeries(
+            [Point(1, 1), None],
+            index=index,
+            name="geometry",
+            crs="EPSG:4326",
+        )
+
+        result = source.fillna(replacement)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    def test_fillna_series_replacement_preserves_left_axis(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        left_index = pd.Index([3, 2, 1, 0], name="feature_id")
+        source = GeoSeries(
+            [Point(7, 7), None, None, None],
+            index=left_index,
+            name="geometry",
+            crs="EPSG:4326",
+        )
+        replacement = gpd.GeoSeries(
+            [Point(3, 3), None, Point(4, 4), Point(99, 99)],
+            index=pd.Index([1, 2, 3, 99], name="other_id"),
+            crs="EPSG:3857",
+        )
+        replacement = GeoSeries(replacement)
+        expected = gpd.GeoSeries(
+            [Point(7, 7), None, Point(3, 3), None],
+            index=left_index,
+            name="geometry",
+            crs="EPSG:4326",
+        )
+
+        result = source.fillna(replacement)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    def test_fillna_series_replacement_uses_left_crs_for_embedded_srid(self):
+        source = GeoSeries([None], crs="EPSG:4326")
+        replacement = GeoSeries([Point(1, 1)], crs="EPSG:3857")
+
+        result = source.fillna(replacement)
+        embedded_srid = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).first()["srid"]
+        expected = gpd.GeoSeries([Point(1, 1)], crs="EPSG:4326").to_crs(3857)
+
+        assert result.crs.to_epsg() == 4326
+        assert embedded_srid == 4326
+        self.check_sgpd_equals_gpd(result.to_crs(3857), expected)
+
+    @pytest.mark.parametrize(
+        ("left_index", "right_index"),
+        [
+            (
+                pd.Index(["y", "x", "x"], name="feature_id"),
+                pd.Index(["y", "x", "x"], name="feature_id"),
+            ),
+            (
+                pd.Index([0, 1, 1], name="feature_id"),
+                pd.Index([0.0, 1.0, 1.0], name="feature_id"),
+            ),
+        ],
+    )
+    def test_fillna_series_replacement_pairs_equal_duplicate_indexes_positionally(
+        self, left_index, right_index
+    ):
+        from geopandas.testing import assert_geoseries_equal
+
+        source = GeoSeries([Point(7, 7), None, None], index=left_index)
+        replacement = GeoSeries(
+            [Point(8, 8), Point(1, 1), Point(2, 2)],
+            index=right_index,
+        )
+        expected = gpd.GeoSeries(
+            [Point(7, 7), Point(1, 1), Point(2, 2)],
+            index=left_index,
+        )
+
+        result = source.fillna(replacement)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize(
+        ("left_index", "right_index"),
+        [
+            (
+                pd.Index(["a", "a"], dtype=object),
+                pd.Index(["a", "a"], dtype="string"),
+            ),
+            (
+                pd.Index([1, 1], dtype="int64"),
+                pd.Index([1, 1], dtype="Int64"),
+            ),
+            (
+                pd.Index([Decimal("0.1"), Decimal("0.1")], dtype=object),
+                pd.Index([0.1, 0.1], dtype="float64"),
+            ),
+        ],
+    )
+    def test_fillna_series_replacement_rejects_duplicate_index_dtype_mismatch(
+        self, left_index, right_index
+    ):
+        source = GeoSeries([None, None], index=left_index)
+        replacement = GeoSeries(
+            [Point(1, 1), Point(2, 2)],
+            index=right_index,
+        )
+
+        result = source.fillna(replacement)
+        with pytest.raises(
+            Exception, match="cannot reindex on an axis with duplicate labels"
+        ):
+            result.to_geopandas()
+
+    def test_fillna_series_replacement_does_not_coerce_decimal_to_float_index(self):
+        source = GeoSeries([None], index=pd.Index([Decimal("0.1")], dtype=object))
+        replacement = GeoSeries([Point(1, 1)], index=pd.Index([0.1]))
+
+        result = source.fillna(replacement).to_geopandas()
+
+        assert result.iloc[0] is None
+
+    def test_fillna_series_replacement_broadcasts_unique_index_to_duplicate_left(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        source = GeoSeries([None, None, None], index=pd.Index([1, 1, 2]))
+        replacement = GeoSeries(
+            [Point(1, 1), Point(2, 2)],
+            index=pd.Index([1, 2]),
+        )
+        expected = gpd.GeoSeries(
+            [Point(1, 1), Point(1, 1), Point(2, 2)],
+            index=pd.Index([1, 1, 2]),
+        )
+
+        result = source.fillna(replacement)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize(
+        ("left_index", "right_index"),
+        [
+            (pd.Index([1]), pd.Index(["1"])),
+            (pd.Index(["1"]), pd.Index([1])),
+        ],
+    )
+    def test_fillna_series_replacement_does_not_match_numeric_and_string_keys(
+        self, left_index, right_index
+    ):
+        source = GeoSeries([None], index=left_index)
+        replacement = GeoSeries([Point(1, 1)], index=right_index)
+
+        result = source.fillna(replacement).to_geopandas()
+
+        assert result.iloc[0] is None
+
+    def test_fillna_series_replacement_matches_null_keys_positionally(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        left_index = pd.Index([None], dtype=object, name="feature_id")
+        right_index = pd.Index([np.nan], dtype="float64", name="replacement_id")
+        source = GeoSeries([None], index=left_index, name="geometry")
+        replacement = GeoSeries([Point(1, 1)], index=right_index)
+        expected = gpd.GeoSeries([None], index=left_index, name="geometry").fillna(
+            gpd.GeoSeries([Point(1, 1)], index=right_index)
+        )
+
+        assert_geoseries_equal(
+            source.fillna(replacement).to_geopandas(),
+            expected,
+            check_index_type=False,
+        )
+
+    def test_fillna_series_replacement_does_not_reindex_null_keys_across_dtypes(
+        self,
+    ):
+        from geopandas.testing import assert_geoseries_equal
+
+        left_index = pd.Index([None, "left-only"], dtype=object, name="feature_id")
+        right_index = pd.Index([1.0, np.nan], dtype="float64", name="replacement_id")
+        source_values = [None, None]
+        replacement_values = [Point(1, 1), Point(2, 2)]
+        source = GeoSeries(source_values, index=left_index, name="geometry")
+        replacement = GeoSeries(replacement_values, index=right_index)
+        expected = gpd.GeoSeries(
+            source_values, index=left_index, name="geometry"
+        ).fillna(gpd.GeoSeries(replacement_values, index=right_index))
+
+        assert expected.isna().all()
+        assert_geoseries_equal(
+            source.fillna(replacement).to_geopandas(),
+            expected,
+            check_index_type=False,
+        )
+
+    @pytest.mark.parametrize(
+        ("left_index", "right_index"),
+        [
+            (pd.Index([2, 1]), pd.Index([1.0, 2.0])),
+            (pd.Index([True]), pd.Index([1])),
+            (
+                pd.DatetimeIndex(["2020-01-02", "2020-01-01"]),
+                pd.Index([date(2020, 1, 1), date(2020, 1, 2)]),
+            ),
+            (
+                pd.Index(["b", "a"], dtype=object),
+                pd.Index(["a", "b"], dtype="string"),
+            ),
+        ],
+    )
+    def test_fillna_series_replacement_matches_compatible_index_keys(
+        self, left_index, right_index
+    ):
+        from geopandas.testing import assert_geoseries_equal
+
+        fill_values = [
+            Point(position, position) for position in range(len(right_index))
+        ]
+        source = GeoSeries([None] * len(left_index), index=left_index)
+        replacement = GeoSeries(fill_values, index=right_index)
+        expected = gpd.GeoSeries([None] * len(left_index), index=left_index).fillna(
+            gpd.GeoSeries(fill_values, index=right_index)
+        )
+
+        result = source.fillna(replacement).to_geopandas()
+
+        assert_geoseries_equal(result, expected, check_index_type=False)
+
+    def test_fillna_series_replacement_does_not_reindex_boolean_as_numeric(self):
+        source = GeoSeries([None, None], index=pd.Index([True, False]))
+        replacement = GeoSeries([Point(0, 0), Point(1, 1)], index=pd.Index([0, 1]))
+
+        result = source.fillna(replacement).to_geopandas()
+
+        assert result.isna().all()
+
+    @pytest.mark.parametrize("multiindex", [False, True])
+    def test_fillna_series_replacement_rejects_nonidentical_duplicate_index(
+        self, multiindex
+    ):
+        if multiindex:
+            source_index = pd.MultiIndex.from_tuples([("a", 1), ("b", 2)])
+            replacement_index = pd.MultiIndex.from_tuples([("a", 1), ("a", 1)])
+            message = "cannot handle a non-unique multi-index!"
+        else:
+            source_index = pd.Index([1, 2])
+            replacement_index = pd.Index([1, 1])
+            message = "cannot reindex on an axis with duplicate labels"
+
+        source = GeoSeries([None, None], index=source_index)
+        replacement = GeoSeries(
+            [Point(1, 1), Point(2, 2)],
+            index=replacement_index,
+        )
+
+        result = source.fillna(replacement)
+        with pytest.raises(Exception, match=message):
+            result.to_geopandas()
+
+    @pytest.mark.parametrize("left_is_multiindex", [False, True])
+    def test_fillna_series_replacement_requires_full_index_shape(
+        self, left_is_multiindex
+    ):
+        from geopandas.testing import assert_geoseries_equal
+
+        single_index = pd.Index(["a", "b"], name="id")
+        multi_index = pd.MultiIndex.from_tuples(
+            [("a", "x"), ("b", "y")], names=["id", "kind"]
+        )
+        left_index = multi_index if left_is_multiindex else single_index
+        right_index = single_index if left_is_multiindex else multi_index
+        source = GeoSeries([None, None], index=left_index)
+        replacement = GeoSeries([Point(1, 1), Point(2, 2)], index=right_index)
+        expected = gpd.GeoSeries([None, None], index=left_index)
+
+        result = source.fillna(replacement)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize("left_is_multiindex", [False, True])
+    def test_fillna_series_replacement_rejects_duplicate_different_index_shape(
+        self, left_is_multiindex
+    ):
+        single_index = pd.Index(["a", "a"], name="id")
+        multi_index = pd.MultiIndex.from_tuples(
+            [("a", "x"), ("a", "x")], names=["id", "kind"]
+        )
+        left_index = (
+            pd.MultiIndex.from_tuples([("a", "x"), ("b", "y")])
+            if left_is_multiindex
+            else pd.Index(["a", "b"])
+        )
+        right_index = single_index if left_is_multiindex else multi_index
+        message = (
+            "cannot reindex on an axis with duplicate labels"
+            if left_is_multiindex
+            else "cannot handle a non-unique multi-index!"
+        )
+        source = GeoSeries([None, None], index=left_index)
+        replacement = GeoSeries([Point(1, 1), Point(2, 2)], index=right_index)
+
+        result = source.fillna(replacement)
+        with pytest.raises(Exception, match=message):
+            result.to_geopandas()
+
+    def test_fillna_series_replacement_uses_full_multiindex_in_left_order(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        left_index = pd.MultiIndex.from_tuples(
+            [("z", 0), ("b", 0), ("a", 0)], names=["group", "row"]
+        )
+        right_index = pd.MultiIndex.from_tuples(
+            [("a", 0), ("b", 0), ("z", 0)],
+            names=["other_group", "other_row"],
+        )
+        source = GeoSeries([Point(7, 7), None, None], index=left_index)
+        replacement = GeoSeries(
+            [Point(1, 1), Point(2, 2), Point(8, 8)], index=right_index
+        )
+        expected = gpd.GeoSeries(
+            [Point(7, 7), Point(2, 2), Point(1, 1)], index=left_index
+        )
+
+        result = source.fillna(replacement)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    def test_fillna_same_anchor_series_is_lazy_and_positional(self, monkeypatch):
+        from geopandas.testing import assert_geoseries_equal
+        from pyspark.sql import DataFrame
+
+        index = pd.Index(["x", "x", "y"], name="feature_id")
+        frame = GeoDataFrame(
+            gpd.GeoDataFrame(
+                {
+                    "geometry": gpd.GeoSeries([Point(7, 7), None, None], index=index),
+                    "replacement": gpd.GeoSeries(
+                        [Point(8, 8), Point(1, 1), Point(2, 2)], index=index
+                    ),
+                },
+                geometry="geometry",
+            )
+        )
+        reversed_sdf = frame._internal.spark_frame.orderBy(
+            F.col(NATURAL_ORDER_COLUMN_NAME).desc()
+        )
+        frame._update_internal_frame(
+            frame._internal.copy(
+                spark_frame=reversed_sdf,
+                index_spark_columns=[
+                    scol_for(reversed_sdf, name)
+                    for name in frame._internal.index_spark_column_names
+                ],
+                data_spark_columns=[
+                    scol_for(reversed_sdf, name)
+                    for name in frame._internal.data_spark_column_names
+                ],
+            )
+        )
+
+        def unexpected_action(*args, **kwargs):
+            raise AssertionError("same-anchor fillna ran a Spark action")
+
+        monkeypatch.setattr(DataFrame, "first", unexpected_action)
+
+        result = frame.geometry.fillna(frame["replacement"])
+        plan = (
+            result._internal.spark_frame._jdf.queryExecution()
+            .optimizedPlan()
+            .toString()
+        )
+        expected = gpd.GeoSeries(
+            [Point(7, 7), Point(1, 1), Point(2, 2)],
+            index=index,
+            name="geometry",
+        )
+
+        assert "Join" not in plan
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize("value", [Point(9, 9), None])
+    def test_fillna_limit_scalar_uses_natural_order(self, value):
+        from geopandas.testing import assert_geoseries_equal
+
+        polygon = Polygon([(0, 0), (1, 0), (0, 1)])
+        source = GeoSeries(
+            GeoSeries(
+                [polygon, None, None, GeometryCollection(), None],
+                name="geometry",
+                crs="EPSG:4326",
+            ).sort_index(ascending=False)
+        )
+        result = source.fillna(value, limit=2).to_geopandas()
+        replacement = Point(9, 9) if value is not None else GeometryCollection()
+        expected = gpd.GeoSeries(
+            [replacement, GeometryCollection(), replacement, None, polygon],
+            index=[4, 3, 2, 1, 0],
+            name="geometry",
+            crs="EPSG:4326",
+        )
+
+        assert_geoseries_equal(result, expected, check_index_type=False)
+
+    @pytest.mark.parametrize("local_fill_values", [False, True])
+    def test_fillna_limit_counts_missing_aligned_values(self, local_fill_values):
+        from geopandas.testing import assert_geoseries_equal
+
+        source = GeoSeries(
+            GeoSeries(
+                [Point(7, 7), None, None, None],
+                name="geometry",
+                crs="EPSG:4326",
+            ).sort_index(ascending=False)
+        )
+        fill_values = gpd.GeoSeries(
+            [Point(3, 3), None, Point(4, 4), Point(99, 99)],
+            index=[1, 2, 3, 99],
+            crs="EPSG:4326",
+        )
+        if not local_fill_values:
+            fill_values = GeoSeries(fill_values)
+
+        result = source.fillna(fill_values, limit=2)
+        expected = gpd.GeoSeries(
+            [Point(4, 4), None, None, Point(7, 7)],
+            index=[3, 2, 1, 0],
+            name="geometry",
+            crs="EPSG:4326",
+        )
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize("local_fill_values", [False, True])
+    def test_fillna_limit_series_replacement_uses_left_crs_for_embedded_srid(
+        self, local_fill_values
+    ):
+        source = GeoSeries([None], crs="EPSG:4326")
+        fill_values = gpd.GeoSeries([Point(1, 1)], crs="EPSG:3857")
+        if not local_fill_values:
+            fill_values = GeoSeries(fill_values)
+
+        result = source.fillna(fill_values, limit=1)
+        embedded_srid = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).first()["srid"]
+        expected = gpd.GeoSeries([Point(1, 1)], crs="EPSG:4326").to_crs(3857)
+
+        assert result.crs.to_epsg() == 4326
+        assert embedded_srid == 4326
+        self.check_sgpd_equals_gpd(result.to_crs(3857), expected)
+
+    @pytest.mark.parametrize("limit", [None, 1])
+    def test_fillna_scalar_replacement_uses_left_crs_for_embedded_srid(self, limit):
+        source = GeoSeries([Point(0, 0), None], crs="EPSG:4326")
+
+        result = source.fillna(Point(1, 1), limit=limit)
+        embedded_srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        expected = gpd.GeoSeries([Point(0, 0), Point(1, 1)], crs="EPSG:4326").to_crs(
+            3857
+        )
+
+        assert result.crs.to_epsg() == 4326
+        assert [row["srid"] for row in embedded_srids] == [4326, 4326]
+        self.check_sgpd_equals_gpd(result.to_crs(3857), expected)
+
+    def test_fillna_limit_pairs_equal_duplicate_indexes_positionally(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        index = ["y", "x", "x"]
+        source = GeoSeries([Point(7, 7), None, None], index=index)
+        fill_values = GeoSeries([Point(8, 8), Point(1, 1), Point(2, 2)], index=index)
+
+        result = source.fillna(fill_values, limit=1)
+        expected = gpd.GeoSeries([Point(7, 7), Point(1, 1), None], index=index)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize("local_fill_values", [False, True])
+    def test_fillna_limit_does_not_coerce_decimal_to_float_index(
+        self, local_fill_values
+    ):
+        source = GeoSeries([None], index=pd.Index([Decimal("0.1")], dtype=object))
+        fill_values = gpd.GeoSeries([Point(1, 1)], index=pd.Index([0.1]))
+        if not local_fill_values:
+            fill_values = GeoSeries(fill_values)
+
+        result = source.fillna(fill_values, limit=1).to_geopandas()
+
+        assert result.iloc[0] is None
+
+    def test_fillna_limit_matches_null_keys_positionally(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        left_index = pd.Index([None], dtype=object, name="feature_id")
+        right_index = pd.Index([np.nan], dtype="float64", name="replacement_id")
+        source = GeoSeries([None], index=left_index, name="geometry")
+        fill_values = GeoSeries([Point(1, 1)], index=right_index)
+        expected = gpd.GeoSeries([Point(1, 1)], index=left_index, name="geometry")
+
+        assert_geoseries_equal(
+            source.fillna(fill_values, limit=1).to_geopandas(),
+            expected,
+            check_index_type=False,
+        )
+
+    def test_fillna_limit_does_not_reindex_null_keys_across_dtypes(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        left_index = pd.Index([None, "left-only"], dtype=object, name="feature_id")
+        right_index = pd.Index([1.0, np.nan], dtype="float64", name="replacement_id")
+        source_values = [None, None]
+        replacement_values = [Point(1, 1), Point(2, 2)]
+        source = GeoSeries(source_values, index=left_index, name="geometry")
+        fill_values = GeoSeries(replacement_values, index=right_index)
+        expected = gpd.GeoSeries(source_values, index=left_index, name="geometry")
+
+        assert expected.isna().all()
+        assert_geoseries_equal(
+            source.fillna(fill_values, limit=1).to_geopandas(),
+            expected,
+            check_index_type=False,
+        )
+
+    def test_fillna_limit_uses_left_order_with_multiindex(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        source_index = pd.MultiIndex.from_tuples(
+            [("z", 0), ("b", 0), ("a", 0)], names=["group", "row"]
+        )
+        fill_index = pd.MultiIndex.from_tuples(
+            [("a", 0), ("b", 0), ("z", 0)], names=["other_group", "other_row"]
+        )
+        source = GeoSeries([Point(7, 7), None, None], index=source_index)
+        fill_values = GeoSeries(
+            [Point(1, 1), Point(2, 2), Point(8, 8)], index=fill_index
+        )
+
+        result = source.fillna(fill_values, limit=1)
+        expected = gpd.GeoSeries([Point(7, 7), Point(2, 2), None], index=source_index)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize("left_is_multiindex", [False, True])
+    def test_fillna_limit_requires_full_index_shape(self, left_is_multiindex):
+        from geopandas.testing import assert_geoseries_equal
+
+        single_index = pd.Index(["a", "b"], name="id")
+        multi_index = pd.MultiIndex.from_tuples(
+            [("a", "x"), ("b", "y")], names=["id", "kind"]
+        )
+        left_index = multi_index if left_is_multiindex else single_index
+        right_index = single_index if left_is_multiindex else multi_index
+        source = GeoSeries([None, None], index=left_index)
+        fill_values = GeoSeries([Point(1, 1), Point(2, 2)], index=right_index)
+
+        result = source.fillna(fill_values, limit=1)
+        expected = gpd.GeoSeries([None, None], index=left_index)
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize(
+        ("left_index", "right_index", "message"),
+        [
+            (
+                pd.Index([1, 2]),
+                pd.Index([1, 1]),
+                "cannot reindex on an axis with duplicate labels",
+            ),
+            (
+                pd.Index(
+                    [Decimal("0.1"), Decimal("0.1")],
+                    dtype=object,
+                ),
+                pd.Index([0.1, 0.1], dtype="float64"),
+                "cannot reindex on an axis with duplicate labels",
+            ),
+            (
+                pd.MultiIndex.from_tuples([("a", 1), ("b", 2)]),
+                pd.MultiIndex.from_tuples([("a", 1), ("a", 1)]),
+                "cannot handle a non-unique multi-index!",
+            ),
+        ],
+    )
+    def test_fillna_limit_rejects_nonidentical_duplicate_fill_index(
+        self, left_index, right_index, message
+    ):
+        source = GeoSeries([None, None], index=left_index)
+        fill_values = GeoSeries([Point(1, 1), Point(2, 2)], index=right_index)
+
+        result = source.fillna(fill_values, limit=1)
+        with pytest.raises(Exception, match=message):
+            result.to_geopandas()
+
+    def test_fillna_limit_broadcasts_unique_value_to_duplicate_left_index(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        source = GeoSeries([None, None, None], index=[1, 1, 2])
+        fill_values = GeoSeries([Point(1, 1), Point(2, 2)], index=[1, 2])
+
+        result = source.fillna(fill_values, limit=1)
+        expected = gpd.GeoSeries([Point(1, 1), None, None], index=[1, 1, 2])
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize("limit", [None, 1])
+    @pytest.mark.parametrize("duplicate", [False, True])
+    @pytest.mark.parametrize("different_index_shape", [False, True])
+    def test_fillna_independent_series_is_lazy(
+        self, monkeypatch, limit, duplicate, different_index_shape
+    ):
+        source = GeoSeries([None, None], index=[1, 2])
+        dataframe_type = type(source._internal.spark_frame)
+        right_index = (
+            pd.MultiIndex.from_tuples([("a", 1), ("a", 1 if duplicate else 2)])
+            if different_index_shape
+            else pd.Index([1, 1 if duplicate else 2])
+        )
+        replacement = GeoSeries([Point(1, 1), Point(2, 2)], index=right_index)
+
+        def unexpected_action(*args, **kwargs):
+            raise AssertionError("independent fillna triggered a Spark action")
+
+        tracker = self.spark.sparkContext.statusTracker()
+        listener_bus = self.spark.sparkContext._jsc.sc().listenerBus()
+        listener_bus.waitUntilEmpty()
+        jobs_before = set(tracker.getJobIdsForGroup(None))
+        with monkeypatch.context() as actions:
+            for operation in ["count", "collect", "toPandas", "first", "head", "take"]:
+                actions.setattr(dataframe_type, operation, unexpected_action)
+            result = source.fillna(replacement, limit=limit)
+
+        assert isinstance(result, GeoSeries)
+        listener_bus.waitUntilEmpty()
+        assert set(tracker.getJobIdsForGroup(None)) <= jobs_before
+
+    @pytest.mark.parametrize("limit", [None, 1])
+    @pytest.mark.parametrize("left_values", [[], [Point(0, 0)], [None]])
+    @pytest.mark.parametrize("projection", ["geometry", "index", "count"])
+    def test_fillna_duplicate_validation_is_not_pruned(
+        self, limit, left_values, projection
+    ):
+        source = GeoSeries(left_values, index=pd.Index(range(len(left_values))))
+        replacement = GeoSeries([Point(1, 1), None], index=[9, 9])
+
+        result = source.fillna(replacement, limit=limit)
+        frame = result._internal.spark_frame
+        with pytest.raises(
+            Exception, match="cannot reindex on an axis with duplicate labels"
+        ):
+            if projection == "geometry":
+                result.to_geopandas()
+            elif projection == "index":
+                frame.select(*result._internal.index_spark_columns).collect()
+            else:
+                frame.count()
+
+    def test_fillna_inplace_defers_duplicate_validation(self):
+        source = GeoSeries([None], index=[0])
+        replacement = GeoSeries([Point(1, 1), Point(2, 2)], index=[1, 1])
+
+        assert source.fillna(replacement, inplace=True) is None
+        with pytest.raises(
+            Exception,
+            match=r"GeoSeries\.fillna: cannot reindex on an axis with duplicate labels",
+        ):
+            source.to_geopandas()
+
+    def test_fillna_limit_same_anchor_series_is_lazy_and_positional(self, monkeypatch):
+        from geopandas.testing import assert_geoseries_equal
+        from pyspark.sql import DataFrame
+
+        index = pd.Index(["x", "x", "y"], name="feature_id")
+        frame = GeoDataFrame(
+            gpd.GeoDataFrame(
+                {
+                    "geometry": gpd.GeoSeries([Point(7, 7), None, None], index=index),
+                    "replacement": gpd.GeoSeries(
+                        [Point(8, 8), Point(1, 1), Point(2, 2)], index=index
+                    ),
+                },
+                geometry="geometry",
+            )
+        )
+
+        def unexpected_action(*args, **kwargs):
+            raise AssertionError("same-anchor fillna(limit=...) ran a Spark action")
+
+        monkeypatch.setattr(DataFrame, "first", unexpected_action)
+
+        result = frame.geometry.fillna(frame["replacement"], limit=1)
+        plan = (
+            result._internal.spark_frame._jdf.queryExecution()
+            .optimizedPlan()
+            .toString()
+        )
+        expected = gpd.GeoSeries(
+            [Point(7, 7), Point(1, 1), None],
+            index=index,
+            name="geometry",
+        )
+
+        assert "Join" not in plan
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    def test_fillna_limit_inplace(self):
+        from geopandas.testing import assert_geoseries_equal
+
+        result = GeoSeries([None, None, None], name="geometry", crs="EPSG:4326")
+
+        return_value = result.fillna(Point(1, 1), limit=1, inplace=True)
+        expected = gpd.GeoSeries(
+            [Point(1, 1), None, None], name="geometry", crs="EPSG:4326"
+        )
+
+        assert return_value is None
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize("limit", [0, -1, 1.5, "1", True, np.bool_(True)])
+    def test_fillna_limit_validation(self, limit):
+        message = (
+            "Limit must be greater than 0"
+            if isinstance(limit, int) and not isinstance(limit, bool)
+            else "Limit must be an integer"
+        )
+
+        with pytest.raises(ValueError, match=message):
+            GeoSeries([None]).fillna(Point(1, 1), limit=limit)
+
+    @pytest.mark.parametrize("limit", [np.int32(1), np.int64(1), np.uint64(1)])
+    def test_fillna_limit_accepts_numpy_integer(self, limit):
+        from geopandas.testing import assert_geoseries_equal
+
+        result = GeoSeries([None, None]).fillna(Point(1, 1), limit=limit)
+        expected = gpd.GeoSeries([Point(1, 1), None])
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize("limit", [2**63, np.uint64(2**64 - 1)])
+    def test_fillna_limit_accepts_large_integer(self, limit):
+        from geopandas.testing import assert_geoseries_equal
+
+        result = GeoSeries([None, None]).fillna(Point(1, 1), limit=limit)
+        expected = gpd.GeoSeries([Point(1, 1), Point(1, 1)])
+
+        assert_geoseries_equal(result.to_geopandas(), expected, check_index_type=False)
+
+    @pytest.mark.parametrize("adaptive", [False, True])
+    @pytest.mark.parametrize(
+        "replacement_kind",
+        ["scalar", "same_anchor", "independent", "independent_reindexed"],
+    )
+    def test_fillna_limit_does_not_duplicate_input_plan(
+        self, replacement_kind, adaptive
+    ):
+        original_adaptive = self.spark.conf.get("spark.sql.adaptive.enabled")
+        original_broadcast = self.spark.conf.get("spark.sql.autoBroadcastJoinThreshold")
+        original_shuffle_partitions = self.spark.conf.get(
+            "spark.sql.shuffle.partitions"
+        )
+        try:
+            self.spark.conf.set("spark.sql.adaptive.enabled", str(adaptive).lower())
+            # Allow automatic broadcasting of the tiny status row, but not the
+            # 24-row label table. This catches both an explicit status broadcast
+            # and accidentally dropping the non-broadcast status hint.
+            self.spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "64")
+            self.spark.conf.set("spark.sql.shuffle.partitions", "4")
+            self._check_fillna_limit_input_plan(replacement_kind)
+        finally:
+            self.spark.conf.set("spark.sql.adaptive.enabled", original_adaptive)
+            self.spark.conf.set(
+                "spark.sql.autoBroadcastJoinThreshold", original_broadcast
+            )
+            self.spark.conf.set(
+                "spark.sql.shuffle.partitions", original_shuffle_partitions
+            )
+
+    def _check_fillna_limit_input_plan(self, replacement_kind):
+        from geopandas.testing import assert_geoseries_equal
+
+        row_id = F.col("id")
+        replacement_column = F.when(row_id != 4, stc.ST_Point(row_id + 100, F.lit(1)))
+        rows = self.spark.range(24, numPartitions=4).select(
+            row_id,
+            F.when(row_id % 3 == 0, stc.ST_Point(row_id, F.lit(0))).alias("geometry"),
+            replacement_column.alias("replacement"),
+        )
+        frame = GeoDataFrame(rows.pandas_api(index_col="id"), geometry="geometry")
+        expected = gpd.GeoSeries(
+            [Point(i, 0) if i % 3 == 0 else None for i in range(24)],
+            index=pd.Index(range(24), name="id"),
+            name="geometry",
+        )
+        if replacement_kind == "scalar":
+            replacement = expected_replacement = Point(99, 1)
+        else:
+            expected_replacement = gpd.GeoSeries(
+                [Point(i + 100, 1) if i != 4 else None for i in range(24)],
+                index=expected.index,
+            )
+            if replacement_kind == "same_anchor":
+                replacement = frame["replacement"]
+            else:
+                right_index = row_id
+                if replacement_kind == "independent_reindexed":
+                    right_index = (23 - row_id).alias("id")
+                    expected_replacement.index = expected_replacement.index[::-1]
+                replacement_rows = self.spark.range(24, numPartitions=3).select(
+                    right_index, replacement_column.alias("replacement")
+                )
+                replacement = GeoSeries(
+                    replacement_rows.pandas_api(index_col="id")["replacement"]
+                )
+
+        result = frame.geometry.fillna(replacement, limit=5)
+        query = result._internal.spark_frame._jdf.queryExecution()
+        plan = query.optimizedPlan().toString()
+        assert "Union" not in plan
+        if replacement_kind.startswith("independent"):
+            # Validation and filling share an exchange, which is only visible
+            # in the executed plan, not in the logical tree's repeated inputs.
+            result._internal.spark_frame.collect()
+            executed = query.executedPlan()
+            if executed.nodeName() == "AdaptiveSparkPlan":
+                executed = executed.executedPlan()
+            physical = executed.toString()
+            assert physical.count("Range (") == 2
+            assert physical.count("FullOuter") == 1
+            assert "ReusedExchange" in physical
+            assert "Union" not in physical
+            assert "BroadcastExchange" not in physical
+            assert "CartesianProduct" in physical
+            # Only the bounded partial index statistics go to one partition;
+            # the geometry rows and global rank remain distributed.
+            lines = physical.splitlines()
+            for line_number, line in enumerate(lines):
+                if "SinglePartition" in line and "ReusedExchange" not in line:
+                    assert "HashAggregate(keys=[]" in lines[line_number + 1]
+                    assert "partial_" in lines[line_number + 1]
+        else:
+            assert plan.count("Range (") == 1
+            assert "SinglePartition" not in query.executedPlan().toString()
+        assert_geoseries_equal(
+            result.to_geopandas(),
+            expected.fillna(expected_replacement, limit=5),
+            check_index_type=False,
+        )
+
+    def test_fillna_limit_scalar_plan_is_distributed_and_lazy(self, monkeypatch):
+        from pyspark.sql import DataFrame
+
+        source = GeoSeries([Point(0, 0), None, None])
+
+        def unexpected_action(*args, **kwargs):
+            raise AssertionError("scalar fillna(limit=...) triggered a Spark action")
+
+        for operation in ["count", "collect", "toPandas", "first"]:
+            monkeypatch.setattr(DataFrame, operation, unexpected_action)
+
+        result = source.fillna(Point(1, 1), limit=1)
+        plan = (
+            result._internal.spark_frame._jdf.queryExecution().executedPlan().toString()
+        )
+
+        assert "SinglePartition" not in plan
+        assert "PythonUDF" not in plan
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"index_parts": True},
+            {"ignore_index": True},
+            {"ignore_index": True, "index_parts": True},
+        ],
+    )
+    def test_explode(self, kwargs):
+        from geopandas.testing import assert_geoseries_equal
+
+        geometries = [
+            MultiPoint([(0, 0), (1, 1)]),
+            Point(9, 9),
+            GeometryCollection([Point(2, 2), MultiPoint([(3, 3), (4, 4)])]),
+            Point(),
+            Polygon(),
+            MultiPoint(),
+            GeometryCollection(),
+            None,
+        ]
+        index = pd.Index(range(10, 18), name="feature_id")
+        expected = gpd.GeoSeries(
+            geometries,
+            index=index,
+            name="geometry",
+            crs="EPSG:4326",
+        ).explode(**kwargs)
+
+        result = GeoSeries(
+            geometries,
+            index=index,
+            name="geometry",
+            crs="EPSG:4326",
+        ).explode(**kwargs)
+        actual = result.to_geopandas()
+
+        assert_geoseries_equal(
+            actual,
+            expected,
+            check_index_type=False,
+            check_geom_type=True,
+            check_crs=True,
+        )
+        pd.testing.assert_index_equal(actual.index, expected.index, exact=False)
+        pd.testing.assert_series_equal(
+            result.is_empty.to_pandas(), expected.is_empty, check_index_type=False
+        )
+
+        all_empty = GeoSeries(
+            [MultiPoint(), GeometryCollection(), None],
+            crs="EPSG:4326",
+        ).explode(**kwargs)
+        assert all_empty.crs is not None
+        assert all_empty.crs.to_epsg() == 4326
+
+    def test_explode_docstring_examples_are_syntactically_valid(self):
+        import doctest
+
+        examples = doctest.DocTestParser().get_examples(GeoSeries.explode.__doc__)
+        for example in examples:
+            compile(example.source, "<GeoSeries.explode>", "single")
+
+    @pytest.mark.parametrize("name", ["__index_level_1__", "__INDEX_LEVEL_1__"])
+    def test_explode_internal_name_collision(self, name):
+        from geopandas.testing import assert_geoseries_equal
+
+        geometries = [MultiPoint([(0, 0), (1, 1)])]
+        series = GeoSeries(geometries)
+        series.name = name
+        result = series.explode(index_parts=True).to_geopandas()
+        expected = gpd.GeoSeries(geometries, name=name).explode(index_parts=True)
+        assert_geoseries_equal(result, expected, check_index_type=False)
 
     def test_to_crs(self):
         from pyproj import CRS
@@ -449,7 +2160,7 @@ class TestGeoSeries(TestGeopandasBase):
         df_result = geoseries.to_geoframe().bounds
         pd.testing.assert_frame_equal(df_result.to_pandas(), expected)
 
-    def test_total_bounds(self):
+    def test_total_bounds(self, monkeypatch):
         d = [
             Point(3, -1),
             Polygon([(0, 0), (1, 1), (1, 0)]),
@@ -457,17 +2168,220 @@ class TestGeoSeries(TestGeopandasBase):
             None,
         ]
         geoseries = sgpd.GeoSeries(d, crs="EPSG:4326")
+        empty_geoseries = sgpd.GeoSeries([], crs="EPSG:4326")
+        all_empty_geoseries = sgpd.GeoSeries([Point(), Polygon()], crs="EPSG:4326")
+
+        spark_dataframe_type = type(geoseries._internal.spark_frame)
+        original_first = spark_dataframe_type.first
+        action_count = 0
+
+        def counting_first(frame):
+            nonlocal action_count
+            action_count += 1
+            return original_first(frame)
+
+        # Spark 4 uses a classic DataFrame subclass that overrides ``first``.
+        # Patch the runtime class so the assertion works across Spark versions.
+        monkeypatch.setattr(spark_dataframe_type, "first", counting_first)
+
         result = geoseries.total_bounds
         expected = np.array([0.0, -1.0, 3.0, 2.0])
         np.testing.assert_array_equal(result, expected)
+        assert action_count == 1
 
+        action_count = 0
         df_result = geoseries.to_geoframe().total_bounds
         np.testing.assert_array_equal(df_result, expected)
+        assert action_count == 1
+
+        action_count = 0
+        empty_result = empty_geoseries.total_bounds
+        np.testing.assert_array_equal(empty_result, np.full(4, np.nan))
+        assert action_count == 1
+
+        action_count = 0
+        all_empty_result = all_empty_geoseries.total_bounds
+        np.testing.assert_array_equal(all_empty_result, np.full(4, np.nan))
+        assert action_count == 1
+
+    @pytest.mark.parametrize(
+        ("level", "expected"),
+        [
+            (2, [0, 10, 15, 2]),
+            (3, [0, 42, 63, 10]),
+            (16, [0, 2863311530, 4294967295, 715827882]),
+        ],
+    )
+    def test_hilbert_distance(self, level, expected):
+        geometries = [
+            Point(0, 0),
+            Point(1, 1),
+            Point(1, 0),
+            Polygon([(0, 0), (0, 1), (1, 1), (1, 0)]),
+        ]
+        index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 2), ("b", 1), ("b", 2)],
+            names=["group", "feature_id"],
+        )
+        source = GeoSeries(
+            geometries,
+            index=index,
+            name="source_geometry",
+            crs="EPSG:4326",
+        )
+
+        result = source.hilbert_distance(
+            total_bounds=(0, 0, 1, 1),
+            level=level,
+        )
+        pd.testing.assert_series_equal(
+            result.to_pandas(),
+            pd.Series(
+                expected,
+                index=index,
+                name="hilbert_distance",
+                dtype="int64",
+            ),
+            check_index_type=False,
+        )
+
+        # GeoDataFrame delegates to the active geometry column, not to the
+        # first geometry-typed column in the frame.
+        if level == 2:
+            frame = GeoDataFrame(
+                gpd.GeoDataFrame(
+                    {
+                        "decoy": gpd.GeoSeries(
+                            [Point(0, 0)] * len(geometries),
+                            index=index,
+                            crs="EPSG:4326",
+                        ),
+                        "active": gpd.GeoSeries(
+                            geometries,
+                            index=index,
+                            crs="EPSG:4326",
+                        ),
+                    },
+                    index=index,
+                    geometry="active",
+                    crs="EPSG:4326",
+                )
+            )
+            pd.testing.assert_series_equal(
+                frame.hilbert_distance(
+                    total_bounds=(0, 0, 1, 1),
+                    level=level,
+                ).to_pandas(),
+                pd.Series(
+                    expected,
+                    index=index,
+                    name="hilbert_distance",
+                    dtype="int64",
+                ),
+                check_index_type=False,
+            )
+
+    def test_hilbert_distance_uses_envelope_midpoint_extent(self):
+        source = GeoSeries(
+            [box(-100, -100, 100, 100), Point(10, 10)],
+            index=pd.Index(["large", "point"], name="feature"),
+        )
+
+        # The inferred extent is (0, 0, 10, 10), based on envelope
+        # midpoints. It is deliberately different from source.total_bounds.
+        expected = pd.Series(
+            [0, 2863311530],
+            index=pd.Index(["large", "point"], name="feature"),
+            name="hilbert_distance",
+            dtype="int64",
+        )
+        pd.testing.assert_series_equal(
+            source.hilbert_distance().to_pandas(),
+            expected,
+            check_index_type=False,
+        )
+
+        zero_width = GeoSeries([Point(0, 0), Point(0, 2), Point(0, 1)])
+        pd.testing.assert_series_equal(
+            zero_width.hilbert_distance(level=2).to_pandas(),
+            pd.Series([0, 5, 3], name="hilbert_distance", dtype="int64"),
+        )
+
+    @pytest.mark.parametrize("total_bounds", [None, (0, 0, 1, 1)])
+    def test_hilbert_distance_uses_one_native_summary_action(
+        self,
+        monkeypatch,
+        total_bounds,
+    ):
+        source = GeoSeries([Point(0, 0), Point(1, 1)])
+        spark_dataframe_type = type(source._internal.spark_frame)
+        original_first = spark_dataframe_type.first
+        action_count = 0
+
+        def counting_first(frame):
+            nonlocal action_count
+            action_count += 1
+            return original_first(frame)
+
+        monkeypatch.setattr(spark_dataframe_type, "first", counting_first)
+
+        result = source.hilbert_distance(total_bounds=total_bounds, level=3)
+        assert action_count == 1
+
+        spark_frame = result._internal.spark_frame
+        if hasattr(spark_frame, "_jdf"):
+            plan = spark_frame._jdf.queryExecution().optimizedPlan().toString()
+            assert "BatchEvalPython" not in plan
+            assert "ArrowEvalPython" not in plan
+            assert "PythonUDF" not in plan
+
+    def test_hilbert_distance_rejects_missing_and_empty_geometries(self):
+        source = GeoSeries(
+            [
+                Point(0, 0),
+                None,
+                Point(),
+                LineString(),
+                Polygon(),
+                MultiPoint(),
+                MultiLineString(),
+                MultiPolygon(),
+                GeometryCollection(),
+            ]
+        )
+        with pytest.raises(
+            ValueError,
+            match="cannot be computed on a GeoSeries with empty or missing",
+        ):
+            source.hilbert_distance(total_bounds=(0, 0, 1, 1))
+
+        empty = GeoSeries([], crs="EPSG:4326")
+        with pytest.raises(ValueError, match="cannot infer total bounds"):
+            empty.hilbert_distance()
+
+        explicit_empty = empty.hilbert_distance(total_bounds=(0, 0, 1, 1))
+        assert explicit_empty.name == "hilbert_distance"
+        assert explicit_empty.to_pandas().empty
+
+    def test_hilbert_distance_validates_level(self):
+        source = GeoSeries([Point(0, 0), Point(1, 1)])
+
+        with pytest.raises(ValueError, match="Level out of range"):
+            source.hilbert_distance(level=17)
+        with pytest.raises(TypeError, match="level must be an integer"):
+            source.hilbert_distance(level=1.5)
+
+        pd.testing.assert_series_equal(
+            source.hilbert_distance(level=0).to_pandas(),
+            pd.Series([0, 0], name="hilbert_distance", dtype="int64"),
+        )
 
     # These tests were taken directly from the TestEstimateUtmCrs class in the geopandas test suite
     # https://github.com/geopandas/geopandas/blob/main/geopandas/tests/test_array.py
     def test_estimate_utm_crs(self):
         from pyproj import CRS
+
+        assert typing.get_type_hints(GeoSeries.estimate_utm_crs)["return"] is CRS
 
         # setup
         esb = Point(-73.9847, 40.7484)
@@ -664,6 +2578,7 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
                 ),
                 GeometryCollection([Point(0, 0), LineString([(0, 0), (1, 1)])]),
                 LinearRing([(0, 0), (1, 1), (1, 0), (0, 1), (0, 0)]),
+                None,
             ]
         )
         result = geoseries.geom_type
@@ -677,6 +2592,7 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
                 "MultiPolygon",
                 "GeometryCollection",
                 "LineString",  # Note: Sedona returns LineString instead of LinearRing
+                None,
             ]
         )
         self.check_pd_series_equal(result, expected)
@@ -831,6 +2747,120 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         df_result = s.to_geoframe().count_coordinates()
         self.check_pd_series_equal(df_result, expected)
 
+    def test_get_coordinates(self):
+        geometries = [
+            Point(1, 1),
+            LineString([(1, -1), (1, 0)]),
+            Polygon(
+                [(3, -1), (4, 0), (3, 1)],
+                [[(3.2, -0.5), (3.5, 0), (3.2, 0.5)]],
+            ),
+            MultiPoint([(5, 5), (6, 6)]),
+            MultiLineString([[(7, 7), (8, 8)], [(9, 9), (10, 10)]]),
+            MultiPolygon(
+                [
+                    Polygon([(11, 11), (12, 11), (11, 12)]),
+                    Polygon([(13, 13), (14, 13), (13, 14)]),
+                ]
+            ),
+            GeometryCollection([Point(15, 15), LineString([(16, 16), (17, 17)])]),
+            Point(),
+            None,
+        ]
+        index = pd.Index([90, 80, 70, 60, 50, 40, 30, 20, 10], name="feature_id")
+        expected_series = gpd.GeoSeries(geometries, index=index)
+        actual_series = GeoSeries(expected_series)
+
+        options = [
+            {},
+            {"index_parts": True},
+            {"ignore_index": True},
+            {"ignore_index": True, "index_parts": True},
+        ]
+        for kwargs in options:
+            actual = actual_series.get_coordinates(**kwargs)
+            expected = expected_series.get_coordinates(**kwargs)
+            assert isinstance(actual, ps.DataFrame)
+            pd.testing.assert_frame_equal(actual.to_pandas(), expected)
+
+        dataframe_result = actual_series.to_geoframe().get_coordinates()
+        pd.testing.assert_frame_equal(
+            dataframe_result.to_pandas(), expected_series.get_coordinates()
+        )
+
+        coordinate_named_index = gpd.GeoSeries(
+            [Point(1, 2), Point(3, 4)],
+            index=pd.Index([10, 20], name="x"),
+        )
+        pd.testing.assert_frame_equal(
+            GeoSeries(coordinate_named_index).get_coordinates().to_pandas(),
+            coordinate_named_index.get_coordinates(),
+        )
+
+        empty_series = gpd.GeoSeries(
+            [Point(), GeometryCollection(), None],
+            index=pd.Index([3, 2, 1], name="feature_id"),
+        )
+        actual_empty = GeoSeries(empty_series).get_coordinates(index_parts=True)
+        expected_empty = empty_series.get_coordinates(index_parts=True)
+        # Spark keeps a fixed integer schema for the coordinate-position level,
+        # including when no rows are produced. GeoPandas infers object only for
+        # that all-empty level.
+        pd.testing.assert_frame_equal(
+            actual_empty.to_pandas(), expected_empty, check_index_type=False
+        )
+
+    def test_get_coordinates_multi_index(self):
+        index = pd.MultiIndex.from_tuples(
+            [("b", 2), ("a", 1), ("b", 1)], names=["group", "feature_id"]
+        )
+        geometries = [
+            LineString([(0, 0), (1, 1)]),
+            Point(2, 2),
+            Polygon([(3, 3), (4, 3), (3, 4)]),
+        ]
+        expected_series = gpd.GeoSeries(geometries, index=index)
+        actual_series = GeoSeries(expected_series)
+
+        for kwargs in ({}, {"index_parts": True}, {"ignore_index": True}):
+            actual = actual_series.get_coordinates(**kwargs).to_pandas()
+            expected = expected_series.get_coordinates(**kwargs)
+            pd.testing.assert_frame_equal(actual, expected)
+
+    def test_get_coordinates_z(self):
+        geometries_wkt = [
+            "POINT (0 1)",
+            "POINT Z (2 3 4)",
+        ]
+        expected_series = gpd.GeoSeries.from_wkt(geometries_wkt)
+        actual_series = GeoSeries.from_wkt(geometries_wkt)
+
+        actual = actual_series.get_coordinates(include_z=True).to_pandas()
+        expected = expected_series.get_coordinates(include_z=True)
+        pd.testing.assert_frame_equal(actual, expected)
+
+    @pytest.mark.skipif(
+        parse_version(shapely.__version__) < parse_version("2.1.0"),
+        reason="M coordinates require shapely>=2.1.0",
+    )
+    def test_get_coordinates_m(self):
+        geometries_wkt = [
+            "POINT (0 1)",
+            "POINT Z (2 3 4)",
+            "POINT M (5 6 7)",
+            "POINT ZM (8 9 10 11)",
+        ]
+        expected_series = gpd.GeoSeries.from_wkt(geometries_wkt)
+        actual_series = GeoSeries.from_wkt(geometries_wkt)
+
+        for kwargs in (
+            {"include_m": True},
+            {"include_z": True, "include_m": True},
+        ):
+            actual = actual_series.get_coordinates(**kwargs).to_pandas()
+            expected = expected_series.get_coordinates(**kwargs)
+            pd.testing.assert_frame_equal(actual, expected)
+
     def test_count_geometries(self):
         s = GeoSeries(
             [
@@ -891,6 +2921,7 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
 
         result = s.dwithin(s2, distance=1, align=True)
         expected = pd.Series([False, True, False, False, False])
+        self.check_pd_series_equal(result, expected)
 
         result = s.dwithin(s2, distance=1, align=False)
         expected = pd.Series([True, False, False, True])
@@ -899,6 +2930,211 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         # Check that GeoDataFrame works too
         df_result = s.to_geoframe().dwithin(s2, distance=1, align=False)
         self.check_pd_series_equal(df_result, expected)
+
+    def test_dwithin_array_like_distances(self):
+        index = pd.Index(["a", "b", "c"], name="feature_id")
+        source = GeoSeries(
+            [Point(0, 0), Point(2, 0), Point(5, 0)],
+            index=index,
+        )
+        expected = pd.Series([True, False, True], index=index)
+
+        distances = [
+            [0, 1, 5],
+            (0, 1, 5),
+            np.array([0, 1, 5]),
+            pd.Series([0, 1, 5], index=["unrelated-c", "unrelated-a", "unrelated-b"]),
+        ]
+        for distance in distances:
+            result = source.dwithin(Point(0, 0), distance)
+            self.check_pd_series_equal(result, expected)
+
+        broadcast_expected = pd.Series([True, True, False], index=index)
+        for distance in ([3], (3,), np.array([3]), np.array(3), np.int64(3)):
+            result = source.dwithin(Point(0, 0), distance)
+            self.check_pd_series_equal(result, broadcast_expected)
+
+    def test_dwithin_distances_follow_geometry_alignment(self):
+        index_name = "feature_id"
+        left = GeoSeries(
+            [Point(100, 0), Point(0, 0), Point(0, 0)],
+            index=pd.Index(["b", "a", "c"], name=index_name),
+        )
+        right = GeoSeries(
+            [Point(2, 0), Point(2, 0), Point(9, 0)],
+            index=pd.Index(["c", "a", "d"], name=index_name),
+        )
+
+        aligned_expected = pd.Series(
+            [False, False, True, False],
+            index=pd.Index(["a", "b", "c", "d"], name=index_name),
+        )
+        aligned = left.dwithin(right, [1, 99, 2, 99], align=True)
+        self.check_pd_series_equal(aligned, aligned_expected)
+
+        with pytest.warns(UserWarning, match="indices of the left and right"):
+            default_aligned = left.dwithin(right, [1, 99, 2, 99])
+        self.check_pd_series_equal(default_aligned, aligned_expected)
+
+        positional_expected = pd.Series(
+            [False, True, False],
+            index=pd.Index(["b", "a", "c"], name=index_name),
+        )
+        positional = left.dwithin(right, [1, 99, 2], align=False)
+        self.check_pd_series_equal(positional, positional_expected)
+
+        with pytest.raises(Exception, match="distance array must contain"):
+            left.dwithin(right, [1, 99, 2], align=True).to_pandas()
+        with pytest.raises(Exception, match="distance array must contain"):
+            left.dwithin(right, [1, 99, 2, 99], align=False).to_pandas()
+
+    def test_dwithin_distributed_distance_series(self):
+        index = pd.Index(["a", "a", "b"], name="feature_id")
+        source = GeoSeries(
+            [Point(0, 0), Point(2, 0), Point(5, 0)],
+            index=index,
+        )
+        expected = pd.Series([True, False, True], index=index)
+
+        independent_distance = ps.Series(
+            [0, 1, 5],
+            index=pd.Index(["ignored-c", "ignored-a", "ignored-b"]),
+        )
+        independent = source.dwithin(Point(0, 0), independent_distance)
+        self.check_pd_series_equal(independent, expected)
+
+        same_anchor_frame = GeoDataFrame(
+            gpd.GeoDataFrame(
+                {
+                    "geometry": [Point(0, 0), Point(2, 0), Point(5, 0)],
+                    "distance": [0, 1, 5],
+                },
+                index=index,
+            )
+        )
+        same_anchor = same_anchor_frame.geometry.dwithin(
+            Point(0, 0),
+            same_anchor_frame["distance"],
+        )
+        self.check_pd_series_equal(same_anchor, expected)
+        if hasattr(same_anchor._internal.spark_frame, "_jdf"):
+            same_anchor_plan = (
+                same_anchor._internal.spark_frame._jdf.queryExecution()
+                .executedPlan()
+                .toString()
+            )
+            assert "AttachDistributedSequence" not in same_anchor_plan
+            assert "Join" not in same_anchor_plan
+
+        if hasattr(independent._internal.spark_frame, "_jdf"):
+            plan = (
+                independent._internal.spark_frame._jdf.queryExecution()
+                .executedPlan()
+                .toString()
+            )
+            assert "BatchEvalPython" not in plan
+            assert "ArrowEvalPython" not in plan
+            assert "PythonUDF" not in plan
+
+    def test_dwithin_duplicate_multiindex_alignment(self):
+        left_index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 1), ("c", 3)],
+            names=["group", "row"],
+        )
+        right_index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 1), ("b", 2)],
+            names=["group", "row"],
+        )
+        left = GeoSeries(
+            [Point(0, 0), Point(10, 0), Point(50, 0)],
+            index=left_index,
+        )
+        right = GeoSeries(
+            [Point(1, 0), Point(12, 0), Point(60, 0)],
+            index=right_index,
+        )
+
+        result = left.dwithin(
+            right,
+            [1, 11, 9, 1, 100, 100],
+            align=True,
+        )
+        expected_index = pd.MultiIndex.from_tuples(
+            [
+                ("a", 1),
+                ("a", 1),
+                ("a", 1),
+                ("a", 1),
+                ("b", 2),
+                ("c", 3),
+            ],
+            names=["group", "row"],
+        )
+        expected = pd.Series(
+            [True, False, True, False, False, False],
+            index=expected_index,
+        )
+        self.check_pd_series_equal(result, expected)
+
+        scalar_result = left.dwithin(Point(0, 0), [0, 10, 49])
+        scalar_expected = pd.Series([True, True, False], index=left_index)
+        self.check_pd_series_equal(scalar_result, scalar_expected)
+
+    def test_dwithin_special_values_and_distance_validation(self):
+        source = GeoSeries([Point(), None, Point(2, 0), Point(0, 0), Point(0, 0)])
+        result = source.dwithin(
+            Point(0, 0),
+            np.array([np.inf, np.inf, np.inf, np.nan, -1.0]),
+        )
+        self.check_pd_series_equal(
+            result,
+            pd.Series([False, False, True, False, False]),
+        )
+
+        for distances in ([], [1, 2], [1, 2, 3, 4, 5, 6], pd.Series([1])):
+            with pytest.raises(Exception, match="distance array must contain"):
+                source.dwithin(Point(0, 0), distances).to_pandas()
+
+        for distances in (
+            ps.Series([1, 2]),
+            ps.Series([1, 2, 3, 4, 5, 6]),
+        ):
+            with pytest.raises(Exception, match="distance array must contain"):
+                source.dwithin(Point(0, 0), distances).to_pandas()
+
+        with pytest.raises(ValueError, match="one-dimensional"):
+            source.dwithin(Point(0, 0), np.ones((5, 1)))
+        with pytest.raises(TypeError, match="numeric"):
+            source.dwithin(Point(0, 0), ["1", "2", "3", "4", "5"])
+        with pytest.raises(TypeError, match="numeric"):
+            source.dwithin(Point(0, 0), [1, 2, 3, 4, pd.NA])
+        with pytest.raises(TypeError, match="numeric"):
+            source.dwithin(
+                Point(0, 0),
+                pd.Series([1, 2, 3, 4, pd.NA], dtype="Float64"),
+            )
+        with pytest.raises(TypeError, match="numeric"):
+            source.dwithin(Point(0, 0), Decimal("1"))
+        with pytest.raises(TypeError, match="numeric"):
+            source.dwithin(Point(0, 0), [1, 2, 3, 4, Decimal("5")])
+        with pytest.raises(TypeError, match="numeric"):
+            source.dwithin(Point(0, 0), ps.Series(["1"] * 5))
+        with pytest.raises(TypeError, match="numeric"):
+            source.dwithin(Point(0, 0), ps.Series([Decimal("1")] * 5))
+        with pytest.raises(
+            ValueError,
+            match=r"Lengths of inputs do not match\. Left: 1, Right: 2",
+        ):
+            GeoSeries([Point(0, 0)]).dwithin(
+                GeoSeries([Point(0, 0), Point(1, 1)]),
+                1,
+                align=False,
+            )
+
+        empty = GeoSeries([])
+        for distances in ([], np.array([]), ps.Series([], dtype=float)):
+            empty_result = empty.dwithin(Point(0, 0), distances)
+            self.check_pd_series_equal(empty_result, pd.Series([], dtype=bool))
 
     def test_difference(self):
         s = GeoSeries(
@@ -1194,7 +3430,64 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         self.check_pd_series_equal(result, expected)
 
     def test_is_ccw(self):
-        pass
+        index = pd.Index(
+            [
+                "ccw-line",
+                "cw-line",
+                "ccw-open-line",
+                "asymmetric-open-line",
+                "open-three-point-line",
+                "closed-three-point-line",
+                "ccw-ring",
+                "polygon",
+                "point",
+                "empty-line",
+                "empty-polygon",
+                "null",
+            ],
+            name="feature_id",
+        )
+        s = GeoSeries(
+            [
+                LineString([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]),
+                LineString([(0, 0), (0, 1), (1, 1), (1, 0), (0, 0)]),
+                LineString([(0, 0), (1, 0), (1, 1), (0, 1)]),
+                LineString([(0, 1), (0, -1), (-1, -2), (3, -2)]),
+                LineString([(0, 0), (1, 0), (0, 1)]),
+                LineString([(0, 0), (1, 0), (0, 0)]),
+                LinearRing([(0, 0), (1, 0), (1, 1), (0, 1)]),
+                Polygon([(0, 0), (1, 0), (0, 1), (0, 0)]),
+                Point(0, 0),
+                LineString(),
+                Polygon(),
+                None,
+            ],
+            index=index,
+        )
+        expected = pd.Series(
+            [
+                True,
+                False,
+                True,
+                False,
+                False,
+                False,
+                True,
+                False,
+                False,
+                False,
+                False,
+                False,
+            ],
+            index=index,
+        )
+
+        result = s.is_ccw
+        self.check_pd_series_equal(result, expected)
+
+        # Check that GeoDataFrame works too.
+        frame_result = s.to_geoframe().is_ccw
+        self.check_pd_series_equal(frame_result, expected)
 
     def test_is_closed(self):
         s = GeoSeries(
@@ -1237,6 +3530,51 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         # Check that GeoDataFrame works too
         df_result = s.to_geoframe().has_z
         self.check_pd_series_equal(df_result, expected)
+
+        mixed = GeoSeries.from_wkt(
+            [
+                "GEOMETRYCOLLECTION (POINT (0 0), POINT Z (1 1 2))",
+                (
+                    "GEOMETRYCOLLECTION (POINT (0 0), "
+                    "GEOMETRYCOLLECTION (POINT Z (1 1 2)))"
+                ),
+                "POINT EMPTY",
+                None,
+            ]
+        )
+        mixed_expected = pd.Series([True, True, False, False])
+        self.check_pd_series_equal(mixed.has_z, mixed_expected)
+
+    def test_has_m(self):
+        s = GeoSeries.from_wkt(
+            [
+                "POINT (0 1)",
+                "POINT Z (0 1 2)",
+                "POINT M (0 1 2)",
+                "POINT ZM (0 1 2 3)",
+                "GEOMETRYCOLLECTION (POINT (0 0), POINT M (1 1 2))",
+                "POINT EMPTY",
+                None,
+            ]
+        )
+        expected = pd.Series([False, False, True, True, True, False, False])
+
+        result = s.has_m
+        self.check_pd_series_equal(result, expected)
+
+        # Check that GeoDataFrame works too.
+        df_result = s.to_geoframe().has_m
+        self.check_pd_series_equal(df_result, expected)
+
+        indexed = GeoSeries(
+            [Point(0, 0), None],
+            index=pd.Index(["point", "null"], name="feature_id"),
+        )
+        indexed_expected = pd.Series(
+            [False, False],
+            index=pd.Index(["point", "null"], name="feature_id"),
+        )
+        self.check_pd_series_equal(indexed.has_m, indexed_expected)
 
     def test_get_precision(self):
         pass
@@ -1370,6 +3708,49 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         df_result = s.to_geoframe().concave_hull(ratio=0.5)
         self.check_sgpd_equals_gpd(df_result, expected)
 
+        # Use an asymmetric point set so that the Delaunay triangulation has no
+        # ambiguous ties, and verify that allow_holes=True can produce a hole.
+        points_around_hole = MultiPoint(
+            [
+                (11.1, 0.1),
+                (6.2, 8.1),
+                (0.1, 10.3),
+                (-8.2, 7.1),
+                (-10.1, -0.2),
+                (-7.2, -8.3),
+                (0.2, -11.1),
+                (7.3, -7.2),
+                (5.1, 0.2),
+                (-0.1, 5.2),
+                (-4.2, -0.9),
+                (0.1, -4.1),
+            ]
+        )
+        result_with_holes = GeoSeries([points_around_hole], crs=3857).concave_hull(
+            ratio=0.9, allow_holes=True
+        )
+        expected_with_holes = gpd.GeoSeries(
+            [
+                Polygon(
+                    [
+                        (-8.2, 7.1),
+                        (0.1, 10.3),
+                        (6.2, 8.1),
+                        (5.1, 0.2),
+                        (11.1, 0.1),
+                        (7.3, -7.2),
+                        (0.2, -11.1),
+                        (-7.2, -8.3),
+                        (-10.1, -0.2),
+                    ],
+                    [[(-4.2, -0.9), (0.1, -4.1), (-0.1, 5.2)]],
+                )
+            ],
+            crs=3857,
+        )
+        self.check_sgpd_equals_gpd(result_with_holes, expected_with_holes)
+        assert result_with_holes.crs == expected_with_holes.crs
+
     def test_convex_hull(self):
         s = GeoSeries(
             [
@@ -1420,6 +3801,62 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         df_result_gpd = df_result.to_geopandas()
         assert len(df_result_gpd) == 2
 
+    def test_constrained_delaunay_triangles(self):
+        triangle = Polygon([(0, 0), (2, 0), (0, 2), (0, 0)])
+        polygon_with_hole = Polygon(
+            [(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)],
+            [[(1, 1), (3, 1), (3, 3), (1, 3), (1, 1)]],
+        )
+        multipolygon = MultiPolygon(
+            [
+                Polygon([(0, 0), (1, 0), (0, 1), (0, 0)]),
+                Polygon([(3, 0), (4, 0), (3, 1), (3, 0)]),
+            ]
+        )
+        geoms = [
+            triangle,
+            polygon_with_hole,
+            multipolygon,
+            Point(0, 0),
+            Polygon(),
+            None,
+        ]
+        index = pd.Index(
+            ["triangle", "hole", "multi", "point", "empty", "null"],
+            name="feature_id",
+        )
+        source = GeoSeries(geoms, index=index, crs="EPSG:3857")
+
+        result = source.constrained_delaunay_triangles()
+
+        actual = result.to_geopandas()
+        assert actual.index.equals(index)
+        for label, original in [
+            ("triangle", triangle),
+            ("hole", polygon_with_hole),
+            ("multi", multipolygon),
+        ]:
+            triangles = actual.loc[label]
+            assert triangles.geom_type == "GeometryCollection"
+            assert shapely.union_all(list(triangles.geoms)).equals(original)
+
+        assert actual.loc["point"].geom_type == "GeometryCollection"
+        assert actual.loc["point"].is_empty
+        assert actual.loc["empty"].geom_type == "GeometryCollection"
+        assert actual.loc["empty"].is_empty
+        assert actual.loc["null"] is None
+        assert result.crs == source.crs
+
+        srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        assert {row.srid for row in srids if row.srid is not None} == {3857}
+
+        # Check that GeoDataFrame works too.
+        frame_result = source.to_geoframe().constrained_delaunay_triangles()
+        self.check_sgpd_equals_gpd(frame_result, actual)
+        assert frame_result.crs == source.crs
+
     def test_voronoi_polygons(self):
         s = GeoSeries(
             [
@@ -1442,6 +3879,83 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         # only_edges=True should raise
         with pytest.raises(NotImplementedError):
             s.voronoi_polygons(only_edges=True)
+
+    def test_voronoi_polygons_extend_to(self):
+        source_geometry = MultiPoint([(0, 0), (1, 0), (0.5, 1)])
+        index = pd.MultiIndex.from_tuples([("group", 7)], names=["group", "feature_id"])
+        source = GeoSeries([source_geometry], index=index, crs="EPSG:3857")
+
+        default = source.voronoi_polygons()
+        extended = source.voronoi_polygons(extend_to=box(-2, 0, 3, 3))
+        contained = source.voronoi_polygons(extend_to=box(0.25, 0.25, 0.75, 0.75))
+        nonrectangular = source.voronoi_polygons(
+            extend_to=Polygon([(-2, 0), (3, 0), (0, 3)])
+        )
+        same_envelope = source.voronoi_polygons(extend_to=box(-2, 0, 3, 3))
+        empty_extent = source.voronoi_polygons(extend_to=GeometryCollection())
+
+        default_geometry = default.to_geopandas().iloc[0]
+        extended_result = extended.to_geopandas()
+        extended_geometry = extended_result.iloc[0]
+        assert extended_result.index.equals(index)
+        assert extended_geometry.bounds == pytest.approx((-2.0, -1.0, 3.0, 3.0))
+        assert contained.to_geopandas().iloc[0].equals(default_geometry)
+        assert (
+            nonrectangular.to_geopandas()
+            .iloc[0]
+            .equals(same_envelope.to_geopandas().iloc[0])
+        )
+        assert empty_extent.to_geopandas().iloc[0].equals(default_geometry)
+        assert extended.crs == source.crs
+
+        srids = extended._internal.spark_frame.select(
+            stf.ST_SRID(extended.spark.column).alias("srid")
+        ).collect()
+        assert [row.srid for row in srids] == [3857]
+
+        frame_source = GeoSeries([source_geometry], crs="EPSG:3857")
+        frame_result = frame_source.to_geoframe().voronoi_polygons(
+            extend_to=box(-2, 0, 3, 3)
+        )
+        frame_expected = gpd.GeoSeries([extended_geometry], crs="EPSG:3857")
+        self.check_sgpd_equals_gpd(frame_result, frame_expected)
+
+        if hasattr(extended._internal.spark_frame, "_jdf"):
+            plan = (
+                extended._internal.spark_frame._jdf.queryExecution()
+                .executedPlan()
+                .toString()
+            )
+            assert "BatchEvalPython" not in plan
+            assert "ArrowEvalPython" not in plan
+
+        for invalid_extent in (
+            [box(0, 0, 1, 1)],
+            "POLYGON ((0 0, 1 0, 1 1, 0 0))",
+            source,
+            ps.Series([1]),
+        ):
+            with pytest.raises(TypeError, match="'extend_to' must be a geometry"):
+                source.voronoi_polygons(extend_to=invalid_extent)
+
+    def test_voronoi_polygons_extend_to_degenerate_inputs(self):
+        source = GeoSeries.from_wkt(
+            [
+                None,
+                "GEOMETRYCOLLECTION EMPTY",
+                "POINT (0 0)",
+                "MULTIPOINT ((0 0), (1 0))",
+            ]
+        )
+        result = source.voronoi_polygons(extend_to=LineString([(-2, 0), (3, 0)]))
+        actual = result.to_geopandas()
+
+        assert actual.iloc[0] is None
+        assert actual.iloc[1].is_empty
+        assert actual.iloc[2].geom_type == "GeometryCollection"
+        assert actual.iloc[2].bounds == pytest.approx((-2.0, 0.0, 3.0, 0.0))
+        assert actual.iloc[3].geom_type == "GeometryCollection"
+        assert actual.iloc[3].bounds == pytest.approx((-2.0, -1.0, 3.0, 1.0))
 
     def test_envelope(self):
         s = sgpd.GeoSeries(
@@ -1581,7 +4095,100 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         self.check_sgpd_equals_gpd(df_result, expected)
 
     def test_interiors(self):
-        pass
+        polygon_with_holes = Polygon(
+            [(0, 0), (0, 5), (5, 5), (5, 0), (0, 0)],
+            [
+                [(1, 1), (2, 1), (1, 2), (1, 1)],
+                [(3, 3), (4, 3), (4, 4), (3, 3)],
+            ],
+        )
+        polygon_without_holes = Polygon([(10, 10), (10, 12), (12, 10), (10, 10)])
+        index = pd.MultiIndex.from_tuples(
+            [
+                ("polygon", "holes"),
+                ("polygon", "no-holes"),
+                ("polygon", "empty"),
+                ("point", "value"),
+                ("point", "empty"),
+                ("line", "empty"),
+                ("multipolygon", "value"),
+                ("collection", "value"),
+                ("null", "value"),
+            ],
+            names=["geometry_type", "case"],
+        )
+        source = GeoSeries(
+            [
+                polygon_with_holes,
+                polygon_without_holes,
+                Polygon(),
+                Point(0, 0),
+                Point(),
+                LineString(),
+                MultiPolygon([polygon_without_holes]),
+                GeometryCollection([polygon_with_holes]),
+                None,
+            ],
+            index=index,
+        )
+
+        result = source.interiors
+
+        assert isinstance(result, ps.Series)
+        actual = result.to_pandas()
+        pd.testing.assert_index_equal(actual.index, index)
+        assert actual.dtype == object
+
+        rings = actual.iloc[0]
+        assert isinstance(rings, list)
+        assert all(isinstance(ring, (LineString, LinearRing)) for ring in rings)
+        assert [list(ring.coords) for ring in rings] == [
+            [(1.0, 1.0), (2.0, 1.0), (1.0, 2.0), (1.0, 1.0)],
+            [(3.0, 3.0), (4.0, 3.0), (4.0, 4.0), (3.0, 3.0)],
+        ]
+        assert actual.iloc[1] == []
+        assert actual.iloc[2] == []
+        assert all(value is None for value in actual.iloc[3:])
+
+        # Check GeoDataFrame delegation separately; GeoSeries.to_geoframe()
+        # does not currently accept a MultiIndex.
+        delegated_index = pd.Index(
+            ["holes", "no-holes", "point", "null"],
+            name="feature_id",
+        )
+        delegated_source = GeoSeries(
+            [
+                polygon_with_holes,
+                polygon_without_holes,
+                Point(0, 0),
+                None,
+            ],
+            index=delegated_index,
+        )
+        frame_result = delegated_source.to_geoframe().interiors
+        assert isinstance(frame_result, ps.Series)
+        frame_actual = frame_result.to_pandas()
+        pd.testing.assert_index_equal(frame_actual.index, delegated_index)
+        assert frame_actual.dtype == object
+        assert [
+            (
+                None
+                if value is None
+                else [
+                    tuple(tuple(coordinate) for coordinate in ring.coords)
+                    for ring in value
+                ]
+            )
+            for value in frame_actual
+        ] == [
+            [
+                ((1.0, 1.0), (2.0, 1.0), (1.0, 2.0), (1.0, 1.0)),
+                ((3.0, 3.0), (4.0, 3.0), (4.0, 4.0), (3.0, 3.0)),
+            ],
+            [],
+            None,
+            None,
+        ]
 
     def test_remove_repeated_points(self):
         s = GeoSeries(
@@ -1653,6 +4260,217 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         df_result = gdf.minimum_bounding_circle()
         self.check_sgpd_equals_gpd(df_result, expected)
 
+    def test_maximum_inscribed_circle(self):
+        geoms = [
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+            Polygon([(0, 0), (0.5, -1), (1, 0), (1, 1), (-0.5, 0.5)]),
+            MultiPolygon(
+                [
+                    Polygon([(0, 0), (0, 2), (2, 2), (2, 0), (0, 0)]),
+                    Polygon([(10, 0), (10, 1), (11, 1), (11, 0), (10, 0)]),
+                ]
+            ),
+            None,
+        ]
+        index = pd.Index(["first", "first", "multi", "null"], name="feature_id")
+        source = GeoSeries(geoms, index=index, crs="EPSG:3857")
+        # Keep this direct test runnable with GeoPandas < 1.1. The version-gated
+        # parity test compares these results with GeoPandas dynamically.
+        expected = gpd.GeoSeries(
+            [
+                LineString([(0.70703125, 0.29296875), (0.5, 0.5)]),
+                LineString([(0.466796875, 0.259765625), (1, 0.259765625)]),
+                LineString([(1, 1), (0, 1)]),
+                None,
+            ],
+            index=index,
+            crs="EPSG:3857",
+        )
+
+        result = source.maximum_inscribed_circle()
+        self.check_sgpd_equals_gpd(result, expected)
+        assert result.name is None
+        assert result.crs == source.crs
+        srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        assert {row.srid for row in srids if row.srid is not None} == {3857}
+
+        frame = GeoDataFrame(
+            gpd.GeoDataFrame(
+                {
+                    "geometry": geoms,
+                    "tolerance": [0.0, 2.0, 0.5, np.nan],
+                    "label": ["a", "b", "c", "d"],
+                },
+                index=index,
+                crs="EPSG:3857",
+            )
+        )
+        row_wise = frame.geometry.maximum_inscribed_circle(tolerance=frame["tolerance"])
+        row_wise_expected = gpd.GeoSeries(
+            [
+                LineString([(0.70703125, 0.29296875), (0.5, 0.5)]),
+                LineString([(0.375, 0.25), (0, 0)]),
+                LineString([(1, 1), (0, 1)]),
+                None,
+            ],
+            index=index,
+            crs="EPSG:3857",
+        )
+        self.check_sgpd_equals_gpd(row_wise, row_wise_expected)
+
+        local_tolerances = [0.0, 2.0, 0.5, np.nan]
+        for local_tolerance in (
+            local_tolerances,
+            np.asarray(local_tolerances),
+            pd.Series(local_tolerances, index=index),
+        ):
+            local_result = source.maximum_inscribed_circle(tolerance=local_tolerance)
+            self.check_sgpd_equals_gpd(local_result, row_wise_expected)
+
+        self.check_sgpd_equals_gpd(
+            source.maximum_inscribed_circle(tolerance=0),
+            expected,
+        )
+        self.check_sgpd_equals_gpd(
+            source.maximum_inscribed_circle(tolerance=np.asarray(0)),
+            expected,
+        )
+        self.check_sgpd_equals_gpd(
+            source.maximum_inscribed_circle(tolerance=[0]),
+            expected,
+        )
+        assert (
+            len(
+                GeoSeries([], crs="EPSG:3857").maximum_inscribed_circle(
+                    tolerance=np.array([0])
+                )
+            )
+            == 0
+        )
+        self.check_sgpd_equals_gpd(
+            frame.maximum_inscribed_circle(tolerance=2.0),
+            gpd.GeoSeries(
+                [
+                    LineString([(0.75, 0.5), (0.625, 0.625)]),
+                    LineString([(0.375, 0.25), (0, 0)]),
+                    LineString([(1, 1), (0, 1)]),
+                    None,
+                ],
+                index=index,
+                crs="EPSG:3857",
+            ),
+        )
+
+        spark_frame = row_wise._internal.spark_frame
+        if hasattr(spark_frame, "_jdf"):
+            optimized_plan = (
+                spark_frame._jdf.queryExecution().optimizedPlan().toString()
+            )
+            assert optimized_plan.lower().count("st_maximuminscribedcircle") == 1
+            assert "BatchEvalPython" not in optimized_plan
+            assert "ArrowEvalPython" not in optimized_plan
+            assert "PythonUDF" not in optimized_plan
+
+        nan_result = source.maximum_inscribed_circle(tolerance=np.nan).to_geopandas()
+        assert nan_result.isna().all()
+
+        degenerate = GeoSeries(
+            [Polygon([(0, 0), (0, 0), (0, 0), (0, 0)])],
+            crs="EPSG:3857",
+        )
+        self.check_sgpd_equals_gpd(
+            degenerate.maximum_inscribed_circle(),
+            gpd.GeoSeries(
+                [LineString([(0, 0), (0, 0)])],
+                crs="EPSG:3857",
+            ),
+        )
+        self.check_sgpd_equals_gpd(
+            degenerate.maximum_inscribed_circle(tolerance=2.0),
+            gpd.GeoSeries(
+                [LineString([(0, 0), (0, 0)])],
+                crs="EPSG:3857",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="'tolerance' should be positive"):
+            source.maximum_inscribed_circle(tolerance=-1)
+        with pytest.raises(ValueError, match="'tolerance' should be positive"):
+            source.maximum_inscribed_circle(tolerance=np.array(-1.0))
+        with pytest.raises(Exception, match="'tolerance' should be positive"):
+            source.maximum_inscribed_circle(
+                tolerance=[-1.0] * len(source)
+            ).to_geopandas()
+        with pytest.raises(Exception, match="'tolerance' should be positive"):
+            frame.geometry.maximum_inscribed_circle(
+                tolerance=frame["tolerance"] - 3.0
+            ).to_geopandas()
+        with pytest.raises(ValueError, match="must share the same frame"):
+            source.maximum_inscribed_circle(tolerance=ps.Series([0.1] * len(source)))
+        with pytest.raises(TypeError, match="numeric scalar"):
+            frame.geometry.maximum_inscribed_circle(tolerance=frame["label"])
+        with pytest.raises(TypeError, match="numeric scalar"):
+            source.maximum_inscribed_circle(tolerance=["0.1"] * len(source))
+        with pytest.raises(TypeError, match="numeric scalar"):
+            source.maximum_inscribed_circle(tolerance=Decimal("0.1"))
+        with pytest.raises(TypeError, match="numeric scalar"):
+            source.maximum_inscribed_circle(tolerance=[Decimal("0.1")] * len(source))
+        for mismatched_tolerance in (
+            [0.1] * (len(source) - 1),
+            [0.1] * (len(source) + 1),
+        ):
+            with pytest.raises(Exception, match="Length of tolerance"):
+                source.maximum_inscribed_circle(
+                    tolerance=mismatched_tolerance
+                ).to_geopandas()
+        with pytest.raises(Exception, match="Index of the Series"):
+            source.maximum_inscribed_circle(
+                tolerance=pd.Series(
+                    local_tolerances,
+                    index=pd.Index(
+                        ["first", "multi", "first", "null"],
+                        name="feature_id",
+                    ),
+                )
+            ).to_geopandas()
+
+        with pytest.raises(
+            Exception,
+            match="Input geometry must be a Polygon or MultiPolygon",
+        ):
+            GeoSeries([Point(0, 0)]).maximum_inscribed_circle().to_geopandas()
+        with pytest.raises(
+            Exception,
+            match="Empty input geometry is not supported",
+        ):
+            GeoSeries([Polygon()]).maximum_inscribed_circle().to_geopandas()
+
+    def test_maximum_inscribed_circle_local_tolerance_preserves_order(self):
+        adaptive_enabled = self.spark.conf.get("spark.sql.adaptive.enabled")
+        shuffle_partitions = self.spark.conf.get("spark.sql.shuffle.partitions")
+        try:
+            self.spark.conf.set("spark.sql.adaptive.enabled", "false")
+            self.spark.conf.set("spark.sql.shuffle.partitions", "8")
+            expected_index = pd.Index(
+                [f"feature-{position:03d}" for position in range(100)],
+                name="feature_id",
+            )
+            source = GeoSeries(
+                [Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])] * 100,
+                index=expected_index,
+            )
+
+            actual = source.maximum_inscribed_circle(
+                tolerance=[2.0] * len(source)
+            ).to_geopandas()
+
+            pd.testing.assert_index_equal(actual.index, expected_index)
+        finally:
+            self.spark.conf.set("spark.sql.adaptive.enabled", adaptive_enabled)
+            self.spark.conf.set("spark.sql.shuffle.partitions", shuffle_partitions)
+
     def test_minimum_bounding_radius(self):
         s = GeoSeries(
             [
@@ -1693,6 +4511,75 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         df_result = gdf.minimum_clearance()
         self.check_pd_series_equal(df_result, expected)
 
+    def test_minimum_clearance_line(self):
+        geoms = [
+            Polygon([(0, 0), (1, 1), (0, 1), (0, 0)]),
+            LineString([(0, 0), (1, 1), (3, 2)]),
+            MultiPoint([(0, 0), (3, 4)]),
+            MultiPoint([(1, 1), (1, 1)]),
+            Point(0, 0),
+            Point(),
+            LineString(),
+            Polygon(),
+            None,
+        ]
+        index = pd.Index(
+            [
+                "polygon",
+                "line",
+                "multipoint",
+                "duplicate",
+                "point",
+                "empty-point",
+                "empty-line",
+                "empty-polygon",
+                "null",
+            ],
+            name="feature_id",
+        )
+        source = GeoSeries(geoms, index=index, crs="EPSG:3857")
+        expected = gpd.GeoSeries(
+            [
+                LineString([(0, 1), (0.5, 0.5)]),
+                LineString([(0, 0), (1, 1)]),
+                LineString([(3, 4), (0, 0)]),
+                LineString(),
+                LineString(),
+                LineString(),
+                LineString(),
+                LineString(),
+                None,
+            ],
+            index=index,
+            crs="EPSG:3857",
+        )
+
+        result = source.minimum_clearance_line()
+
+        self.check_sgpd_equals_gpd(result, expected)
+        assert result.crs == source.crs
+        actual = result.to_geopandas()
+        for label in [
+            "duplicate",
+            "point",
+            "empty-point",
+            "empty-line",
+            "empty-polygon",
+        ]:
+            assert actual.loc[label].geom_type == "LineString"
+            assert actual.loc[label].is_empty
+        assert actual.loc["null"] is None
+
+        srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        assert {row.srid for row in srids if row.srid is not None} == {3857}
+
+        # Check that GeoDataFrame works too.
+        frame_result = source.to_geoframe().minimum_clearance_line()
+        self.check_sgpd_equals_gpd(frame_result, expected)
+        assert frame_result.crs == source.crs
+
     def test_normalize(self):
         s = GeoSeries(
             [
@@ -1716,6 +4603,106 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         # Check that GeoDataFrame works too
         df_result = s.to_geoframe().normalize()
         self.check_sgpd_equals_gpd(df_result, expected)
+
+    def test_orient_polygons(self):
+        clockwise_polygon = Polygon(
+            [(0, 0), (0, 5), (5, 5), (5, 0), (0, 0)],
+            [[(1, 1), (4, 1), (4, 4), (1, 4), (1, 1)]],
+        )
+        second_polygon = Polygon([(10, 0), (10, 2), (12, 2), (12, 0), (10, 0)])
+        multipolygon = MultiPolygon([clockwise_polygon, second_polygon])
+        nested_collection = GeometryCollection(
+            [
+                Point(20, 20),
+                GeometryCollection(
+                    [
+                        clockwise_polygon,
+                        MultiPolygon([second_polygon]),
+                    ]
+                ),
+            ]
+        )
+        geoms = [
+            clockwise_polygon,
+            multipolygon,
+            nested_collection,
+            Point(1, 1),
+            LineString([(0, 0), (1, 1)]),
+            Point(),
+            LineString(),
+            Polygon(),
+            MultiPolygon(),
+            GeometryCollection(),
+            None,
+        ]
+        index = pd.Index(
+            [
+                "polygon",
+                "multipolygon",
+                "nested",
+                "point",
+                "line",
+                "empty-point",
+                "empty-line",
+                "empty-polygon",
+                "empty-multipolygon",
+                "empty-collection",
+                "null",
+            ],
+            name="feature_id",
+        )
+        source = GeoSeries(geoms, index=index, crs="EPSG:3857")
+        expected = gpd.GeoSeries(geoms, index=index, crs="EPSG:3857")
+
+        def assert_oriented(geometry, exterior_cw):
+            if geometry is None or geometry.is_empty:
+                return
+            if isinstance(geometry, Polygon):
+                assert bool(geometry.exterior.is_ccw) is not exterior_cw
+                assert all(
+                    bool(ring.is_ccw) is exterior_cw for ring in geometry.interiors
+                )
+            elif isinstance(geometry, (MultiPolygon, GeometryCollection)):
+                for part in geometry.geoms:
+                    assert_oriented(part, exterior_cw)
+
+        for exterior_cw in (False, True):
+            result = source.orient_polygons(exterior_cw=exterior_cw)
+
+            self.check_sgpd_equals_gpd(result, expected)
+            assert result.crs == source.crs
+            actual = result.to_geopandas().sort_index()
+            for geometry in actual:
+                assert_oriented(geometry, exterior_cw)
+
+            nested = actual.loc["nested"]
+            assert isinstance(nested, GeometryCollection)
+            assert isinstance(nested.geoms[1], GeometryCollection)
+            assert isinstance(nested.geoms[1].geoms[1], MultiPolygon)
+
+            for label, geometry_type in [
+                ("empty-point", "Point"),
+                ("empty-line", "LineString"),
+                ("empty-polygon", "Polygon"),
+                ("empty-multipolygon", "MultiPolygon"),
+                ("empty-collection", "GeometryCollection"),
+            ]:
+                assert actual.loc[label].is_empty
+                assert actual.loc[label].geom_type == geometry_type
+            assert actual.loc["null"] is None
+
+            srids = result._internal.spark_frame.select(
+                stf.ST_SRID(result.spark.column).alias("srid")
+            ).collect()
+            assert {row.srid for row in srids if row.srid is not None} == {3857}
+
+            # Check that GeoDataFrame works too.
+            frame_result = source.to_geoframe().orient_polygons(exterior_cw=exterior_cw)
+            self.check_sgpd_equals_gpd(frame_result, expected)
+            assert frame_result.crs == source.crs
+            frame_actual = frame_result.to_geopandas().sort_index()
+            for geometry in frame_actual:
+                assert_oriented(geometry, exterior_cw)
 
     def test_make_valid(self):
         s = sgpd.GeoSeries(
@@ -1795,6 +4782,272 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         df_result = s.to_geoframe().reverse()
         self.check_sgpd_equals_gpd(df_result, expected)
 
+    def test_sample_points(self):
+        polygon = box(0, 0, 2, 2)
+        multipolygon = MultiPolygon([box(4, 0, 5, 1), box(7, 0, 9, 2)])
+        line = LineString([(0, 0), (2, 0), (2, 2)])
+        multiline = MultiLineString([[(0, 4), (1, 4)], [(3, 4), (3, 7)]])
+        geometries = [
+            polygon,
+            multipolygon,
+            line,
+            multiline,
+            Point(1, 1),
+            MultiPoint([(0, 0), (1, 1)]),
+            GeometryCollection([Point(0, 0)]),
+            Polygon(),
+            LineString(),
+            None,
+        ]
+        index = pd.Index(
+            [
+                "area",
+                "area",
+                "line",
+                "line",
+                "point",
+                "points",
+                "gc",
+                "ep",
+                "el",
+                "null",
+            ],
+            name="feature_id",
+        )
+        source = GeoSeries(geometries, index=index, crs="EPSG:3857")
+
+        result = source.sample_points(4, rng=0)
+        actual = result.to_geopandas()
+        repeated = source.sample_points(4, rng=0).to_geopandas()
+
+        assert isinstance(result, GeoSeries)
+        assert result.name == "sampled_points"
+        assert result.crs == source.crs
+        assert actual.index.equals(index)
+        assert [geometry.wkb for geometry in actual] == [
+            geometry.wkb for geometry in repeated
+        ]
+        for source_geometry, sampled in zip(geometries[:4], actual.iloc[:4]):
+            assert sampled.geom_type == "MultiPoint"
+            assert len(sampled.geoms) == 4
+            assert all(source_geometry.covers(point) for point in sampled.geoms)
+        for sampled in actual.iloc[4:]:
+            assert sampled.geom_type == "MultiPoint"
+            assert sampled.is_empty
+
+        srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        assert {row.srid for row in srids} == {3857}
+
+        if hasattr(result._internal.spark_frame, "_jdf"):
+            plan = (
+                result._internal.spark_frame._jdf.queryExecution()
+                .executedPlan()
+                .toString()
+            )
+            assert "BatchEvalPython" not in plan
+            assert "ArrowEvalPython" not in plan
+            assert "PythonUDF" not in plan
+
+        frame_result = source.to_geoframe().sample_points(4, rng=0)
+        assert isinstance(frame_result, GeoSeries)
+        assert frame_result.name == "sampled_points"
+        assert frame_result.crs == source.crs
+
+        zero = GeoSeries([polygon, line, Point(0, 0)]).sample_points(0, rng=1)
+        zero_types = [geometry.geom_type for geometry in zero.to_geopandas()]
+        assert zero_types == ["MultiPoint", "MultiPoint", "MultiPoint"]
+
+        one = GeoSeries([polygon, line, Point(0, 0)]).sample_points(1, rng=1)
+        one_types = [geometry.geom_type for geometry in one.to_geopandas()]
+        assert one_types == ["MultiPoint", "MultiPoint", "MultiPoint"]
+
+        degenerate_lines = GeoSeries(
+            [
+                LineString([(0, 0), (0, 0)]),
+                MultiLineString([[(1, 1), (1, 1)], [(1, 1), (1, 1)]]),
+            ]
+        ).sample_points(4, rng=1)
+        degenerate_actual = degenerate_lines.to_geopandas()
+        assert [geometry.geom_type for geometry in degenerate_actual] == [
+            "MultiPoint",
+            "MultiPoint",
+        ]
+        assert all(
+            len(geometry.geoms) == 4
+            and all(point.equals(Point(i, i)) for point in geometry.geoms)
+            for i, geometry in enumerate(degenerate_actual)
+        )
+
+        multi_index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 2), ("b", 1), ("b", 2)],
+            names=["group", "position"],
+        )
+        distributed_source = GeoSeries(
+            [polygon, multipolygon, line, multiline],
+            index=multi_index,
+            crs="EPSG:3857",
+        )
+        distributed_result = distributed_source.sample_points(
+            ps.Series([1, 2, 3, 4]), rng=7
+        ).to_geopandas()
+        assert distributed_result.index.equals(multi_index)
+        assert [
+            1 if geometry.geom_type == "Point" else len(geometry.geoms)
+            for geometry in distributed_result
+        ] == [1, 2, 3, 4]
+
+        extra_sizes = distributed_source.sample_points(
+            [1, 2, 3, 4, 99], rng=7
+        ).to_geopandas()
+        assert [
+            1 if geometry.geom_type == "Point" else len(geometry.geoms)
+            for geometry in extra_sizes
+        ] == [1, 2, 3, 4]
+
+        same_anchor_index = pd.Index(
+            ["duplicate", "duplicate", "other", "other"],
+            name="feature_id",
+        )
+        same_anchor_frame = GeoDataFrame(
+            gpd.GeoDataFrame(
+                {
+                    "geometry": [polygon, multipolygon, line, multiline],
+                    "size": [1, 2, 3, 4],
+                },
+                index=same_anchor_index,
+                crs="EPSG:3857",
+            )
+        )
+        same_anchor_result = same_anchor_frame.geometry.sample_points(
+            same_anchor_frame["size"], rng=7
+        )
+        same_anchor_actual = same_anchor_result.to_geopandas()
+        assert same_anchor_actual.index.equals(same_anchor_index)
+        assert [
+            1 if geometry.geom_type == "Point" else len(geometry.geoms)
+            for geometry in same_anchor_actual
+        ] == [1, 2, 3, 4]
+        if hasattr(same_anchor_result._internal.spark_frame, "_jdf"):
+            plan = (
+                same_anchor_result._internal.spark_frame._jdf.queryExecution()
+                .optimizedPlan()
+                .toString()
+            )
+            assert "Join" not in plan
+            assert "AttachDistributedSequence" not in plan
+
+        # Like GeoPandas, an integer seed restarts the same random stream for
+        # every row, so identical geometries receive identical samples.
+        identical = GeoSeries(
+            [line, line],
+            index=pd.Index(["duplicate", "duplicate"], name="feature_id"),
+        ).sample_points(4, rng=7)
+        identical_actual = identical.to_geopandas()
+        assert identical_actual.iloc[0].wkb == identical_actual.iloc[1].wkb
+
+        for sizes in ([], [1, 2, 3]):
+            empty_result = GeoSeries([], crs="EPSG:3857").sample_points(sizes, rng=7)
+            assert len(empty_result) == 0
+            assert empty_result.name == "sampled_points"
+            assert empty_result.crs == "EPSG:3857"
+
+        empty_float_sizes = GeoSeries([], crs="EPSG:3857").sample_points(
+            ps.Series([], dtype=float), rng=7
+        )
+        assert len(empty_float_sizes) == 0
+        assert empty_float_sizes.name == "sampled_points"
+        assert empty_float_sizes.crs == "EPSG:3857"
+
+        with pytest.raises(TypeError):
+            source.sample_points(True)
+        with pytest.raises(TypeError):
+            source.sample_points(1.5)
+        with pytest.raises(ValueError):
+            source.sample_points(-1)
+        with pytest.raises(NotImplementedError):
+            source.sample_points(1, method="cluster_poisson")
+        with pytest.raises(Exception, match="sample size values must be integers"):
+            source.sample_points(ps.Series([1.0] * len(source))).to_geopandas()
+        for short_sizes in ([], [1]):
+            with pytest.raises(Exception, match="Length of sample sizes"):
+                source.sample_points(short_sizes, rng=1).to_geopandas()
+        with pytest.warns(FutureWarning, match="'seed' keyword is deprecated"):
+            source.sample_points(1, seed=1)
+
+    def test_sample_points_stateful_rng_is_partition_stable(self):
+        line = LineString([(0, 0), (2, 0), (2, 2)])
+        identical_source = GeoSeries(
+            [line, line, line, line],
+            index=pd.Index(["duplicate"] * 4, name="feature_id"),
+        )
+        test_position_col = "__sample_points_test_position__"
+        resolved_source = identical_source._internal.resolved_copy
+        positioned_frame = InternalFrame.attach_distributed_sequence_column(
+            resolved_source.spark_frame.orderBy(NATURAL_ORDER_COLUMN_NAME),
+            test_position_col,
+        )
+        ordered_rows = positioned_frame.select(
+            F.col(test_position_col).alias("position"),
+            scol_for(
+                positioned_frame,
+                resolved_source.index_spark_column_names[0],
+            ).alias("feature_id"),
+            scol_for(
+                positioned_frame,
+                resolved_source.data_spark_column_names[0],
+            ).alias("geometry"),
+        )
+
+        # These encodings have the same row order but mimic natural-order IDs
+        # generated with one partition and with a boundary before position 2.
+        natural_order_encodings = [
+            F.col("position"),
+            F.when(F.col("position") < 2, F.col("position")).otherwise(
+                F.lit(1 << 33) + F.col("position") - F.lit(2)
+            ),
+        ]
+
+        def source_with_natural_order(encoding):
+            spark_frame = ordered_rows.select(
+                F.col("feature_id"),
+                F.col("geometry"),
+                encoding.cast("long").alias(NATURAL_ORDER_COLUMN_NAME),
+            )
+            return GeoSeries(spark_frame.pandas_api(index_col="feature_id")["geometry"])
+
+        for rng_factory in (
+            lambda: np.random.default_rng(0),
+            lambda: np.random.PCG64(0),
+        ):
+            stateful_results = [
+                source_with_natural_order(encoding).sample_points(4, rng=rng_factory())
+                for encoding in natural_order_encodings
+            ]
+            assert (
+                stateful_results[0]
+                .to_geopandas()
+                .index.equals(pd.Index(["duplicate"] * 4, name="feature_id"))
+            )
+            ordered_wkb = [
+                [
+                    row.geometry.wkb
+                    for row in result._internal.spark_frame.select(
+                        result.spark.column.alias("geometry"),
+                        scol_for(
+                            result._internal.spark_frame,
+                            NATURAL_ORDER_COLUMN_NAME,
+                        ).alias("natural_order"),
+                    )
+                    .orderBy("natural_order")
+                    .collect()
+                ]
+                for result in stateful_results
+            ]
+            assert ordered_wkb[0] == ordered_wkb[1]
+            assert len(set(ordered_wkb[0])) == len(ordered_wkb[0])
+
     def test_segmentize(self):
         s = GeoSeries(
             [
@@ -1844,8 +5097,753 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         )
         self.check_sgpd_equals_gpd(result, expected)
 
-    def test_transform(self):
-        pass
+    def test_affine_transform_preserves_metadata_and_delegates(self):
+        geoms = [
+            Point(1, 2),
+            LineString([(0, 0), (2, 1)]),
+            Polygon([(0, 0), (2, 0), (1, 1), (0, 0)]),
+            MultiPoint([(0, 0), (1, 2)]),
+            Polygon(),
+            None,
+        ]
+        index = pd.Index(
+            ["point", "line", "polygon", "multipoint", "empty", "null"],
+            name="feature_id",
+        )
+        matrix = [2, 1, -1, 3, 4, -5]
+        source = GeoSeries(geoms, index=index, crs="EPSG:3857")
+        expected = gpd.GeoSeries(geoms, index=index, crs="EPSG:3857").affine_transform(
+            matrix
+        )
+
+        result = source.affine_transform(matrix)
+
+        self.check_sgpd_equals_gpd(result, expected)
+        assert result.crs == source.crs == expected.crs
+        actual = result.to_geopandas()
+        assert actual.loc["empty"].is_empty
+        assert actual.loc["empty"].geom_type == "Polygon"
+        assert actual.loc["null"] is None
+
+        srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        assert {row.srid for row in srids if row.srid is not None} == {3857}
+
+        # GeoDataFrame inherits the base geometry-column delegation.
+        frame_result = source.to_geoframe().affine_transform(matrix)
+        assert isinstance(frame_result, GeoSeries)
+        self.check_sgpd_equals_gpd(frame_result, expected)
+        assert frame_result.crs == source.crs
+
+    def test_affine_transform_3d_coefficient_order(self):
+        source = GeoSeries([wkt.loads("POINT Z (1 2 3)")], crs="EPSG:4326")
+        result = source.affine_transform(range(1, 13))
+
+        point = result.to_geopandas().iloc[0]
+        assert tuple(point.coords[0]) == pytest.approx((24.0, 43.0, 62.0))
+        srid = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).first()
+        assert srid.srid == 4326
+        assert result.crs == source.crs
+
+    def test_affine_transform_dimension_handling(self):
+        z_geoms = [
+            Point(1, 2, 3),
+            LineString([(0, 0, 4), (2, 1, 5)]),
+            Polygon([(0, 0, 1), (2, 0, 2), (1, 1, 3), (0, 0, 1)]),
+        ]
+        matrix_2d = [2, 0, 0, 3, 4, -5]
+        result_2d_on_z = GeoSeries(z_geoms).affine_transform(matrix_2d)
+        expected_2d_on_z = gpd.GeoSeries(z_geoms).affine_transform(matrix_2d)
+        self.check_sgpd_equals_gpd(result_2d_on_z, expected_2d_on_z)
+
+        actual_2d_on_z = result_2d_on_z.to_geopandas()
+        assert all(geom.has_z for geom in actual_2d_on_z)
+        assert actual_2d_on_z.iloc[0].z == pytest.approx(3.0)
+        assert [coord[2] for coord in actual_2d_on_z.iloc[1].coords] == [4.0, 5.0]
+
+        xy_geoms = [
+            Point(1, 2),
+            LineString([(0, 0), (2, 1)]),
+            Polygon([(0, 0), (2, 0), (1, 1), (0, 0)]),
+        ]
+        matrix_3d = [
+            1.0,
+            0.5,
+            0.25,
+            -0.5,
+            2.0,
+            0.75,
+            0.1,
+            -0.2,
+            1.5,
+            3.0,
+            -4.0,
+            5.0,
+        ]
+        result_3d_on_2d = GeoSeries(xy_geoms).affine_transform(matrix_3d)
+        expected_3d_on_2d = gpd.GeoSeries(xy_geoms).affine_transform(matrix_3d)
+        self.check_sgpd_equals_gpd(result_3d_on_2d, expected_3d_on_2d)
+        assert not any(geom.has_z for geom in result_3d_on_2d.to_geopandas())
+
+        special_geoms = [Polygon(), None]
+        result_3d_special = GeoSeries(special_geoms).affine_transform(matrix_3d)
+        expected_3d_special = gpd.GeoSeries(special_geoms).affine_transform(matrix_3d)
+        self.check_sgpd_equals_gpd(result_3d_special, expected_3d_special)
+        actual_3d_special = result_3d_special.to_geopandas()
+        assert actual_3d_special.iloc[0].is_empty
+        assert actual_3d_special.iloc[0].geom_type == "Polygon"
+        assert actual_3d_special.iloc[1] is None
+
+    def test_affine_transform_validates_matrix(self):
+        source = GeoSeries([Point(1, 2)])
+
+        class OversizedSequence:
+            def __len__(self):
+                return 10**9
+
+            def __iter__(self):
+                raise AssertionError("invalid-length matrices must not be iterated")
+
+        with pytest.raises(ValueError, match="either 6 or 12 coefficients"):
+            source.affine_transform(OversizedSequence())
+
+        class InconsistentSequence:
+            def __len__(self):
+                return 6
+
+            def __iter__(self):
+                return iter([1] * 7)
+
+        with pytest.raises(ValueError, match="either 6 or 12 coefficients"):
+            source.affine_transform(InconsistentSequence())
+
+        for matrix in ([1] * 5, [1] * 7, [1] * 11, [1] * 13):
+            with pytest.raises(ValueError):
+                source.affine_transform(matrix)
+
+        for coefficient in ("not-numeric", "1", None, np.array([1])):
+            matrix = [1, 0, 0, 1, 0, coefficient]
+            with pytest.raises(TypeError, match="only numeric coefficients"):
+                source.affine_transform(matrix)
+
+        for matrix in ("123456", 123456, {1, 2, 3, 4, 5, 6}):
+            with pytest.raises(TypeError, match="local ordered sequence"):
+                source.affine_transform(matrix)
+
+        with pytest.raises(TypeError, match="local ordered sequence"):
+            source.affine_transform(ps.Series([1, 0, 0, 1, 0, 0]))
+
+    def test_rotate(self):
+        geoms = [
+            Point(1, 1),
+            LineString([(1, -1), (1, 0)]),
+            Polygon([(3, -1), (4, 0), (3, 1)]),
+            None,
+        ]
+        s = GeoSeries(geoms)
+
+        # Test default
+        result = s.rotate(90)
+        expected = gpd.GeoSeries(
+            [
+                Point(1.0, 1.0),
+                LineString([(1.5, -0.5), (0.5, -0.5)]),
+                Polygon([(4.5, -0.5), (3.5, 0.5), (2.5, -0.5), (4.5, -0.5)]),
+                None,
+            ]
+        )
+        self.check_sgpd_equals_gpd(result, expected)
+
+        # Test with explicit origin tuple (90 degrees around 0,0)
+        result = s.rotate(90, origin=(0, 0))
+        expected = gpd.GeoSeries(
+            [
+                Point(-1.0, 1.0),
+                LineString([(1.0, 1.0), (0.0, 1.0)]),
+                Polygon([(1.0, 3.0), (0.0, 4.0), (-1.0, 3.0), (1.0, 3.0)]),
+                None,
+            ]
+        )
+        self.check_sgpd_equals_gpd(result, expected)
+
+        # Test use_radians
+        import math
+
+        result = s.rotate(math.pi / 2, origin=(0, 0), use_radians=True)
+        self.check_sgpd_equals_gpd(result, expected)
+
+        # Test with a Point object as the origin
+        result = s.rotate(90, origin=Point(0, 0))
+        self.check_sgpd_equals_gpd(result, expected)
+
+        # Test origin='centroid'
+        result = s.rotate(45, origin="centroid")
+        expected = gpd.GeoSeries(
+            [
+                Point(1.0, 1.0),
+                LineString(
+                    [
+                        (1.3535533905932737, -0.8535533905932737),
+                        (0.6464466094067263, -0.14644660940672627),
+                    ]
+                ),
+                Polygon(
+                    [
+                        (3.8047378541243653, -0.9428090415820636),
+                        (3.8047378541243653, 0.4714045207910314),
+                        (2.3905242917512703, 0.4714045207910314),
+                        (3.8047378541243653, -0.9428090415820636),
+                    ]
+                ),
+                None,
+            ]
+        )
+        self.check_sgpd_equals_gpd(result, expected)
+
+        # Test invalid origin strings
+        with pytest.raises((ValueError, TypeError)):
+            s.rotate(90, origin="invalid")
+
+    @pytest.mark.parametrize(
+        "scale_kwargs",
+        [
+            pytest.param({}, id="defaults"),
+            pytest.param(
+                {
+                    "xfact": np.float64(2),
+                    "yfact": np.int64(3),
+                    "zfact": np.float32(4),
+                    "origin": "center",
+                },
+                id="custom-center",
+            ),
+            pytest.param(
+                {"xfact": 2, "yfact": 3, "zfact": 4, "origin": "centroid"},
+                id="custom-centroid",
+            ),
+            pytest.param(
+                {"xfact": -1, "yfact": 2, "zfact": -3, "origin": Point(1, 1)},
+                id="negative-point-origin",
+            ),
+            pytest.param(
+                {"xfact": 0, "yfact": 0, "zfact": 0, "origin": (0, 0)},
+                id="zero-tuple-origin",
+            ),
+        ],
+    )
+    def test_scale_factors_and_origins(self, scale_kwargs):
+        geoms = [
+            Point(2, 3),
+            LineString([(1, 2), (4, 6)]),
+            # This asymmetric polygon distinguishes bbox center from centroid.
+            Polygon([(0, 0), (4, 0), (0, 2), (0, 0)]),
+        ]
+        source = GeoSeries(geoms)
+        expected = gpd.GeoSeries(geoms).scale(**scale_kwargs)
+
+        result = source.scale(**scale_kwargs)
+
+        self.check_sgpd_equals_gpd(result, expected)
+
+    def test_scale_3d_default_origin(self):
+        result = GeoSeries([Point(1, 2, 3)]).scale(xfact=2, yfact=3, zfact=4)
+
+        point = result.to_geopandas().iloc[0]
+        # Keyword origins are 2D, so the point is its own x/y origin while
+        # z is scaled around zero.
+        assert tuple(point.coords[0]) == pytest.approx((1.0, 2.0, 12.0))
+
+    @pytest.mark.parametrize(
+        "origin,expected_coordinates",
+        [
+            pytest.param((1, 1), [(1, 4, 12), (7, 16, 36)], id="two-coordinate-tuple"),
+            pytest.param(Point(1, 1), [(1, 4, 12), (7, 16, 36)], id="2d-point"),
+            pytest.param(
+                (1, 1, 2), [(1, 4, 6), (7, 16, 30)], id="three-coordinate-tuple"
+            ),
+            pytest.param(Point(1, 1, 2), [(1, 4, 6), (7, 16, 30)], id="3d-point"),
+        ],
+    )
+    def test_scale_3d_explicit_origin(self, origin, expected_coordinates):
+        source = GeoSeries([LineString([(1, 2, 3), (4, 6, 9)])])
+
+        result = source.scale(xfact=2, yfact=3, zfact=4, origin=origin)
+
+        line = result.to_geopandas().iloc[0]
+        assert list(line.coords) == pytest.approx(expected_coordinates)
+
+    def test_scale_2d_stays_2d_with_3d_parameters(self):
+        geoms = [
+            Point(1, 2),
+            LineString([(0, 0), (2, 1)]),
+            Polygon([(0, 0), (2, 0), (1, 1), (0, 0)]),
+        ]
+        source = GeoSeries(geoms)
+        expected = gpd.GeoSeries(geoms).scale(2, 3, 4, origin=(1, 1, 2))
+
+        result = source.scale(2, 3, 4, origin=(1, 1, 2))
+
+        self.check_sgpd_equals_gpd(result, expected)
+        assert not any(geom.has_z for geom in result.to_geopandas())
+
+    def test_scale_preserves_metadata_empty_null_and_delegates(self):
+        geoms = [
+            Point(1, 2),
+            LineString([(0, 0), (2, 1)]),
+            Point(),
+            LineString(),
+            Polygon(),
+            None,
+        ]
+        index = pd.Index(
+            ["point", "line", "empty-point", "empty-line", "empty-polygon", "null"],
+            name="feature_id",
+        )
+        source = GeoSeries(geoms, index=index, crs="EPSG:3857", name="geometry")
+        expected = gpd.GeoSeries(
+            geoms, index=index, crs="EPSG:3857", name="geometry"
+        ).scale(2, 3, 4, origin="center")
+
+        result = source.scale(2, 3, 4, origin="center")
+
+        self.check_sgpd_equals_gpd(result, expected)
+        assert result.name is None
+        assert result.crs == source.crs == expected.crs
+        actual = result.to_geopandas()
+        assert actual.loc["empty-point"].is_empty
+        assert actual.loc["empty-point"].geom_type == "Point"
+        assert actual.loc["empty-line"].is_empty
+        assert actual.loc["empty-line"].geom_type == "LineString"
+        assert actual.loc["empty-polygon"].is_empty
+        assert actual.loc["empty-polygon"].geom_type == "Polygon"
+        assert actual.loc["null"] is None
+
+        srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        assert {row.srid for row in srids if row.srid is not None} == {3857}
+
+        frame_result = source.to_geoframe().scale(2, 3, 4, origin="center")
+        assert isinstance(frame_result, GeoSeries)
+        self.check_sgpd_equals_gpd(frame_result, expected)
+        assert frame_result.crs == source.crs
+
+    def test_scale_validates_factors_and_origin(self):
+        source = GeoSeries([Point(1, 2)])
+
+        invalid_factors = [
+            ("xfact", None),
+            ("yfact", "2"),
+            ("zfact", np.array([2])),
+            ("xfact", [2]),
+            ("yfact", 2 + 1j),
+        ]
+        for name, value in invalid_factors:
+            with pytest.raises(TypeError, match=rf"'{name}' must be a numeric scalar"):
+                source.scale(**{name: value})
+
+        with pytest.raises(TypeError, match="'xfact' must be a numeric scalar"):
+            source.scale(xfact=ps.Series([2.0]))
+
+        for origin in ("invalid", "CENTER"):
+            with pytest.raises(ValueError, match="origin must be"):
+                source.scale(origin=origin)
+
+        for origin in ((1,), (1, 2, 3, 4)):
+            with pytest.raises(
+                ValueError, match="tuple must contain two or three coordinates"
+            ):
+                source.scale(origin=origin)
+
+        for origin in ((1, "2"), (1, None), (1, 2, "invalid-z")):
+            with pytest.raises(TypeError, match="only numeric coordinates"):
+                source.scale(origin=origin)
+
+        for origin in (None, [0, 0], Polygon([(0, 0), (1, 0), (0, 1)])):
+            with pytest.raises(TypeError, match="origin must be"):
+                source.scale(origin=origin)
+
+        with pytest.raises(ValueError, match="Point must be a non-empty 2D or 3D"):
+            source.scale(origin=Point())
+
+        # Operation-wide arguments are validated even when there is no
+        # non-empty geometry on which to apply the transformation.
+        empty_source = GeoSeries([Polygon(), None])
+        with pytest.raises(TypeError, match="'xfact' must be a numeric scalar"):
+            empty_source.scale(xfact=None)
+        with pytest.raises(ValueError, match="origin must be"):
+            empty_source.scale(origin="invalid")
+
+    def test_skew_documented_examples(self):
+        geoms = [
+            Point(1, 1),
+            LineString([(1, -1), (1, 0)]),
+            Polygon([(3, -1), (4, 0), (3, 1), (3, -1)]),
+        ]
+        source = GeoSeries(geoms)
+
+        for kwargs in (
+            {"xs": 45, "ys": 30},
+            {"xs": 45, "ys": 30, "origin": (0, 0)},
+        ):
+            result = source.skew(**kwargs)
+            expected = gpd.GeoSeries(geoms).skew(**kwargs)
+            self.check_sgpd_equals_gpd(result, expected)
+
+    @pytest.mark.parametrize(
+        "xs,ys",
+        [
+            pytest.param(45, 0, id="x-only"),
+            pytest.param(0, 30, id="y-only"),
+            pytest.param(45, 30, id="both"),
+            pytest.param(-45, -30, id="negative"),
+            pytest.param(0, 0, id="zero"),
+        ],
+    )
+    def test_skew_angle_combinations(self, xs, ys):
+        geoms = [
+            Point(1, 2),
+            LineString([(0, 0), (2, 4)]),
+            Polygon([(0, 0), (4, 0), (0, 2), (0, 0)]),
+        ]
+        source = GeoSeries(geoms)
+        expected = gpd.GeoSeries(geoms).skew(xs, ys, origin=(0, 0))
+
+        result = source.skew(xs, ys, origin=(0, 0))
+
+        self.check_sgpd_equals_gpd(result, expected)
+
+    def test_skew_degrees_radians_and_180_degree_clamp(self):
+        import math
+
+        source = GeoSeries([LineString([(0, 0), (2, 4)])])
+
+        degrees = source.skew(45, 30, origin=(0, 0)).to_geopandas().iloc[0]
+        radians = (
+            source.skew(
+                math.pi / 4,
+                math.pi / 6,
+                origin=(0, 0),
+                use_radians=True,
+            )
+            .to_geopandas()
+            .iloc[0]
+        )
+        numpy_bool_radians = (
+            source.skew(
+                math.pi / 4,
+                math.pi / 6,
+                origin=(0, 0),
+                use_radians=np.bool_(True),
+            )
+            .to_geopandas()
+            .iloc[0]
+        )
+        clamped = source.skew(180, 180, origin=(0, 0)).to_geopandas().iloc[0]
+
+        expected = [(0.0, 0.0), (6.0, 5.1547005383792515)]
+        assert list(degrees.coords) == pytest.approx(expected)
+        assert list(radians.coords) == pytest.approx(expected)
+        assert list(numpy_bool_radians.coords) == pytest.approx(expected)
+        assert list(clamped.coords) == [(0.0, 0.0), (2.0, 4.0)]
+
+    @pytest.mark.parametrize(
+        "use_radians",
+        [
+            pytest.param(0, id="int-false"),
+            pytest.param(1, id="int-true"),
+            pytest.param(np.int64(0), id="numpy-int-false"),
+            pytest.param(np.int64(1), id="numpy-int-true"),
+        ],
+    )
+    def test_skew_accepts_integer_use_radians(self, use_radians):
+        source = GeoSeries([LineString([(0, 0), (2, 4)])])
+        kwargs = {
+            "xs": 0.5,
+            "ys": -0.25,
+            "origin": (0, 0),
+            "use_radians": use_radians,
+        }
+
+        result = source.skew(**kwargs)
+        expected = source.to_geopandas().skew(**kwargs)
+
+        self.check_sgpd_equals_gpd(result, expected)
+
+    def test_skew_center_and_centroid_origins(self):
+        source = GeoSeries([Polygon([(0, 0), (4, 0), (0, 2), (0, 0)])])
+
+        centered = source.skew(45, 30, origin="center").to_geopandas().iloc[0]
+        centroid = source.skew(45, 30, origin="centroid").to_geopandas().iloc[0]
+
+        assert centered.exterior.coords[0] == pytest.approx((-1.0, -1.1547005383792512))
+        assert centroid.exterior.coords[0] == pytest.approx(
+            (-2.0 / 3.0, -0.7698003589195008)
+        )
+
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            pytest.param((1, 1), id="two-coordinate-tuple"),
+            pytest.param((1, 1, 999), id="three-coordinate-tuple"),
+            pytest.param(Point(1, 1), id="2d-point"),
+            pytest.param(Point(1, 1, 999), id="3d-point"),
+        ],
+    )
+    def test_skew_explicit_origins_ignore_z(self, origin):
+        source = GeoSeries([LineString([(1, 2, 3), (4, 6, 9)])])
+
+        result = source.skew(45, 45, origin=origin)
+
+        line = result.to_geopandas().iloc[0]
+        assert line.has_z
+        assert list(line.coords) == pytest.approx([(2, 2, 3), (9, 9, 9)])
+        assert [coordinate[2] for coordinate in line.coords] == [3.0, 9.0]
+
+    def test_skew_2d_stays_2d_with_3d_origin(self):
+        geoms = [
+            Point(1, 2),
+            LineString([(0, 0), (2, 1)]),
+            Polygon([(0, 0), (2, 0), (1, 1), (0, 0)]),
+        ]
+        source = GeoSeries(geoms)
+        expected = gpd.GeoSeries(geoms).skew(45, 30, origin=(1, 1, 999))
+
+        result = source.skew(45, 30, origin=(1, 1, 999))
+
+        self.check_sgpd_equals_gpd(result, expected)
+        assert not any(geom.has_z for geom in result.to_geopandas())
+
+    @pytest.mark.parametrize("origin", ["center", "centroid"])
+    def test_skew_preserves_metadata_empty_null_and_delegates(self, origin):
+        geoms = [
+            Point(1, 2),
+            LineString([(0, 0), (2, 1)]),
+            Point(),
+            LineString(),
+            Polygon(),
+            None,
+        ]
+        index = pd.Index(
+            ["point", "line", "empty-point", "empty-line", "empty-polygon", "null"],
+            name="feature_id",
+        )
+        source = GeoSeries(geoms, index=index, crs="EPSG:3857", name="geometry")
+        expected = gpd.GeoSeries(
+            geoms, index=index, crs="EPSG:3857", name="geometry"
+        ).skew(45, 30, origin=origin)
+
+        result = source.skew(45, 30, origin=origin)
+
+        self.check_sgpd_equals_gpd(result, expected)
+        assert result.name is None
+        assert result.crs == source.crs == expected.crs
+        actual = result.to_geopandas()
+        assert actual.loc["empty-point"].is_empty
+        assert actual.loc["empty-point"].geom_type == "Point"
+        assert actual.loc["empty-line"].is_empty
+        assert actual.loc["empty-line"].geom_type == "LineString"
+        assert actual.loc["empty-polygon"].is_empty
+        assert actual.loc["empty-polygon"].geom_type == "Polygon"
+        assert actual.loc["null"] is None
+
+        srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        assert {row.srid for row in srids if row.srid is not None} == {3857}
+
+        frame_result = source.to_geoframe().skew(45, 30, origin=origin)
+        assert isinstance(frame_result, GeoSeries)
+        self.check_sgpd_equals_gpd(frame_result, expected)
+        assert frame_result.crs == source.crs
+
+    def test_skew_validates_angles_units_and_origin(self):
+        source = GeoSeries([Point(1, 2)])
+
+        invalid_angles = [
+            ("xs", None),
+            ("ys", "30"),
+            ("xs", np.array([45])),
+            ("ys", [30]),
+            ("xs", 45 + 1j),
+        ]
+        for name, value in invalid_angles:
+            with pytest.raises(TypeError, match=rf"'{name}' must be a numeric scalar"):
+                source.skew(**{name: value})
+
+        for name in ("xs", "ys"):
+            with pytest.raises(TypeError, match=rf"'{name}' must be a numeric scalar"):
+                source.skew(**{name: ps.Series([45.0])})
+
+        for use_radians in (None, 0.0, 1.0, "true", [True], np.array(True)):
+            with pytest.raises(TypeError, match="'use_radians' must be a boolean"):
+                source.skew(use_radians=use_radians)
+
+        for origin in ("invalid", "CENTER"):
+            with pytest.raises(ValueError, match="origin must be"):
+                source.skew(origin=origin)
+
+        for origin in ((1,), (1, 2, 3, 4)):
+            with pytest.raises(
+                ValueError, match="tuple must contain two or three coordinates"
+            ):
+                source.skew(origin=origin)
+
+        for origin in ((1, "2"), (1, None), (1, 2, "ignored-by-skew")):
+            with pytest.raises(TypeError, match="only numeric coordinates"):
+                source.skew(origin=origin)
+
+        for origin in (
+            None,
+            [0, 0],
+            Polygon([(0, 0), (1, 0), (0, 1)]),
+            ps.Series([0.0, 0.0]),
+        ):
+            with pytest.raises(TypeError, match="origin must be"):
+                source.skew(origin=origin)
+
+        with pytest.raises(ValueError, match="Point must be a non-empty 2D or 3D"):
+            source.skew(origin=Point())
+
+        # Operation-wide arguments are validated even when there is no
+        # non-empty geometry on which to apply the transformation.
+        empty_source = GeoSeries([Polygon(), None])
+        for name in ("xs", "ys"):
+            with pytest.raises(TypeError, match=rf"'{name}' must be a numeric scalar"):
+                empty_source.skew(**{name: None})
+        with pytest.raises(TypeError, match="'use_radians' must be a boolean"):
+            empty_source.skew(use_radians=1.0)
+        with pytest.raises(ValueError, match="origin must be"):
+            empty_source.skew(origin="invalid")
+
+    def test_translate_documented_example_and_delegation(self):
+        geoms = [
+            Point(1, 1),
+            LineString([(1, -1), (1, 0)]),
+            Polygon([(3, -1), (4, 0), (3, 1)]),
+            None,
+        ]
+        s = GeoSeries(geoms)
+
+        # Docstring example: translate(2, 3)
+        result = s.translate(2, 3)
+        expected = gpd.GeoSeries(
+            [
+                Point(3, 4),
+                LineString([(3, 2), (3, 3)]),
+                Polygon([(5, 2), (6, 3), (5, 4), (5, 2)]),
+                None,
+            ]
+        )
+        self.check_sgpd_equals_gpd(result, expected)
+
+        df_result = s.to_geoframe().translate(2, 3)
+        assert isinstance(df_result, GeoSeries)
+        self.check_sgpd_equals_gpd(df_result, expected)
+
+    @pytest.mark.parametrize(
+        "offsets",
+        [
+            pytest.param((), id="defaults"),
+            pytest.param((2, -3, 0), id="integer-xy"),
+            pytest.param((-1.5, 0.25, -2.0), id="negative-fractional"),
+            pytest.param(
+                (np.float64(2), np.int64(3), np.float32(5)),
+                id="numpy-scalars",
+            ),
+        ],
+    )
+    def test_translate_offsets_and_dimensions(self, offsets):
+        geoms = [
+            Point(1, 2),
+            LineString([(0, 0), (2, 4)]),
+            Point(1, 2, 3),
+            LineString([(0, 0, 1), (2, 4, 7)]),
+        ]
+        source = GeoSeries(geoms)
+        expected = gpd.GeoSeries(geoms).translate(*offsets)
+
+        result = source.translate(*offsets)
+
+        self.check_sgpd_equals_gpd(result, expected)
+        actual = result.to_geopandas().sort_index()
+        assert not actual.iloc[0].has_z
+        assert not actual.iloc[1].has_z
+        assert actual.iloc[2].has_z
+        assert actual.iloc[3].has_z
+
+    def test_translate_preserves_metadata_empty_and_null(self):
+        geoms = [
+            Point(1, 2),
+            Point(),
+            LineString(),
+            Polygon(),
+            None,
+        ]
+        index = pd.Index(
+            ["point", "empty-point", "empty-line", "empty-polygon", "null"],
+            name="feature_id",
+        )
+        source = GeoSeries(geoms, index=index, crs="EPSG:3857", name="geometry")
+        expected = gpd.GeoSeries(
+            geoms, index=index, crs="EPSG:3857", name="geometry"
+        ).translate(2, -3, 5)
+
+        result = source.translate(2, -3, 5)
+
+        self.check_sgpd_equals_gpd(result, expected)
+        assert result.name is None
+        assert result.crs == source.crs == expected.crs
+        actual = result.to_geopandas()
+        assert actual.loc["empty-point"].is_empty
+        assert actual.loc["empty-point"].geom_type == "Point"
+        assert actual.loc["empty-line"].is_empty
+        assert actual.loc["empty-line"].geom_type == "LineString"
+        assert actual.loc["empty-polygon"].is_empty
+        assert actual.loc["empty-polygon"].geom_type == "Polygon"
+        assert actual.loc["null"] is None
+
+        srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        assert {row.srid for row in srids if row.srid is not None} == {3857}
+
+        frame_result = source.to_geoframe().translate(2, -3, 5)
+        assert isinstance(frame_result, GeoSeries)
+        self.check_sgpd_equals_gpd(frame_result, expected)
+        assert frame_result.crs == source.crs
+
+    def test_translate_validates_offsets(self):
+        source = GeoSeries([Point(1, 2)])
+        invalid_offsets = [
+            ("xoff", None),
+            ("yoff", "2"),
+            ("zoff", np.array([2])),
+            ("xoff", np.array(2.0)),
+            ("yoff", [2]),
+            ("zoff", 2 + 1j),
+            ("xoff", pd.Series([2.0])),
+        ]
+        for name, value in invalid_offsets:
+            with pytest.raises(TypeError, match=rf"'{name}' must be a numeric scalar"):
+                source.translate(**{name: value})
+
+        for value in (ps.Series([2.0]), source.spark.column):
+            for name in ("xoff", "yoff", "zoff"):
+                with pytest.raises(
+                    TypeError, match=rf"'{name}' must be a numeric scalar"
+                ):
+                    source.translate(**{name: value})
+
+        # Operation-wide arguments are validated even when there is no
+        # non-empty geometry on which to apply the transformation.
+        empty_source = GeoSeries([Point(), LineString(), Polygon(), None])
+        for name in ("xoff", "yoff", "zoff"):
+            with pytest.raises(TypeError, match=rf"'{name}' must be a numeric scalar"):
+                empty_source.translate(**{name: None})
 
     def test_force_2d(self):
         s = sgpd.GeoSeries(
@@ -2111,6 +6109,30 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         result = s.to_geoframe().difference(s2.to_geoframe())
         self.check_sgpd_equals_gpd(result, expected)
 
+    def test_crosses_geometry_collections(self):
+        geometries = [
+            wkt.loads("GEOMETRYCOLLECTION (POINT (1 1), POINT (3 3))"),
+            wkt.loads("GEOMETRYCOLLECTION (POINT (10 10), LINESTRING (0 2, 2 0))"),
+            wkt.loads(
+                "GEOMETRYCOLLECTION (GEOMETRYCOLLECTION (LINESTRING (0 2, 2 0)))"
+            ),
+            wkt.loads("GEOMETRYCOLLECTION (LINESTRING (1 1, 3 3))"),
+            wkt.loads("GEOMETRYCOLLECTION (POINT (0 0))"),
+            GeometryCollection(),
+            None,
+        ]
+        line = LineString([(0, 0), (2, 2)])
+        local = gpd.GeoSeries(geometries)
+        expected = local.crosses(line)
+        assert expected.tolist() == [True, True, True, False, False, False, False]
+
+        series = GeoSeries(geometries)
+        self.check_pd_series_equal(series.crosses(line), expected)
+        self.check_pd_series_equal(series.to_geoframe().crosses(line), expected)
+
+        lines = GeoSeries([line] * len(geometries))
+        self.check_pd_series_equal(lines.crosses(series, align=False), expected)
+
     def test_crosses(self):
         s = GeoSeries(
             [
@@ -2147,9 +6169,6 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         df_result = s.to_geoframe().crosses(s2, align=False)
         self.check_pd_series_equal(df_result, expected)
 
-        # Sedona ST_Crosses doesn't support GeometryCollection, so it returns NULL for now.
-        # https://github.com/apache/sedona/issues/2417
-        # Once this is resolved, we can update the expected result of this test.
         # Ensure M-dimension doesn't break things.
         s = GeoSeries(
             [
@@ -2159,7 +6178,7 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         )
         line = LineString([(0, 0), (1, 1)])
         result = s.crosses(line)
-        expected = pd.Series([None, False])
+        expected = pd.Series([False, False], dtype=bool)
         self.check_pd_series_equal(result, expected)
 
     def test_disjoint(self):
@@ -2681,6 +6700,233 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         )
         self.check_sgpd_equals_gpd(df_result, expected)
 
+    @requires_geopandas_shared_paths
+    def test_shared_paths(self):
+        reference = LineString([(0, 0), (2, 0), (2, 1)])
+        geometries = [
+            LineString([(0, 0), (2, 0), (2, 2)]),
+            LineString([(2, 2), (2, 0), (0, 0)]),
+            MultiLineString(
+                [
+                    [(0, 0), (2, 0)],
+                    [(2, 2), (2, 1)],
+                ]
+            ),
+            LineString(),
+            None,
+        ]
+        index = pd.MultiIndex.from_tuples(
+            [
+                ("same", 1),
+                ("opposite", 2),
+                ("multi", 3),
+                ("empty", 4),
+                ("null", 5),
+            ],
+            names=["kind", "row"],
+        )
+        source = GeoSeries(
+            geometries,
+            index=index,
+            crs="EPSG:3857",
+            name="roads",
+        )
+        expected = gpd.GeoSeries(
+            geometries,
+            index=index,
+            crs="EPSG:3857",
+            name="roads",
+        ).shared_paths(reference)
+
+        result = source.shared_paths(reference)
+
+        self.check_sgpd_equals_gpd(result, expected)
+        assert result.name is None
+        assert result.crs == source.crs == expected.crs
+        actual = result.to_geopandas()
+        for label in index[:-1]:
+            actual_collection = actual.loc[label]
+            expected_collection = expected.loc[label]
+            assert actual_collection.geom_type == "GeometryCollection"
+            assert len(actual_collection.geoms) == 2
+            for component in range(2):
+                assert actual_collection.geoms[component].equals(
+                    expected_collection.geoms[component]
+                )
+        assert actual.loc[("null", 5)] is None
+
+        srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        assert {row.srid for row in srids if row.srid is not None} == {3857}
+
+        frame_source = GeoSeries(
+            geometries,
+            index=pd.Index(["same", "opposite", "multi", "empty", "null"]),
+            crs="EPSG:3857",
+        )
+        frame_expected = gpd.GeoSeries(
+            geometries,
+            index=pd.Index(["same", "opposite", "multi", "empty", "null"]),
+            crs="EPSG:3857",
+        ).shared_paths(reference)
+        frame_result = frame_source.to_geoframe().shared_paths(reference)
+        assert isinstance(frame_result, GeoSeries)
+        self.check_sgpd_equals_gpd(frame_result, frame_expected)
+        assert frame_result.crs == frame_source.crs
+
+        with pytest.raises(TypeError, match="'other' must be"):
+            source.shared_paths(None)
+
+    def test_shared_paths_avoids_unnecessary_srid_copies(self, monkeypatch):
+        left = GeoSeries(
+            [LineString([(0, 0), (2, 0)])],
+            crs="EPSG:3857",
+        )
+        right = GeoSeries(
+            [LineString([(0, 0), (1, 0)])],
+            crs="EPSG:3857",
+        )
+        reference = LineString([(0, 0), (1, 0)])
+        original_set_srid = stf.ST_SetSRID
+        set_srid_arguments = []
+
+        def recording_set_srid(geometry, srid):
+            set_srid_arguments.append(srid)
+            return original_set_srid(geometry, srid)
+
+        monkeypatch.setattr(stf, "ST_SetSRID", recording_set_srid)
+
+        matching_result = left.shared_paths(right, align=False)
+        assert set_srid_arguments == []
+        assert matching_result.to_geopandas().iloc[0] is not None
+
+        scalar_result = left.shared_paths(reference)
+        assert set_srid_arguments == [3857]
+        assert scalar_result.to_geopandas().iloc[0] is not None
+
+    @requires_geopandas_shared_paths
+    def test_shared_paths_duplicate_multiindex_alignment(self):
+        left_index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 1), ("b", 2)], names=["group", "row"]
+        )
+        right_index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 1), ("c", 3)], names=["group", "row"]
+        )
+        left_geometries = [
+            LineString([(0, 0), (2, 0)]),
+            LineString([(2, 0), (0, 0)]),
+            LineString([(0, 1), (2, 1)]),
+        ]
+        right_geometries = [
+            LineString([(0, 0), (1, 0)]),
+            LineString([(2, 0), (1, 0)]),
+            LineString([(0, 3), (2, 3)]),
+        ]
+        left = GeoSeries(left_geometries, index=left_index, crs="EPSG:4326")
+        right = GeoSeries(right_geometries, index=right_index, crs="EPSG:4326")
+        expected_left = gpd.GeoSeries(
+            left_geometries, index=left_index, crs="EPSG:4326"
+        )
+        expected_right = gpd.GeoSeries(
+            right_geometries, index=right_index, crs="EPSG:4326"
+        )
+
+        result = left.shared_paths(right, align=True)
+        expected = expected_left.shared_paths(expected_right, align=True)
+
+        actual = result.to_geopandas()
+        assert len(actual) == 6
+        pd.testing.assert_index_equal(actual.index, expected.index)
+        assert result.crs == left.crs
+        for actual_collection, expected_collection in zip(actual, expected):
+            if actual_collection is None or expected_collection is None:
+                assert actual_collection is None and expected_collection is None
+                continue
+            for component in range(2):
+                assert actual_collection.geoms[component].equals(
+                    expected_collection.geoms[component]
+                )
+
+        positional_result = left.shared_paths(right, align=False)
+        positional_expected = expected_left.shared_paths(expected_right, align=False)
+        positional_actual = positional_result.to_geopandas()
+        pd.testing.assert_index_equal(
+            positional_actual.index, positional_expected.index
+        )
+        for actual_collection, expected_collection in zip(
+            positional_actual, positional_expected
+        ):
+            for component in range(2):
+                assert actual_collection.geoms[component].equals(
+                    expected_collection.geoms[component]
+                )
+
+    @requires_geopandas_shared_paths
+    def test_shared_paths_default_alignment_warning_and_length_validation(self):
+        left = GeoSeries(
+            [LineString([(0, 0), (2, 0)])],
+            index=pd.Index(["left"], name="feature"),
+        )
+        right = GeoSeries(
+            [LineString([(0, 0), (1, 0)])],
+            index=pd.Index(["right"], name="feature"),
+        )
+
+        with pytest.warns(
+            UserWarning,
+            match="The indices of the left and right GeoSeries' are not equal",
+        ):
+            result = left.shared_paths(right)
+        expected = gpd.GeoSeries(
+            [LineString([(0, 0), (2, 0)])],
+            index=pd.Index(["left"], name="feature"),
+        ).shared_paths(
+            gpd.GeoSeries(
+                [LineString([(0, 0), (1, 0)])],
+                index=pd.Index(["right"], name="feature"),
+            ),
+            align=True,
+        )
+        self.check_sgpd_equals_gpd(result, expected)
+
+        with pytest.warns(UserWarning, match="CRS mismatch") as warning_info:
+            crs_result = GeoSeries(
+                [LineString([(0, 0), (2, 0)])], crs="EPSG:4326"
+            ).shared_paths(
+                GeoSeries([LineString([(0, 0), (1, 0)])], crs="EPSG:3857"),
+                align=False,
+            )
+        crs_warning = next(
+            warning
+            for warning in warning_info
+            if "CRS mismatch" in str(warning.message)
+        )
+        assert crs_warning.filename == __file__
+        assert crs_result.crs.to_epsg() == 4326
+        with pytest.warns(UserWarning, match="CRS mismatch"):
+            crs_expected = gpd.GeoSeries(
+                [LineString([(0, 0), (2, 0)])], crs="EPSG:4326"
+            ).shared_paths(
+                gpd.GeoSeries([LineString([(0, 0), (1, 0)])], crs="EPSG:3857"),
+                align=False,
+            )
+        self.check_sgpd_equals_gpd(crs_result, crs_expected)
+
+        with pytest.raises(
+            ValueError,
+            match=r"Lengths of inputs do not match\. Left: 1, Right: 2",
+        ):
+            left.shared_paths(
+                GeoSeries(
+                    [
+                        LineString([(0, 0), (1, 0)]),
+                        LineString([(0, 1), (1, 1)]),
+                    ]
+                ),
+                align=False,
+            )
+
     def test_intersection_all(self):
         s = GeoSeries([box(0, 0, 2, 2), box(1, 1, 3, 3)])
         result = s.intersection_all()
@@ -2974,6 +7220,892 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         expected = pd.Series([True, False, True])
         self.check_pd_series_equal(df_result, expected)
 
+    @pytest.mark.parametrize(
+        ("method", "kwargs"),
+        [
+            ("geom_equals", {}),
+            ("geom_equals_exact", {"tolerance": 0}),
+        ],
+    )
+    def test_equality_predicates_warn_on_crs_mismatch(self, method, kwargs):
+        left = GeoSeries([Point(0, 0)], crs="EPSG:4326")
+
+        right = GeoSeries([Point(0, 0)], crs="EPSG:3857")
+        right_operands = [
+            right,
+            right.to_geoframe(),
+            right.to_spark_pandas(),
+            GeoSeries([Point(0, 0)]),
+        ]
+        for right_operand in right_operands:
+            with pytest.warns(UserWarning, match="CRS mismatch") as warning_info:
+                result = getattr(left, method)(
+                    right_operand,
+                    align=False,
+                    **kwargs,
+                )
+
+            crs_warnings = [
+                warning
+                for warning in warning_info
+                if "CRS mismatch" in str(warning.message)
+            ]
+            assert len(crs_warnings) == 1
+            assert crs_warnings[0].filename == __file__
+            self.check_pd_series_equal(result, pd.Series([True]))
+
+        with pytest.warns(UserWarning, match="CRS mismatch") as warning_info:
+            frame_result = getattr(left.to_geoframe(), method)(
+                right,
+                align=False,
+                **kwargs,
+            )
+        crs_warnings = [
+            warning
+            for warning in warning_info
+            if "CRS mismatch" in str(warning.message)
+        ]
+        assert len(crs_warnings) == 1
+        assert crs_warnings[0].filename == __file__
+        self.check_pd_series_equal(frame_result, pd.Series([True]))
+
+    @pytest.mark.parametrize(
+        ("method", "kwargs"),
+        [
+            ("geom_equals", {}),
+            ("geom_equals_exact", {"tolerance": 0}),
+        ],
+    )
+    def test_equality_predicates_avoid_spurious_crs_warnings(self, method, kwargs):
+        left = GeoSeries([Point(0, 0)], crs="EPSG:4326")
+        right = GeoSeries([Point(0, 0)], crs="EPSG:4326")
+
+        with warnings.catch_warnings(record=True) as warning_info:
+            warnings.simplefilter("always")
+            matching_result = getattr(left, method)(right, align=False, **kwargs)
+            spark_pandas_result = getattr(left, method)(
+                right.to_spark_pandas(),
+                align=False,
+                **kwargs,
+            )
+            scalar_result = getattr(left, method)(Point(0, 0), **kwargs)
+            crsless_result = getattr(GeoSeries([Point(0, 0)]), method)(
+                GeoSeries([Point(0, 0)]),
+                align=False,
+                **kwargs,
+            )
+
+        assert not any(
+            "CRS mismatch" in str(warning.message) for warning in warning_info
+        )
+        self.check_pd_series_equal(matching_result, pd.Series([True]))
+        self.check_pd_series_equal(spark_pandas_result, pd.Series([True]))
+        self.check_pd_series_equal(scalar_result, pd.Series([True]))
+        self.check_pd_series_equal(crsless_result, pd.Series([True]))
+
+    @pytest.mark.parametrize(
+        ("method", "kwargs"),
+        [
+            ("geom_equals", {}),
+            ("geom_equals_exact", {"tolerance": 0}),
+        ],
+    )
+    def test_equality_predicate_crs_warning_preserves_alignment(self, method, kwargs):
+        left = GeoSeries([Point(0, 0)], index=[1], crs="EPSG:4326")
+        right = GeoSeries([Point(0, 0)], index=[0], crs="EPSG:3857")
+
+        with pytest.warns(UserWarning, match="CRS mismatch") as warning_info:
+            result = getattr(left, method)(right, align=True, **kwargs)
+
+        crs_warnings = [
+            warning
+            for warning in warning_info
+            if "CRS mismatch" in str(warning.message)
+        ]
+        assert len(crs_warnings) == 1
+        assert crs_warnings[0].filename == __file__
+        self.check_pd_series_equal(result, pd.Series([False, False], index=[0, 1]))
+
+    @pytest.mark.parametrize(
+        ("method", "kwargs"),
+        [
+            ("geom_equals", {}),
+            ("geom_equals_exact", {"tolerance": 0}),
+        ],
+    )
+    def test_equality_predicate_alignment_warning_stays_at_user_call(
+        self, method, kwargs
+    ):
+        left_index = pd.MultiIndex.from_tuples(
+            [("left", 0)],
+            names=["side", "row"],
+        )
+        right_index = pd.MultiIndex.from_tuples(
+            [("right", 0)],
+            names=["side", "row"],
+        )
+        left = GeoSeries([Point(0, 0)], index=left_index)
+        right = GeoSeries([Point(0, 0)], index=right_index)
+
+        with pytest.warns(
+            UserWarning,
+            match="indices of the left and right GeoSeries",
+        ) as warning_info:
+            getattr(left, method)(right, **kwargs)
+
+        alignment_warning = next(
+            warning
+            for warning in warning_info
+            if "indices of the left and right GeoSeries" in str(warning.message)
+        )
+        assert alignment_warning.filename == __file__
+
+    def test_binary_operation_with_projected_multiindex(self):
+        index = pd.MultiIndex.from_tuples([("a", 1), ("b", 2)], names=["group", "row"])
+        result = GeoSeries([Point(0, 0), Point(1, 1)], index=index).geom_equals(
+            Point(0, 0)
+        )
+        expected = pd.Series([True, False], index=index)
+        self.check_pd_series_equal(result, expected)
+
+    def test_binary_operation_single_index_alignment_stays_lazy(self, monkeypatch):
+        left_geometries = [box(0, 0, 2, 2), box(3, 3, 5, 5)]
+        right_geometries = [box(1, 1, 4, 4), box(0, 0, 1, 1)]
+        left = GeoSeries(left_geometries, index=["a", "b"])
+        right = GeoSeries(right_geometries, index=["b", "a"])
+        sequence_attachments = []
+        original_attach = InternalFrame.attach_distributed_sequence_column
+
+        def recording_attach(sdf, column_name):
+            sequence_attachments.append(column_name)
+            return original_attach(sdf, column_name)
+
+        monkeypatch.setattr(
+            InternalFrame,
+            "attach_distributed_sequence_column",
+            recording_attach,
+        )
+
+        result = left.intersection(right, align=True)
+        assert sequence_attachments == []
+        expected = gpd.GeoSeries(left_geometries, index=["a", "b"]).intersection(
+            gpd.GeoSeries(right_geometries, index=["b", "a"]), align=True
+        )
+        self.check_sgpd_equals_gpd(result, expected)
+
+    @pytest.mark.parametrize(
+        ("method", "kwargs"),
+        [
+            ("intersection", {}),
+            ("shortest_line", {}),
+            ("snap", {"tolerance": 0.25}),
+        ],
+    )
+    def test_binary_geometry_operations_preserve_duplicate_multiindex(
+        self, method, kwargs
+    ):
+        left_index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 1), ("b", 2)], names=["group", "row"]
+        )
+        right_index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 1), ("c", 3)], names=["group", "row"]
+        )
+        left = GeoSeries(
+            [
+                LineString([(0, 0), (2, 0)]),
+                LineString([(0, 0), (2, 0)]),
+                LineString([(0, 1), (2, 1)]),
+            ],
+            index=left_index,
+        )
+        right = GeoSeries(
+            [
+                LineString([(0, 0), (1, 0)]),
+                LineString([(1, 0), (2, 0)]),
+                LineString([(0, 3), (2, 3)]),
+            ],
+            index=right_index,
+        )
+
+        result = getattr(left, method)(right, align=True, **kwargs)
+        expected = getattr(gpd.GeoSeries(left.to_geopandas()), method)(
+            gpd.GeoSeries(right.to_geopandas()),
+            align=True,
+            **kwargs,
+        )
+
+        self.check_sgpd_equals_gpd(result, expected)
+        assert len(result) == 6
+
+        identical_right = GeoSeries(
+            right.to_geopandas().array,
+            index=left_index,
+        )
+        identical_result = getattr(left, method)(identical_right, align=True, **kwargs)
+        identical_expected = getattr(gpd.GeoSeries(left.to_geopandas()), method)(
+            gpd.GeoSeries(identical_right.to_geopandas()),
+            align=True,
+            **kwargs,
+        )
+
+        self.check_sgpd_equals_gpd(identical_result, identical_expected)
+        assert len(identical_result) == 3
+
+    def test_geom_equals_exact(self):
+        s = GeoSeries([Point(0, 1.1), Point(0, 1.0), Point(0, 1.2)])
+
+        result = s.geom_equals_exact(Point(0, 1), tolerance=0.1)
+        expected = gpd.GeoSeries(
+            [Point(0, 1.1), Point(0, 1.0), Point(0, 1.2)]
+        ).geom_equals_exact(Point(0, 1), tolerance=0.1)
+        self.check_pd_series_equal(result, expected)
+
+        result = s.geom_equals_exact(Point(0, 1), tolerance=0.15)
+        expected = gpd.GeoSeries(
+            [Point(0, 1.1), Point(0, 1.0), Point(0, 1.2)]
+        ).geom_equals_exact(Point(0, 1), tolerance=0.15)
+        self.check_pd_series_equal(result, expected)
+
+        df_result = s.to_geoframe().geom_equals_exact(Point(0, 1), tolerance=0.15)
+        self.check_pd_series_equal(df_result, expected)
+
+    def test_geom_equals_exact_alignment(self):
+        left_geometries = [Point(0, 0), Point(1, 1), None]
+        right_geometries = [Point(1, 1), Point(0, 0), Point(9, 9)]
+        left_index = ["a", "b", "c"]
+        right_index = ["b", "a", "d"]
+
+        left = GeoSeries(left_geometries, index=left_index)
+        right = GeoSeries(right_geometries, index=right_index)
+        expected_left = gpd.GeoSeries(left_geometries, index=left_index)
+        expected_right = gpd.GeoSeries(right_geometries, index=right_index)
+
+        result = left.geom_equals_exact(right, tolerance=0)
+        expected = expected_left.geom_equals_exact(
+            expected_right, tolerance=0, align=True
+        )
+        self.check_pd_series_equal(result, expected)
+
+        result = left.geom_equals_exact(right, tolerance=0, align=True)
+        self.check_pd_series_equal(result, expected)
+
+        result = left.geom_equals_exact(right, tolerance=0, align=False)
+        expected = expected_left.geom_equals_exact(
+            expected_right, tolerance=0, align=False
+        )
+        self.check_pd_series_equal(result, expected)
+
+    def test_geom_equals_exact_duplicate_index_alignment(self):
+        index = ["a", "a"]
+        left_geometries = [Point(0, 0), Point(1, 1)]
+        right_geometries = [Point(0, 0), Point(9, 9)]
+
+        result = GeoSeries(left_geometries, index=index).geom_equals_exact(
+            GeoSeries(right_geometries, index=index), tolerance=0, align=True
+        )
+        expected = gpd.GeoSeries(left_geometries, index=index).geom_equals_exact(
+            gpd.GeoSeries(right_geometries, index=index),
+            tolerance=0,
+            align=True,
+        )
+        self.check_pd_series_equal(result, expected)
+
+    def test_geom_equals_exact_unequal_duplicate_index_alignment(self):
+        left_index = ["a", "a", "c"]
+        right_index = ["a", "a", "b"]
+        left_geometries = [Point(0, 0), Point(1, 1), Point(2, 2)]
+        right_geometries = [Point(0, 0), Point(9, 9), Point(3, 3)]
+
+        result = GeoSeries(left_geometries, index=left_index).geom_equals_exact(
+            GeoSeries(right_geometries, index=right_index),
+            tolerance=0,
+            align=True,
+        )
+        expected = gpd.GeoSeries(left_geometries, index=left_index).geom_equals_exact(
+            gpd.GeoSeries(right_geometries, index=right_index),
+            tolerance=0,
+            align=True,
+        )
+        self.check_pd_series_equal(result, expected)
+        assert len(result) == 6
+
+    def test_geom_equals_exact_align_false_requires_equal_lengths(self):
+        left = GeoSeries([Point(0, 0)])
+        right = GeoSeries([Point(0, 0), Point(1, 1)])
+
+        with pytest.raises(
+            ValueError,
+            match=r"Lengths of inputs do not match\. Left: 1, Right: 2",
+        ):
+            left.geom_equals_exact(right, tolerance=0, align=False)
+
+    def test_geom_equals_exact_preserves_multiindex(self):
+        left_index = pd.MultiIndex.from_tuples(
+            [("b", 2), ("a", 1)], names=["group", "row"]
+        )
+        right_index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("c", 3)], names=["group", "row"]
+        )
+        left_geometries = [Point(2, 2), Point(1, 1)]
+        right_geometries = [Point(1, 1), Point(3, 3)]
+
+        left = GeoSeries(left_geometries, index=left_index)
+        right = GeoSeries(right_geometries, index=right_index)
+        result = left.geom_equals_exact(right, tolerance=0, align=True)
+        expected = gpd.GeoSeries(left_geometries, index=left_index).geom_equals_exact(
+            gpd.GeoSeries(right_geometries, index=right_index),
+            tolerance=0,
+            align=True,
+        )
+        self.check_pd_series_equal(result, expected)
+
+        positional_result = left.geom_equals_exact(right, tolerance=0, align=False)
+        positional_expected = gpd.GeoSeries(
+            left_geometries, index=left_index
+        ).geom_equals_exact(
+            gpd.GeoSeries(right_geometries, index=right_index),
+            tolerance=0,
+            align=False,
+        )
+        self.check_pd_series_equal(positional_result, positional_expected)
+
+        scalar_result = left.geom_equals_exact(Point(1, 1), tolerance=0)
+        scalar_expected = gpd.GeoSeries(
+            left_geometries, index=left_index
+        ).geom_equals_exact(Point(1, 1), tolerance=0)
+        self.check_pd_series_equal(scalar_result, scalar_expected)
+
+        duplicate_index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("a", 1)], names=["group", "row"]
+        )
+        duplicate_result = GeoSeries(
+            [Point(0, 0), Point(1, 1)], index=duplicate_index
+        ).geom_equals_exact(
+            GeoSeries([Point(0, 0), Point(9, 9)], index=duplicate_index),
+            tolerance=0,
+            align=True,
+        )
+        duplicate_expected = gpd.GeoSeries(
+            [Point(0, 0), Point(1, 1)], index=duplicate_index
+        ).geom_equals_exact(
+            gpd.GeoSeries([Point(0, 0), Point(9, 9)], index=duplicate_index),
+            tolerance=0,
+            align=True,
+        )
+        self.check_pd_series_equal(duplicate_result, duplicate_expected)
+
+    def test_geom_equals_exact_aligns_multiindex_by_name(self):
+        left_index = pd.MultiIndex.from_tuples(
+            [("left-2", "b"), ("left-1", "a")],
+            names=["left_row", "group"],
+        )
+        right_index = pd.MultiIndex.from_tuples(
+            [("a", "right-3"), ("c", "right-4")],
+            names=["group", "right_row"],
+        )
+        left_geometries = [Point(2, 2), Point(1, 1)]
+        right_geometries = [Point(1, 1), Point(3, 3)]
+
+        result = GeoSeries(left_geometries, index=left_index).geom_equals_exact(
+            GeoSeries(right_geometries, index=right_index),
+            tolerance=0,
+            align=True,
+        )
+        expected = gpd.GeoSeries(left_geometries, index=left_index).geom_equals_exact(
+            gpd.GeoSeries(right_geometries, index=right_index),
+            tolerance=0,
+            align=True,
+        )
+        self.check_pd_series_equal(result, expected)
+
+    def test_geom_equals_exact_aligns_different_index_levels(self):
+        simple_index = pd.Index(["b", "a", "d"], name="group")
+        multiindex = pd.MultiIndex.from_tuples(
+            [("b", 2), ("a", 1), ("c", 3)], names=["group", "row"]
+        )
+        simple_geometries = [Point(2, 2), Point(1, 1), Point(4, 4)]
+        multi_geometries = [Point(2, 2), Point(9, 9), Point(3, 3)]
+
+        result = GeoSeries(simple_geometries, index=simple_index).geom_equals_exact(
+            GeoSeries(multi_geometries, index=multiindex),
+            tolerance=0,
+            align=True,
+        )
+        expected = gpd.GeoSeries(
+            simple_geometries, index=simple_index
+        ).geom_equals_exact(
+            gpd.GeoSeries(multi_geometries, index=multiindex),
+            tolerance=0,
+            align=True,
+        )
+        self.check_pd_series_equal(result, expected)
+
+        reverse_result = GeoSeries(
+            multi_geometries, index=multiindex
+        ).geom_equals_exact(
+            GeoSeries(simple_geometries, index=simple_index),
+            tolerance=0,
+            align=True,
+        )
+        reverse_expected = gpd.GeoSeries(
+            multi_geometries, index=multiindex
+        ).geom_equals_exact(
+            gpd.GeoSeries(simple_geometries, index=simple_index),
+            tolerance=0,
+            align=True,
+        )
+        self.check_pd_series_equal(reverse_result, reverse_expected)
+
+    def test_geom_equals_exact_rejects_unrelated_multiindex_names(self):
+        left_index = pd.MultiIndex.from_tuples(
+            [("a", 1)], names=["left_group", "left_row"]
+        )
+        right_index = pd.MultiIndex.from_tuples(
+            [("b", 2)], names=["right_group", "right_row"]
+        )
+
+        with pytest.raises(
+            ValueError, match="cannot join with no overlapping index names"
+        ):
+            GeoSeries([Point(0, 0)], index=left_index).geom_equals_exact(
+                GeoSeries([Point(0, 0)], index=right_index),
+                tolerance=0,
+                align=True,
+            )
+
+    def test_geom_equals_exact_linearring_serialization_limitation(self):
+        ring = LinearRing([(0, 0), (1, 0), (1, 1), (0, 0)])
+        line = LineString(ring.coords)
+
+        # Sedona represents standalone LinearRings as LineStrings throughout
+        # the GeoPandas compatibility layer.
+        result = GeoSeries([ring]).geom_equals_exact(line, tolerance=0)
+        self.check_pd_series_equal(result, pd.Series([True]))
+
+    def test_geom_equals_exact_structural_null_and_dimensions(self):
+        left_geometries = [
+            Point(),
+            LineString(),
+            Polygon(),
+            None,
+            Point(1, 2, 3),
+            wkt.loads("POINT M (1 2 3)"),
+            LineString([(0, 0), (1, 1)]),
+            GeometryCollection([Point(0, 0), LineString([(0, 0), (1, 1)])]),
+        ]
+        right_geometries = [
+            Point(),
+            Polygon(),
+            Polygon(),
+            None,
+            Point(1, 2, 99),
+            wkt.loads("POINT M (1 2 99)"),
+            LineString([(1, 1), (0, 0)]),
+            GeometryCollection([LineString([(0, 0), (1, 1)]), Point(0, 0)]),
+        ]
+
+        result = GeoSeries(left_geometries).geom_equals_exact(
+            GeoSeries(right_geometries), tolerance=0, align=False
+        )
+        expected = gpd.GeoSeries(left_geometries).geom_equals_exact(
+            gpd.GeoSeries(right_geometries), tolerance=0, align=False
+        )
+        self.check_pd_series_equal(result, expected)
+
+    @pytest.mark.parametrize("tolerance", [-1.0, np.nan, np.inf])
+    def test_geom_equals_exact_special_tolerances(self, tolerance):
+        geometries = [Point(0, 0), Point(1, 1), None]
+        result = GeoSeries(geometries).geom_equals_exact(
+            Point(0, 0), tolerance=tolerance
+        )
+        expected = gpd.GeoSeries(geometries).geom_equals_exact(
+            Point(0, 0), tolerance=tolerance
+        )
+        self.check_pd_series_equal(result, expected)
+
+    @pytest.mark.parametrize("tolerance", [None, "0.1", [0.1], np.array([0.1])])
+    def test_geom_equals_exact_rejects_non_scalar_tolerance(self, tolerance):
+        s = GeoSeries([Point(0, 0)])
+        with pytest.raises(TypeError, match="'tolerance' must be a numeric scalar"):
+            s.geom_equals_exact(Point(0, 0), tolerance=tolerance)
+
+    @pytest.mark.parametrize("other", [None, 1, "POINT (0 0)", [Point(0, 0)]])
+    def test_geom_equals_exact_rejects_non_geometry_other(self, other):
+        s = GeoSeries([Point(0, 0)])
+        with pytest.raises(TypeError, match="'other' must be"):
+            s.geom_equals_exact(other, tolerance=0)
+
+    @requires_shapely_m_support
+    def test_geom_equals_identical_structure_dimensions_and_nan(self):
+        left_wkts = [
+            "POINT Z (1 2 3)",
+            "POINT Z (1 2 3)",
+            "POINT M (1 2 3)",
+            "POINT M (1 2 3)",
+            "POINT Z (1 2 3)",
+            "POINT ZM (1 2 3 4)",
+            "POINT ZM (1 2 3 4)",
+            "LINESTRING Z (0 0 1, 1 1 NaN)",
+            "LINESTRING Z (0 0 1, 1 1 NaN)",
+            "LINESTRING (0 0, 1 1)",
+            "POLYGON ((0 0, 2 0, 0 2, 0 0))",
+            "GEOMETRYCOLLECTION (POINT (0 0), LINESTRING (0 0, 1 1))",
+            "POINT EMPTY",
+            "POINT EMPTY",
+            None,
+        ]
+        right_wkts = [
+            "POINT Z (1 2 3)",
+            "POINT Z (1 2 4)",
+            "POINT M (1 2 3)",
+            "POINT M (1 2 4)",
+            "POINT M (1 2 3)",
+            "POINT ZM (1 2 3 4)",
+            "POINT ZM (1 2 3 5)",
+            "LINESTRING Z (0 0 1, 1 1 NaN)",
+            "LINESTRING Z (0 0 1, 1 1 2)",
+            "LINESTRING (1 1, 0 0)",
+            "POLYGON ((2 0, 0 2, 0 0, 2 0))",
+            "GEOMETRYCOLLECTION (LINESTRING (0 0, 1 1), POINT (0 0))",
+            "POINT EMPTY",
+            "LINESTRING EMPTY",
+            None,
+        ]
+        index = pd.Index(
+            [
+                "z-same",
+                "z-different",
+                "m-same",
+                "m-different",
+                "z-versus-m",
+                "zm-same",
+                "zm-different",
+                "nan-same",
+                "nan-different",
+                "line-order",
+                "ring-order",
+                "part-order",
+                "empty-same",
+                "empty-type",
+                "missing",
+            ],
+            name="case",
+        )
+        left = GeoSeries(shapely.from_wkt(left_wkts), index=index, name="left")
+        right = GeoSeries(shapely.from_wkt(right_wkts), index=index, name="right")
+
+        result = left.geom_equals_identical(right, align=False)
+
+        self.check_pd_series_equal(
+            result,
+            pd.Series(
+                [
+                    True,
+                    False,
+                    True,
+                    False,
+                    False,
+                    True,
+                    False,
+                    True,
+                    False,
+                    False,
+                    False,
+                    False,
+                    True,
+                    False,
+                    False,
+                ],
+                index=index,
+                dtype=bool,
+            ),
+        )
+        assert result.name is None
+
+    def test_geom_equals_identical_scalar_multiindex_geodataframe_and_plan(self):
+        index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("b", 2), ("c", 3)], names=["group", "row"]
+        )
+        source = GeoSeries(
+            [Point(1, 2, 3), Point(1, 2), None],
+            index=index,
+            name="source",
+        )
+
+        result = source.geom_equals_identical(Point(1, 2, 3))
+        self.check_pd_series_equal(
+            result,
+            pd.Series([True, False, False], index=index, dtype=bool),
+        )
+        assert result.name is None
+
+        if hasattr(result._internal.spark_frame, "_jdf"):
+            plan = (
+                result._internal.spark_frame._jdf.queryExecution()
+                .optimizedPlan()
+                .toString()
+            )
+            assert "BatchEvalPython" not in plan
+            assert "ArrowEvalPython" not in plan
+            assert "PythonUDF" not in plan
+
+        frame_source = GeoSeries(
+            [Point(1, 2, 3), Point(1, 2), None],
+            index=pd.Index(["z", "xy", "missing"], name="kind"),
+        )
+        frame_result = frame_source.to_geoframe().geom_equals_identical(Point(1, 2, 3))
+        self.check_pd_series_equal(
+            frame_result,
+            pd.Series(
+                [True, False, False],
+                index=pd.Index(["z", "xy", "missing"], name="kind"),
+                dtype=bool,
+            ),
+        )
+
+    @requires_shapely_m_support
+    @pytest.mark.parametrize(
+        ("other_wkt", "expected"),
+        [
+            ("POINT M (1 2 3)", [True, False, False, False, False]),
+            ("POINT ZM (1 2 3 4)", [False, False, False, True, False]),
+        ],
+    )
+    def test_geom_equals_identical_scalar_m_and_zm(self, other_wkt, expected):
+        source = GeoSeries(
+            shapely.from_wkt(
+                [
+                    "POINT M (1 2 3)",
+                    "POINT M (1 2 4)",
+                    "POINT Z (1 2 3)",
+                    "POINT ZM (1 2 3 4)",
+                    "POINT ZM (1 2 3 5)",
+                ]
+            )
+        )
+
+        result = source.geom_equals_identical(shapely.from_wkt(other_wkt))
+
+        self.check_pd_series_equal(result, pd.Series(expected, dtype=bool))
+
+    @requires_shapely_m_support
+    @pytest.mark.parametrize(
+        ("dimensional_wkt", "xy_wkt"),
+        [
+            ("POINT M EMPTY", "POINT EMPTY"),
+            ("LINESTRING M EMPTY", "LINESTRING EMPTY"),
+            ("POLYGON M EMPTY", "POLYGON EMPTY"),
+            ("POINT ZM EMPTY", "POINT EMPTY"),
+            ("LINESTRING ZM EMPTY", "LINESTRING EMPTY"),
+            ("POLYGON ZM EMPTY", "POLYGON EMPTY"),
+            ("LINEARRING M EMPTY", "LINEARRING EMPTY"),
+            ("LINEARRING ZM EMPTY", "LINEARRING EMPTY"),
+        ],
+    )
+    def test_geom_equals_identical_scalar_typed_empty(self, dimensional_wkt, xy_wkt):
+        source = GeoSeries(shapely.from_wkt([dimensional_wkt, xy_wkt]))
+
+        result = source.geom_equals_identical(shapely.from_wkt(dimensional_wkt))
+
+        self.check_pd_series_equal(result, pd.Series([True, False], dtype=bool))
+
+    def test_geom_equals_identical_alignment_and_duplicates(self):
+        left_geometries = [Point(0, 0), Point(1, 1), None]
+        right_geometries = [Point(1, 1), Point(0, 0), Point(9, 9)]
+        left = GeoSeries(left_geometries, index=["a", "b", "c"])
+        right = GeoSeries(right_geometries, index=["b", "a", "d"])
+
+        with pytest.warns(
+            UserWarning,
+            match="The indices of the left and right GeoSeries' are not equal",
+        ) as warning_records:
+            default_result = left.geom_equals_identical(right)
+        alignment_warning = next(
+            warning
+            for warning in warning_records
+            if "indices of the left and right GeoSeries" in str(warning.message)
+        )
+        assert alignment_warning.filename == __file__
+        aligned_expected = pd.Series(
+            [True, True, False, False],
+            index=pd.Index(["a", "b", "c", "d"]),
+            dtype=bool,
+        )
+        self.check_pd_series_equal(default_result, aligned_expected)
+        self.check_pd_series_equal(
+            left.geom_equals_identical(right, align=True), aligned_expected
+        )
+        self.check_pd_series_equal(
+            left.geom_equals_identical(right, align=False),
+            pd.Series(
+                [False, False, False],
+                index=pd.Index(["a", "b", "c"]),
+                dtype=bool,
+            ),
+        )
+
+        duplicate_index = ["a", "a"]
+        equal_duplicate_result = GeoSeries(
+            [Point(0, 0), Point(1, 1)], index=duplicate_index
+        ).geom_equals_identical(
+            GeoSeries([Point(0, 0), Point(9, 9)], index=duplicate_index),
+            align=True,
+        )
+        self.check_pd_series_equal(
+            equal_duplicate_result,
+            pd.Series([True, False], index=duplicate_index, dtype=bool),
+        )
+
+        unequal_duplicate_result = GeoSeries(
+            [Point(0, 0), Point(1, 1), Point(2, 2)], index=["a", "a", "c"]
+        ).geom_equals_identical(
+            GeoSeries(
+                [Point(0, 0), Point(9, 9), Point(3, 3)],
+                index=["a", "a", "b"],
+            ),
+            align=True,
+        )
+        self.check_pd_series_equal(
+            unequal_duplicate_result,
+            pd.Series(
+                [True, False, False, False, False, False],
+                index=pd.Index(["a", "a", "a", "a", "b", "c"]),
+                dtype=bool,
+            ),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"Lengths of inputs do not match\. Left: 1, Right: 2",
+        ):
+            GeoSeries([Point(0, 0)]).geom_equals_identical(
+                GeoSeries([Point(0, 0), Point(1, 1)]), align=False
+            )
+
+    def test_geom_equals_identical_preserves_named_multiindex(self):
+        left_index = pd.MultiIndex.from_tuples(
+            [("b", 2), ("a", 1)], names=["group", "row"]
+        )
+        right_index = pd.MultiIndex.from_tuples(
+            [("a", 1), ("c", 3)], names=["group", "row"]
+        )
+        result = GeoSeries(
+            [Point(2, 2), Point(1, 1)], index=left_index
+        ).geom_equals_identical(
+            GeoSeries([Point(1, 1), Point(3, 3)], index=right_index),
+            align=True,
+        )
+        self.check_pd_series_equal(
+            result,
+            pd.Series(
+                [True, False, False],
+                index=pd.MultiIndex.from_tuples(
+                    [("a", 1), ("b", 2), ("c", 3)], names=["group", "row"]
+                ),
+                dtype=bool,
+            ),
+        )
+
+        unrelated_left = pd.MultiIndex.from_tuples(
+            [("a", 1)], names=["left_group", "left_row"]
+        )
+        unrelated_right = pd.MultiIndex.from_tuples(
+            [("b", 2)], names=["right_group", "right_row"]
+        )
+        with pytest.raises(
+            ValueError, match="cannot join with no overlapping index names"
+        ):
+            GeoSeries([Point(0, 0)], index=unrelated_left).geom_equals_identical(
+                GeoSeries([Point(0, 0)], index=unrelated_right), align=True
+            )
+
+    @requires_geopandas_geom_equals_identical
+    def test_geom_equals_identical_warns_on_crs_mismatch(self):
+        left = GeoSeries([Point(0, 0)], crs="EPSG:4326")
+        right = GeoSeries([Point(0, 0)], crs="EPSG:3857")
+
+        with pytest.warns(UserWarning, match="CRS mismatch"):
+            result = left.geom_equals_identical(right, align=False)
+        with pytest.warns(UserWarning, match="CRS mismatch"):
+            expected = gpd.GeoSeries(
+                [Point(0, 0)], crs="EPSG:4326"
+            ).geom_equals_identical(
+                gpd.GeoSeries([Point(0, 0)], crs="EPSG:3857"), align=False
+            )
+        self.check_pd_series_equal(result, expected)
+
+    def test_geom_equals_identical_serialization_boundaries(self):
+        empty_2d = GeoSeries.from_wkt(
+            [
+                "POINT EMPTY",
+                "LINESTRING EMPTY",
+                "POLYGON EMPTY",
+                "POINT EMPTY",
+                "POINT EMPTY",
+            ]
+        )
+        empty_dimensional = GeoSeries.from_wkt(
+            [
+                "POINT Z EMPTY",
+                "LINESTRING Z EMPTY",
+                "POLYGON Z EMPTY",
+                "POINT M EMPTY",
+                "POINT ZM EMPTY",
+            ]
+        )
+
+        # WKT tagged Z, M or ZM keeps that layout, even for empty geometries.
+        self.check_pd_series_equal(
+            empty_2d.geom_equals_identical(empty_dimensional, align=False),
+            pd.Series([False, False, False, False, False], dtype=bool),
+        )
+
+        nan_first_z = GeoSeries.from_wkt(["LINESTRING Z (0 0 NaN, 1 1 2)"])
+        two_dimensional = GeoSeries.from_wkt(["LINESTRING (0 0, 1 1)"])
+
+        # A later non-NaN Z now establishes and preserves the XYZ layout.
+        self.check_pd_series_equal(
+            nan_first_z.geom_equals_identical(two_dimensional, align=False),
+            pd.Series([False], dtype=bool),
+        )
+
+        all_nan_z = GeoSeries.from_wkt(["LINESTRING Z (0 0 NaN, 1 1 NaN)"])
+
+        # A tagged Z keeps the XYZ layout even when every Z value is NaN.
+        self.check_pd_series_equal(
+            all_nan_z.geom_equals_identical(two_dimensional, align=False),
+            pd.Series([False], dtype=bool),
+        )
+
+        mixed_dimension = GeoSeries([MultiPoint([Point(0, 0), Point(1, 1, 2)])])
+        normalized_dimension = GeoSeries(
+            [shapely.from_wkt("MULTIPOINT Z ((0 0 NaN), (1 1 2))")]
+        )
+
+        # Shapely's homogeneous multi-geometry encoding selects one layout
+        # before the value reaches the JVM, promoting the XY child to XYZ/NaN.
+        self.check_pd_series_equal(
+            mixed_dimension.geom_equals_identical(normalized_dimension, align=False),
+            pd.Series([True], dtype=bool),
+        )
+
+        ring = LinearRing([(0, 0), (1, 0), (1, 1), (0, 0)])
+        line = LineString(ring.coords)
+        # Standalone LinearRings use the LineString representation in this layer.
+        self.check_pd_series_equal(
+            GeoSeries([ring]).geom_equals_identical(line),
+            pd.Series([True], dtype=bool),
+        )
+        self.check_pd_series_equal(
+            GeoSeries([LinearRing()]).geom_equals_identical(LinearRing()),
+            pd.Series([True], dtype=bool),
+        )
+
+    @pytest.mark.parametrize("other", [None, 1, "POINT (0 0)", [Point(0, 0)]])
+    def test_geom_equals_identical_rejects_non_geometry_other(self, other):
+        with pytest.raises(TypeError, match="'other' must be"):
+            GeoSeries([Point(0, 0)]).geom_equals_identical(other)
+
     def test_interpolate(self):
         s = GeoSeries(
             [
@@ -3049,15 +8181,17 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         self.check_pd_series_equal(df_result, expected)
 
     def test_set_crs(self):
+        from pyproj import CRS
+
         geo_series = sgpd.GeoSeries([Point(0, 0), Point(1, 1)], name="geometry")
         assert geo_series.crs == None
         geo_series = geo_series.set_crs(epsg=4326)
         assert geo_series.crs.to_epsg() == 4326
 
         with pytest.raises(ValueError):
-            geo_series.set_crs(4328, allow_override=False)
+            geo_series.set_crs(4328)
         with pytest.raises(ValueError):
-            geo_series.set_crs(None, allow_override=False)
+            geo_series.set_crs(None)
 
         geo_series = geo_series.set_crs(None, allow_override=True)
         assert geo_series.crs == None
@@ -3065,8 +8199,12 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         # Check that the name is preserved for set_crs
         geo_series.name = "geometry"
 
-        geo_series.set_crs(4326, inplace=True)
+        inplace_result = geo_series.set_crs(4326, inplace=True)
+        assert inplace_result is geo_series
         assert geo_series.crs.to_epsg() == 4326
+
+        geo_series.crs = 3857
+        assert geo_series.crs.to_epsg() == 3857
 
         # Check that the name is preserved for set_crs after inplace=True
         geo_series.name = "geometry"
@@ -3074,9 +8212,405 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         geo_series = sgpd.GeoSeries(self.geoseries, crs=4326)
         assert geo_series.crs.to_epsg() == 4326
 
+        all_null = sgpd.GeoSeries([None], name="geometry", crs=4326)
+        assert all_null.crs.to_epsg() == 4326
+        assert all_null.copy(deep=True).crs.to_epsg() == 4326
+
+        without_crs = all_null.set_crs(None, allow_override=True)
+        assert without_crs.crs is None
+        assert all_null.crs.to_epsg() == 4326
+
+        with_other_crs = all_null.set_crs(3857, allow_override=True)
+        assert with_other_crs.crs.to_epsg() == 3857
+        assert all_null.crs.to_epsg() == 4326
+
+        empty_result = sgpd.GeoSeries(
+            [GeometryCollection()],
+            crs=4326,
+        ).explode(ignore_index=True)
+        assert len(empty_result) == 0
+        assert empty_result.crs.to_epsg() == 4326
+        assert empty_result.set_crs(3857, allow_override=True).crs.to_epsg() == 3857
+
+        all_null.set_crs(None, inplace=True, allow_override=True)
+        assert all_null.crs is None
+
+        custom_crs = CRS.from_proj4(
+            "+proj=aeqd +lat_0=12.345 +lon_0=67.89 " "+datum=WGS84 +units=m +no_defs"
+        )
+        assert custom_crs.to_epsg() is None
+        custom_series = sgpd.GeoSeries([Point(0, 0)]).set_crs(custom_crs)
+        assert custom_series.crs == custom_crs
+        assert custom_series.to_geopandas().crs == custom_crs
+        assert (
+            custom_series._internal.spark_frame.select(
+                stf.ST_SRID(custom_series.spark.column).alias("srid")
+            ).first()["srid"]
+            == 0
+        )
+
         # This test errors due to a bug in pyspark.
         # We can uncomment it once the fix is https://github.com/apache/spark/pull/51475 is merged
         # It was tested locally by using the fixed version of pyspark
         # # First element null
         # geo_series = sgpd.GeoSeries([None, None, Point(1, 1)], crs=4326)
         # assert geo_series.crs.to_epsg() == 4326
+
+    def test_crs_metadata_propagation(self):
+        source = sgpd.GeoSeries([None], name="geometry", crs=4326)
+
+        copied = source.copy(deep=True)
+        reconstructed = sgpd.GeoSeries(source)
+        buffered = source.buffer(1)
+        transformed = source.to_crs(3857)
+        frame = source.to_geoframe()
+        round_tripped = GeoDataFrame(frame.to_spark_pandas())
+
+        source.set_crs(3857, inplace=True, allow_override=True)
+
+        assert copied.crs.to_epsg() == 4326
+        assert reconstructed.crs.to_epsg() == 4326
+        assert buffered.crs.to_epsg() == 4326
+        assert frame.crs.to_epsg() == 4326
+        assert round_tripped.crs.to_epsg() == 4326
+        assert transformed.crs.to_epsg() == 3857
+
+    def test_local_construction_records_authoritative_no_crs(self):
+        """Locally built GeoSeries with no explicit crs must record an
+        authoritative "no CRS" state (metadata present, value None) instead
+        of being left indistinguishable from a raw column of unknown CRS
+        provenance (metadata absent)."""
+
+        def assert_no_crs_metadata(series: GeoSeries):
+            has_metadata, value = read_crs_metadata(series._internal.data_fields[0])
+            assert has_metadata is True
+            assert value is None
+            assert series.crs is None
+
+        assert_no_crs_metadata(sgpd.GeoSeries([Point(1, 1), Point(2, 2)]))
+        assert_no_crs_metadata(sgpd.GeoSeries([Point(1, 1)], crs=None))
+        assert_no_crs_metadata(sgpd.GeoSeries([], name="polygons", crs=None))
+        assert_no_crs_metadata(sgpd.GeoSeries([None, None]))
+        assert_no_crs_metadata(sgpd.GeoSeries(gpd.GeoSeries([Point(1, 1)])))
+        assert_no_crs_metadata(sgpd.GeoSeries.from_wkt(["POINT (1 1)", "POINT (2 2)"]))
+        assert_no_crs_metadata(
+            sgpd.GeoSeries.from_wkb([Point(1, 1).wkb, Point(2, 2).wkb])
+        )
+
+        for name in (None, 0, ""):
+            named = sgpd.GeoSeries([Point(1, 1)], name=name)
+            assert_no_crs_metadata(named)
+            assert named.name == name
+            physical_name = named._internal.data_spark_column_names[0]
+            assert isinstance(physical_name, str)
+            assert physical_name in named._internal.spark_frame.columns
+
+        gdf = sgpd.GeoDataFrame({"geometry": [Point(1, 1), Point(2, 2)]})
+        assert_no_crs_metadata(gdf.geometry)
+
+        with ps.option_context("compute.ops_on_diff_frames", True):
+            set_via_array = sgpd.GeoDataFrame({"value": [1, 2]}).set_geometry(
+                [Point(0, 0), Point(1, 1)]
+            )
+        assert_no_crs_metadata(set_via_array.geometry)
+
+    def test_wrapped_raw_columns_keep_srid_inference_and_mismatch_warning(self):
+        """Wrapping an existing distributed column of unknown provenance (no
+        Sedona CRS metadata) must not fabricate a "no CRS" state -- the
+        legacy SRID-inference fallback must still apply."""
+
+        def raw_series(srid):
+            return GeoSeries(
+                self.spark.range(1)
+                .selectExpr(f"ST_SetSRID(ST_Point(0D, 0D), {srid}) AS geometry")
+                .pandas_api()["geometry"]
+            )
+
+        left = raw_series(4326)
+        right = raw_series(3857)
+        for series, expected_srid in ((left, 4326), (right, 3857)):
+            has_metadata, _ = read_crs_metadata(series._internal.data_fields[0])
+            assert has_metadata is False
+            assert series.crs.to_epsg() == expected_srid
+
+        job_group = "test_wrapped_raw_columns_keep_srid_inference_and_mismatch_warning"
+        self.sc.setJobGroup(job_group, "raw-column CRS inference")
+        try:
+            with pytest.warns(UserWarning, match="CRS mismatch"):
+                left.geom_equals(right, align=False)
+            job_ids = self.sc.statusTracker().getJobIdsForGroup(job_group)
+        finally:
+            self.sc.setJobGroup(None, None)
+
+        assert len(job_ids) >= 2
+
+    def test_no_crs_stamp_preserves_embedded_srid(self):
+        """Recording an authoritative "no CRS" state must be metadata-only:
+        it must never rewrite the geometry bytes, so any SRID already
+        embedded via WKB/EWKB survives untouched."""
+        srid_series = sgpd.GeoSeries([Point(1, 1)]).set_crs(4326, allow_override=True)
+        # Detach the authoritative CRS metadata but keep the embedded SRID,
+        # simulating a column whose bytes carry a SRID Sedona doesn't yet
+        # know about as metadata.
+        srid_series._record_no_crs_metadata(inplace=True)
+
+        assert srid_series.crs is None
+        embedded_srid = srid_series._internal.spark_frame.select(
+            stf.ST_SRID(srid_series.spark.column).alias("srid")
+        ).first()["srid"]
+        assert embedded_srid == 4326
+
+    def test_local_construction_no_spark_job_for_crs_discovery(self):
+        """A binary predicate between two locally constructed, CRS-less
+        GeoSeries reads both operands' authoritative "no CRS" metadata for
+        its mismatch check without launching a distributed SRID-inference
+        job."""
+        s1 = sgpd.GeoSeries([Point(1, 1), Point(2, 2)])
+        s2 = sgpd.GeoSeries([Point(1, 1), Point(3, 3)])
+
+        job_group = "test_local_construction_no_spark_job_for_crs_discovery"
+        self.sc.setJobGroup(job_group, "crs discovery for a binary predicate")
+        try:
+            # geom_equals() is lazy: building it (which internally reads
+            # .crs on both operands to check for a mismatch) must not by
+            # itself submit any Spark job.
+            s1.geom_equals(s2)
+            job_ids = self.sc.statusTracker().getJobIdsForGroup(job_group)
+        finally:
+            self.sc.setJobGroup(None, None)
+
+        assert len(job_ids) == 0
+
+    def test_local_construction_no_python_plan_for_crs_access(self):
+        """The optimized plan for a binary predicate between two locally
+        constructed, CRS-less GeoSeries must not contain a Python UDF/eval
+        node stemming from the CRS mismatch check."""
+        s1 = sgpd.GeoSeries([Point(1, 1), Point(2, 2)])
+        s2 = sgpd.GeoSeries([Point(1, 1), Point(3, 3)])
+
+        result = s1.geom_equals(s2)
+        plan = (
+            result._internal.spark_frame._jdf.queryExecution()
+            .optimizedPlan()
+            .toString()
+        )
+        assert "BatchEvalPython" not in plan
+        assert "ArrowEvalPython" not in plan
+        assert "PythonUDF" not in plan
+
+
+@pytest.mark.skipif(
+    parse_version(pyspark.__version__) < parse_version("3.5.0")
+    or parse_version(shapely.__version__) < parse_version("2.0.0"),
+    reason="Coordinate transform requires Spark>=3.5 and Shapely>=2.0",
+)
+class TestGeoSeriesTransform(TestGeopandasBase):
+    def test_transform_documented_examples(self):
+        _ = self.spark
+        source = GeoSeries([Point(0, 0)])
+        self.check_sgpd_equals_gpd(
+            source.transform(lambda coords: coords + 1),
+            gpd.GeoSeries([Point(1, 1)]),
+        )
+        polygon = GeoSeries([Polygon([(0, 0), (1, 1), (0, 1)])])
+        self.check_sgpd_equals_gpd(
+            polygon.transform(lambda coords: coords * [2, 3]),
+            gpd.GeoSeries([Polygon([(0, 0), (2, 3), (0, 3)])]),
+        )
+
+    def test_transform_preserves_multiindex_crs_and_delegates(self):
+        _ = self.spark
+        index = pd.MultiIndex.from_tuples(
+            [("a", 2), ("a", 2), ("b", 1), ("b", 3)],
+            names=["group", "feature"],
+        )
+        geometries = [Point(1, 2), None, Polygon(), LineString([(0, 0), (2, 1)])]
+        source = GeoSeries(geometries, index=index, crs="EPSG:3857", name="shape")
+        expected = gpd.GeoSeries(
+            [Point(3, 1), None, Polygon(), LineString([(2, -1), (4, 0)])],
+            index=index,
+            crs="EPSG:3857",
+        )
+        result = source.transform(lambda coords: coords + [2, -1])
+        self.check_sgpd_equals_gpd(result, expected)
+        assert result.crs == expected.crs
+        srids = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid")
+        ).collect()
+        assert {row.srid for row in srids if row.srid is not None} == {3857}
+        frame = GeoDataFrame(
+            gpd.GeoDataFrame(
+                {"shape": geometries, "value": 9},
+                geometry="shape",
+                index=index,
+                crs="EPSG:3857",
+            )
+        )
+        frame_result = frame.transform(lambda coords: coords + [2, -1])
+        self.check_sgpd_equals_gpd(frame_result, expected)
+        assert frame_result.crs == expected.crs
+
+    def test_transform_preserves_per_row_srids(self):
+        frame = self.spark.createDataFrame(
+            [(0, "SRID=4326;POINT (1 2)"), (1, "SRID=3857;POINT (3 4)")],
+            "id long, ewkt string",
+        ).selectExpr("id", "ST_GeomFromEWKT(ewkt) AS geometry")
+        source = GeoSeries(frame.pandas_api(index_col="id")["geometry"])
+
+        result = source.transform(lambda coords: coords + [2, -1])
+        rows = (
+            result._internal.spark_frame.select(
+                result._internal.index_spark_columns[0].alias("id"),
+                stf.ST_SRID(result.spark.column).alias("srid"),
+                stf.ST_AsText(result.spark.column).alias("wkt"),
+            )
+            .orderBy("id")
+            .collect()
+        )
+        assert [(row.id, row.srid, row.wkt) for row in rows] == [
+            (0, 4326, "POINT (3 1)"),
+            (1, 3857, "POINT (5 3)"),
+        ]
+
+    @pytest.mark.parametrize(
+        "geometry_wkt,expected_wkt",
+        [
+            (
+                "MULTIPOINT (EMPTY, (1 2), EMPTY)",
+                "MULTIPOINT (EMPTY, (3 1), EMPTY)",
+            ),
+            (
+                "MULTILINESTRING (EMPTY, (0 0, 1 1), EMPTY)",
+                "MULTILINESTRING (EMPTY, (2 -1, 3 0), EMPTY)",
+            ),
+            (
+                "MULTIPOLYGON (EMPTY, ((0 0, 1 0, 1 1, 0 0)), EMPTY)",
+                "MULTIPOLYGON (EMPTY, ((2 -1, 3 -1, 3 0, 2 -1)), EMPTY)",
+            ),
+        ],
+        ids=["multipoint", "multilinestring", "multipolygon"],
+    )
+    @pytest.mark.parametrize("srid", [0, 4326])
+    def test_transform_preserves_empty_multipart_members(
+        self, srid, geometry_wkt, expected_wkt
+    ):
+        frame = self.spark.createDataFrame(
+            [(0, f"SRID={srid};{geometry_wkt}")],
+            "id long, ewkt string",
+        ).selectExpr("id", "ST_GeomFromEWKT(ewkt) AS geometry")
+        source = GeoSeries(frame.pandas_api(index_col="id")["geometry"])
+
+        result = source.transform(lambda coords: coords + [2, -1])
+        row = result._internal.spark_frame.select(
+            stf.ST_SRID(result.spark.column).alias("srid"),
+            result.spark.column.alias("geometry"),
+        ).first()
+        assert row.srid == srid
+        assert len(row.geometry.geoms) == 3
+        assert row.geometry.geoms[0].is_empty
+        assert row.geometry.geoms[2].is_empty
+        assert row.geometry.wkb == wkt.loads(expected_wkt).wkb
+
+    @pytest.mark.parametrize("include_z", [False, True])
+    def test_transform_dimensions(self, include_z):
+        _ = self.spark
+        source = GeoSeries([Point(1, 2, 3), Point(1, 2), None, Point()])
+
+        def offset(coords):
+            assert isinstance(coords, np.ndarray)
+            assert coords.dtype == np.float64
+            assert coords.shape[1] == (3 if include_z else 2)
+            return coords + 1
+
+        result = source.transform(offset, include_z=include_z).to_geopandas()
+        assert tuple(result.iloc[0].coords[0]) == ((2, 3, 4) if include_z else (2, 3))
+        assert tuple(result.iloc[1].coords[0]) == (2, 3)
+        assert result.iloc[2] is None
+        assert result.iloc[3].is_empty
+        assert result.iloc[3].geom_type == "Point"
+
+    @pytest.mark.parametrize(
+        "geometries",
+        [[], [None, None], [Point(), LineString(), Polygon(), GeometryCollection()]],
+    )
+    def test_transform_empty_and_null_inputs(self, geometries):
+        from geopandas.testing import assert_geoseries_equal
+
+        _ = self.spark
+        source = GeoSeries(geometries, crs="EPSG:4326")
+        result = source.transform(lambda coords: coords + 1)
+        assert_geoseries_equal(
+            result.to_geopandas(),
+            gpd.GeoSeries(geometries, crs="EPSG:4326"),
+            check_index_type=False,
+        )
+
+    @pytest.mark.parametrize("partitions,batch_size", [(1, 1), (1, 2), (3, 2)])
+    def test_transform_coordinatewise_callbacks_are_batch_independent(
+        self, partitions, batch_size
+    ):
+        spark = self.spark
+        frame = (
+            spark.range(6)
+            .selectExpr("id", "ST_Point(CAST(id AS DOUBLE), 2D) AS geometry")
+            .repartition(partitions)
+        )
+        source = GeoSeries(frame.pandas_api(index_col="id")["geometry"])
+
+        def nonlinear(coords):
+            # The callback must run on workers, including schema construction.
+            assert TaskContext.get() is not None
+            return np.column_stack((coords[:, 0] ** 2, coords[:, 1] + coords[:, 0]))
+
+        key = "spark.sql.execution.arrow.maxRecordsPerBatch"
+        original = spark.conf.get(key)
+        try:
+            spark.conf.set(key, str(batch_size))
+            result = source.transform(nonlinear).to_geopandas().sort_index()
+        finally:
+            spark.conf.set(key, original)
+        assert [tuple(geom.coords[0]) for geom in result] == [
+            (0, 2),
+            (1, 3),
+            (4, 4),
+            (9, 5),
+            (16, 6),
+            (25, 7),
+        ]
+        assert result.index.tolist() == list(range(6))
+
+    def test_transform_callback_errors_are_deferred(self):
+        _ = self.spark
+        source = GeoSeries([Point(0, 0)])
+
+        def fail(coords):
+            raise ValueError("coordinate callback failed")
+
+        result = source.transform(fail)
+        with pytest.raises(Exception, match="coordinate callback failed"):
+            result.to_geopandas()
+
+    def test_transform_rejects_changed_coordinate_count(self):
+        _ = self.spark
+        source = GeoSeries([LineString([(0, 0), (1, 1)])])
+        result = source.transform(lambda coords: coords[:-1])
+        with pytest.raises(Exception, match="unexpected shape"):
+            result.to_geopandas()
+
+    def test_transform_rejects_noncallable(self):
+        _ = self.spark
+        source = GeoSeries([Point(0, 0)])
+        with pytest.raises(TypeError, match="callable"):
+            source.transform(None)
+
+    def test_transform_requires_supported_runtime(self, monkeypatch):
+        _ = self.spark
+        source = GeoSeries([Point(0, 0)])
+        with monkeypatch.context() as patched:
+            patched.setattr(pyspark, "__version__", "3.4.4")
+            with pytest.raises(NotImplementedError, match="Spark 3.5"):
+                source.transform(lambda coords: coords)
+        with monkeypatch.context() as patched:
+            patched.setattr(shapely, "__version__", "1.8.5")
+            with pytest.raises(ImportError, match="Shapely 2.0"):
+                source.transform(lambda coords: coords)

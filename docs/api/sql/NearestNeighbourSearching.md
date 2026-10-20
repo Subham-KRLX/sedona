@@ -32,6 +32,8 @@ Queries side table contains geometries that are used to find the k-nearest neigh
 
 When either queries or objects data contain non-point data (geometries), we take the centroid of each geometry.
 
+Empty geometries are skipped: an empty query geometry has no neighbors, and an empty object geometry is never returned as a neighbor.
+
 In case there are ties in the distance, the result will include all the tied geometries only when the following sedona config is set to true:
 
 **Note for Inner Join:**
@@ -67,6 +69,10 @@ SELECT * FROM (
 CACHE TABLE knnResult;
 SELECT * FROM knnResult WHERE condition;
 ```
+
+Additional `ON` predicates that remain in the kNN join condition are evaluated on the neighbors selected by `ST_KNN`. If a predicate rejects a selected pair, the join does not choose another neighbor to replace it, so it may return fewer than `k` neighbors for a query geometry. Spark may push predicates that reference only one input below the join, as described above.
+
+Use only one `ST_KNN` predicate per join condition. When combining it with another spatial predicate, place `ST_KNN` before predicates such as `ST_Intersects` in the `ON` condition; otherwise, query planning may reject the join.
 
 ### Optimization Barrier
 

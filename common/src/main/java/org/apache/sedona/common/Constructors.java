@@ -25,12 +25,13 @@ import javax.xml.parsers.ParserConfigurationException;
 import org.apache.sedona.common.enums.FileDataSplitter;
 import org.apache.sedona.common.enums.GeometryType;
 import org.apache.sedona.common.geometryObjects.Box2D;
+import org.apache.sedona.common.geometryObjects.Box3D;
 import org.apache.sedona.common.utils.FormatUtils;
 import org.apache.sedona.common.utils.GeoHashDecoder;
+import org.datasyslab.jts.io.WKBReader;
+import org.datasyslab.jts.io.WKTReader;
 import org.locationtech.jts.geom.*;
 import org.locationtech.jts.io.ParseException;
-import org.locationtech.jts.io.WKBReader;
-import org.locationtech.jts.io.WKTReader;
 import org.locationtech.jts.io.gml2.GMLReader;
 import org.locationtech.jts.io.kml.KMLReader;
 import org.xml.sax.SAXException;
@@ -43,8 +44,7 @@ public class Constructors {
     if (wkt == null) {
       return null;
     }
-    GeometryFactory geometryFactory = new GeometryFactory(new PrecisionModel(), srid);
-    return new WKTReader(geometryFactory).read(wkt);
+    return WKTReader.forDeclaredDimensions(srid).read(wkt);
   }
 
   public static Geometry geomFromEWKT(String ewkt) throws ParseException {
@@ -64,8 +64,7 @@ public class Constructors {
         throw new ParseException("Invalid EWKT string");
       }
     }
-    GeometryFactory geometryFactory = new GeometryFactory(new PrecisionModel(), SRID);
-    return new WKTReader(geometryFactory).read(wkt);
+    return WKTReader.forDeclaredDimensions(SRID).read(wkt);
   }
 
   public static Geometry geomFromWKB(byte[] wkb) throws ParseException {
@@ -73,7 +72,7 @@ public class Constructors {
   }
 
   public static Geometry geomFromWKB(byte[] wkb, int SRID) throws ParseException {
-    Geometry geom = new WKBReader().read(wkb);
+    Geometry geom = WKBReader.forDeclaredDimensions().read(wkb);
     if (geom.getFactory().getSRID() != geom.getSRID() || (SRID >= 0 && geom.getSRID() != SRID)) {
       // Make sure that the geometry and the geometry factory have the correct SRID
       if (SRID < 0) {
@@ -113,32 +112,28 @@ public class Constructors {
     if (wkt == null || !wkt.startsWith("MULTIPOINT")) {
       return null;
     }
-    GeometryFactory geometryFactory = new GeometryFactory(new PrecisionModel(), srid);
-    return new WKTReader(geometryFactory).read(wkt);
+    return WKTReader.forDeclaredDimensions(srid).read(wkt);
   }
 
   public static Geometry mLineFromText(String wkt, int srid) throws ParseException {
     if (wkt == null || !wkt.startsWith("MULTILINESTRING")) {
       return null;
     }
-    GeometryFactory geometryFactory = new GeometryFactory(new PrecisionModel(), srid);
-    return new WKTReader(geometryFactory).read(wkt);
+    return WKTReader.forDeclaredDimensions(srid).read(wkt);
   }
 
   public static Geometry mPolyFromText(String wkt, int srid) throws ParseException {
     if (wkt == null || !wkt.startsWith("MULTIPOLYGON")) {
       return null;
     }
-    GeometryFactory geometryFactory = new GeometryFactory(new PrecisionModel(), srid);
-    return new WKTReader(geometryFactory).read(wkt);
+    return WKTReader.forDeclaredDimensions(srid).read(wkt);
   }
 
   public static Geometry geomCollFromText(String wkt, int srid) throws ParseException {
     if (wkt == null || !wkt.startsWith("GEOMETRYCOLLECTION")) {
       return null;
     }
-    GeometryFactory geometryFactory = new GeometryFactory(new PrecisionModel(), srid);
-    return new WKTReader(geometryFactory).read(wkt);
+    return WKTReader.forDeclaredDimensions(srid).read(wkt);
   }
 
   /**
@@ -340,6 +335,29 @@ public class Constructors {
     Point ll = (Point) lowerLeft;
     Point ur = (Point) upperRight;
     return new Box2D(ll.getX(), ll.getY(), ur.getX(), ur.getY());
+  }
+
+  /**
+   * Build a {@link Box3D} from two corner POINT Z geometries. Mirrors PostGIS's {@code
+   * ST_3DMakeBox}. The corners are taken verbatim — no swapping or validation of ordering — so
+   * inverted bounds are preserved as supplied. POINT inputs without a Z dimension contribute {@code
+   * z = 0}, matching PostGIS. NULL or empty point inputs return NULL.
+   */
+  public static Box3D make3DBox(Geometry lowerLeft, Geometry upperRight) {
+    if (lowerLeft == null || upperRight == null) {
+      return null;
+    }
+    if (!(lowerLeft instanceof Point) || !(upperRight instanceof Point)) {
+      throw new IllegalArgumentException("ST_3DMakeBox requires two POINT geometries");
+    }
+    if (lowerLeft.isEmpty() || upperRight.isEmpty()) {
+      return null;
+    }
+    Point ll = (Point) lowerLeft;
+    Point ur = (Point) upperRight;
+    double llZ = Double.isNaN(ll.getCoordinate().getZ()) ? 0.0 : ll.getCoordinate().getZ();
+    double urZ = Double.isNaN(ur.getCoordinate().getZ()) ? 0.0 : ur.getCoordinate().getZ();
+    return new Box3D(ll.getX(), ll.getY(), llZ, ur.getX(), ur.getY(), urZ);
   }
 
   public static Geometry geomFromGeoHash(String geoHash, Integer precision) {

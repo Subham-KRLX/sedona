@@ -468,7 +468,7 @@ public class TestFunctionsV2 extends TestBase {
   public void test_ST_GeometryN() {
     registerUDFV2("ST_GeometryN", String.class, int.class);
     verifySqlSingleRes(
-        "select ST_AsText(sedona.ST_GeometryN(ST_GeometryFromWKT('MULTIPOINT((10 40), (40 30), (20 20), (30 10))'), 1))",
+        "select ST_AsText(sedona.ST_GeometryN(ST_GeometryFromWKT('MULTIPOINT((10 40), (40 30), (20 20), (30 10))'), 2))",
         "POINT(40 30)");
   }
 
@@ -494,10 +494,28 @@ public class TestFunctionsV2 extends TestBase {
   }
 
   @Test
+  public void test_ST_HilbertDistance() {
+    registerUDFV2(
+        "ST_HilbertDistance",
+        String.class,
+        double.class,
+        double.class,
+        double.class,
+        double.class,
+        int.class);
+    verifySqlSingleRes(
+        "select sedona.ST_HilbertDistance(ST_GeometryFromWKT('POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))'), 0, 0, 1, 1, 2) = 2",
+        true);
+    verifySqlSingleRes(
+        "select sedona.ST_HilbertDistance(ST_GeometryFromWKT('POINT (1 0)'), 0, 0, 1, 1, 16) = 4294967295",
+        true);
+  }
+
+  @Test
   public void test_ST_InteriorRingN() {
     registerUDFV2("ST_InteriorRingN", String.class, int.class);
     verifySqlSingleRes(
-        "select ST_AsText(sedona.ST_InteriorRingN(ST_GeometryFromWKT('POLYGON((0 0, 0 5, 5 5, 5 0, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1), (1 3, 2 3, 2 4, 1 4, 1 3), (3 3, 4 3, 4 4, 3 4, 3 3))'), 0))",
+        "select ST_AsText(sedona.ST_InteriorRingN(ST_GeometryFromWKT('POLYGON((0 0, 0 5, 5 5, 5 0, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1), (1 3, 2 3, 2 4, 1 4, 1 3), (3 3, 4 3, 4 4, 3 4, 3 3))'), 1))",
         "LINESTRING(1 1,2 1,2 2,1 2,1 1)");
   }
 
@@ -507,6 +525,16 @@ public class TestFunctionsV2 extends TestBase {
     verifySqlSingleRes(
         "select ST_AsText(sedona.ST_Intersection(ST_GeometryFromWKT('LINESTRING(0 0, 2 2)'), ST_GeometryFromWKT('LINESTRING(0 2, 2 0)')))",
         "POINT(1 1)");
+  }
+
+  @Test
+  public void test_ST_SharedPaths() {
+    registerUDFV2("ST_SharedPaths", String.class, String.class);
+    // Snowflake's GEOMETRY type rejects GeoJSON with empty coordinates, so use inputs
+    // that produce shared paths in both directions (no empty collection element).
+    verifySqlSingleRes(
+        "select ST_AsText(sedona.ST_SharedPaths(ST_GeometryFromWKT('LINESTRING(0 0, 100 0)'), ST_GeometryFromWKT('LINESTRING(20 0, 30 0, 30 50, 80 0, 70 0)')))",
+        "GEOMETRYCOLLECTION(MULTILINESTRING((20 0,30 0)),MULTILINESTRING((70 0,80 0)))");
   }
 
   @Test
@@ -530,6 +558,17 @@ public class TestFunctionsV2 extends TestBase {
   public void test_ST_IsEmpty() {
     registerUDFV2("ST_IsEmpty", String.class);
     verifySqlSingleRes("select sedona.ST_IsEmpty(ST_GeometryFromWKT('POINT(1 2)'))", false);
+  }
+
+  @Test
+  public void test_ST_IsLineStringCCW() {
+    registerUDFV2("ST_IsLineStringCCW", String.class);
+    verifySqlSingleRes(
+        "select sedona.ST_IsLineStringCCW(ST_GeometryFromWKT('LINESTRING (0 0, 1 0, 1 1, 0 1, 0 0)'))",
+        true);
+    verifySqlSingleRes(
+        "select sedona.ST_IsLineStringCCW(ST_GeometryFromWKT('LINESTRING (0 1, 0 -1, -1 -2, 3 -2)'))",
+        false);
   }
 
   @Test
@@ -720,8 +759,8 @@ public class TestFunctionsV2 extends TestBase {
   public void test_ST_OffsetCurve() {
     registerUDFV2("ST_OffsetCurve", String.class, double.class);
     verifySqlSingleRes(
-        "select sedona.ST_AsText(sedona.ST_OffsetCurve(ST_GeometryFromWKT('LINESTRING(0 0, 10 0)'), 5.0))",
-        "LINESTRING (0 5, 10 5)");
+        "select ST_AsText(sedona.ST_OffsetCurve(ST_GeometryFromWKT('LINESTRING(0 0, 10 0)'), 5.0))",
+        "LINESTRING(0 5,10 5)");
     registerUDFV2("ST_OffsetCurve", String.class, double.class, int.class);
     registerUDFV2("ST_NPoints", String.class);
     verifySqlSingleRes(
@@ -1200,6 +1239,15 @@ public class TestFunctionsV2 extends TestBase {
     verifySqlSingleRes(
         "SELECT sedona.ST_IsPolygonCW(ST_GeomFromWKT('POLYGON ((20 35, 45 20, 30 5, 10 10, 10 30, 20 35), (30 20, 20 25, 20 15, 30 20))'))",
         true);
+    // Non-polygonal geometries have no polygonal component to violate the orientation, so
+    // PostGIS parity requires true here.
+    verifySqlSingleRes("SELECT sedona.ST_IsPolygonCW(ST_GeomFromWKT('POINT (0 0)'))", true);
+    verifySqlSingleRes(
+        "SELECT sedona.ST_IsPolygonCW(ST_GeomFromWKT('LINESTRING (0 0, 1 0, 0 0)'))", true);
+    // Empty geometries cannot be tested here: Snowflake's native GEOMETRY parses
+    // 'POLYGON EMPTY' to NULL, so the UDF never receives an empty geometry.
+    // Empty inputs, and geometry-collection recursion, are covered by the WKB-based tests
+    // in TestFunctions.
   }
 
   @Test
@@ -1231,6 +1279,15 @@ public class TestFunctionsV2 extends TestBase {
     verifySqlSingleRes(
         "SELECT sedona.ST_IsPolygonCCW(ST_GeomFromWKT('POLYGON ((20 35, 10 30, 10 10, 30 5, 45 20, 20 35),(30 20, 20 15, 20 25, 30 20))'))",
         true);
+    // Non-polygonal geometries have no polygonal component to violate the orientation, so
+    // PostGIS parity requires true here.
+    verifySqlSingleRes("SELECT sedona.ST_IsPolygonCCW(ST_GeomFromWKT('POINT (0 0)'))", true);
+    verifySqlSingleRes(
+        "SELECT sedona.ST_IsPolygonCCW(ST_GeomFromWKT('LINESTRING (0 0, 1 0, 0 0)'))", true);
+    // Empty geometries cannot be tested here: Snowflake's native GEOMETRY parses
+    // 'POLYGON EMPTY' to NULL, so the UDF never receives an empty geometry.
+    // Empty inputs, and geometry-collection recursion, are covered by the WKB-based tests
+    // in TestFunctions.
   }
 
   @Test

@@ -75,7 +75,7 @@ public class PixelFunctionEditors {
     for (int j = rowY; j < rowY + height; j++) {
       for (int i = colX; i < colX + width; i++) {
         double[] pixel = rasterCopied.getPixel(i, j, (double[]) null);
-        if (keepNoData && noDataValue != null && noDataValue == pixel[band - 1]) {
+        if (keepNoData && RasterUtils.isNoData(pixel[band - 1], noDataValue)) {
           iterator++;
           continue;
         } else {
@@ -152,10 +152,19 @@ public class PixelFunctionEditors {
 
     if (keepNoData) {
       noDataValue = RasterBandAccessors.getBandNoDataValue(raster, band);
-      rasterizedGeom =
-          RasterConstructors.asRaster(geom, raster, bandDataType, allTouched, value, noDataValue);
-    } else {
-      rasterizedGeom = RasterConstructors.asRaster(geom, raster, bandDataType, allTouched, value);
+    }
+    // The rasterized geometry is only read as a mask below, where 0 marks pixels outside the
+    // geometry, so its band must not carry a nodata value (that would fill the mask's background
+    // with it). Passing an explicit null noDataValue keeps the mask's background at 0; the
+    // noDataValue-less overloads would instead inherit the reference band's nodata value and fill
+    // the background with it.
+    rasterizedGeom =
+        RasterConstructors.asRaster(geom, raster, bandDataType, allTouched, value, null);
+    WritableRaster rasterCopied = makeCopiedRaster(raster);
+    if (rasterizedGeom == null) {
+      // The geometry only touches the raster's boundary and burns none of its pixels, so nothing
+      // changes.
+      return RasterUtils.clone(rasterCopied, raster.getSampleDimensions(), raster, null, true);
     }
 
     Raster rasterizedGeomData = RasterUtils.getRaster(rasterizedGeom.getRenderedImage());
@@ -165,7 +174,6 @@ public class PixelFunctionEditors {
         widthGeometryRaster = RasterAccessors.getWidth(rasterizedGeom);
     int heightOriginalRaster = RasterAccessors.getHeight(raster),
         widthOriginalRaster = RasterAccessors.getWidth(raster);
-    WritableRaster rasterCopied = makeCopiedRaster(raster);
 
     // Converting geometry to raster and then iterating through them
     int[] pixelLocation = RasterUtils.getGridCoordinatesFromWorld(raster, colX, rowY);
@@ -188,7 +196,7 @@ public class PixelFunctionEditors {
         double pixelNew =
             rasterizedGeomData.getPixel(geometryX + i, geometryY + j, (double[]) null)[0];
         // skipping 0 from the rasterized geometry as
-        if (pixelNew == 0 || keepNoData && noDataValue != null && noDataValue == pixel[band - 1]) {
+        if (pixelNew == 0 || (keepNoData && RasterUtils.isNoData(pixel[band - 1], noDataValue))) {
           continue;
         } else {
           pixel[band - 1] = pixelNew;

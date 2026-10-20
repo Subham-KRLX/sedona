@@ -41,6 +41,8 @@ import org.apache.sedona.common.Functions;
 import org.apache.sedona.common.FunctionsGeoTools;
 import org.apache.sedona.common.raster.RasterAccessors;
 import org.apache.sedona.common.raster.RasterEditors;
+import org.apache.sedona.common.raster.RasterPredicates;
+import org.geotools.api.coverage.SampleDimensionType;
 import org.geotools.api.coverage.grid.GridEnvelope;
 import org.geotools.api.metadata.spatial.PixelOrientation;
 import org.geotools.api.referencing.FactoryException;
@@ -58,8 +60,8 @@ import org.geotools.coverage.grid.GridEnvelope2D;
 import org.geotools.coverage.grid.GridGeometry2D;
 import org.geotools.geometry.Position2D;
 import org.geotools.referencing.crs.DefaultEngineeringCRS;
+import org.geotools.referencing.crs.DefaultGeographicCRS;
 import org.geotools.referencing.operation.transform.AffineTransform2D;
-import org.geotools.util.ClassChanger;
 import org.geotools.util.NumberRange;
 import org.locationtech.jts.geom.Geometry;
 
@@ -294,14 +296,49 @@ public class RasterUtils {
    * @param noDataValue The no data value.
    * @return A new sample dimension with the given no data value.
    */
-  @SuppressWarnings({"unchecked", "rawtypes"})
   public static GridSampleDimension createSampleDimensionWithNoDataValue(
       GridSampleDimension sampleDimension, double noDataValue) {
-    // if noDataValues contain noDataValue, then return the original sample dimension
-    double existingNoDataValue = getNoDataValue(sampleDimension);
-    if (Double.compare(existingNoDataValue, noDataValue) == 0) {
+    return createSampleDimensionWithNoDataValue(
+        sampleDimension, noDataValue, sampleDimension.getSampleDimensionType());
+  }
+
+  /**
+   * Create a sample dimension using a given sampleDimension as template, with the given no data
+   * value encoded for an explicit sample dimension type.
+   *
+   * <p>The type matters because the no data value is wrapped into a {@link Number} of that type. It
+   * is only worth passing explicitly when the template's own type does not describe the pixels the
+   * sample dimension will end up attached to — deserializing a raster whose band data was replaced
+   * by a Python UDF, for instance, where the template comes from the source raster but the pixels
+   * may have a wider type.
+   *
+   * @param sampleDimension The sample dimension to be used as template.
+   * @param noDataValue The no data value.
+   * @param sampleDimensionType The type to encode the no data value for.
+   * @return A new sample dimension with the given no data value.
+   */
+  @SuppressWarnings({"unchecked", "rawtypes"})
+  public static GridSampleDimension createSampleDimensionWithNoDataValue(
+      GridSampleDimension sampleDimension,
+      double noDataValue,
+      SampleDimensionType sampleDimensionType) {
+    // Encode the value for the sample dimension type first: a float band stores 99.2 as
+    // 99.19999694824219, and the split ranges and new category must agree on the encoded value,
+    // not the requested one.
+    Number wrappedNoData = TypeMap.wrapSample(noDataValue, sampleDimensionType, false);
+    double effectiveNoDataValue = wrappedNoData.doubleValue();
+
+    // Preserve the existing categories when their declared scalar already agrees. In particular,
+    // callers that copy an existing range-valued NODATA category pass its minimum here and expect
+    // the range to remain intact. Wire-level authoritative overrides remove that category before
+    // calling this shared helper.
+    if (hasNoDataValue(sampleDimension)
+        && Double.compare(getNoDataValue(sampleDimension), effectiveNoDataValue) == 0) {
       return sampleDimension;
     }
+
+    NumberRange noDataRange =
+        new NumberRange(wrappedNoData.getClass(), wrappedNoData, wrappedNoData);
 
     String description = sampleDimension.getDescription().toString();
     List<Category> categories = sampleDimension.getCategories();
@@ -311,49 +348,41 @@ public class RasterUtils {
     // Copy existing categories. If the category contains noDataValue, split it into two categories.
     List<Category> newCategories = new ArrayList<>(categories.size());
     for (Category category : categories) {
+      if (category.getName().equals(Category.NODATA.getName())) {
+        // The existing no data category is being replaced wholesale, so drop it. This has to
+        // happen before the split below: a range-valued no data category that contains the new
+        // value would otherwise be split into no data-named fragments, and getNoDataValue() reads
+        // the first such category, reporting the fragment's minimum instead of the value asked for.
+        continue;
+      }
       NumberRange<? extends Number> range = category.getRange();
-      if (range.contains((Number) noDataValue)) {
-        // Split this range to two ranges, one is [min, noDataValue), the other is (noDataValue,
-        // max]
-        Number min = range.getMinValue();
-        Number max = range.getMaxValue();
-        final Class<? extends Number> clazz = ClassChanger.getWidestClass(min, max);
-        min = ClassChanger.cast(min, clazz);
-        max = ClassChanger.cast(max, clazz);
-        Number nodata = ClassChanger.cast(noDataValue, clazz);
-        if (min.doubleValue() < noDataValue) {
-          Category leftCategory =
-              new Category(
-                  category.getName(),
-                  category.getColors(),
-                  new NumberRange(clazz, min, range.isMinIncluded(), nodata, false));
-          newCategories.add(leftCategory);
+      if (range.contains(wrappedNoData)) {
+        // NumberRange performs the split in the widest operand type, so a float output retains
+        // Float fragments while a byte category widened to double can represent a fractional
+        // NODATA value. It can return representationally empty fragments at exclusive boundaries;
+        // compare their effective included endpoints before constructing a Category.
+        for (NumberRange<?> fragment : range.subtract(noDataRange)) {
+          if (fragment.getMinimum(true) <= fragment.getMaximum(true)) {
+            newCategories.add(
+                new Category(
+                    category.getName(), category.getColors(), fragment, category.isQuantitative()));
+          }
         }
-        if (max.doubleValue() > noDataValue) {
-          Category rightCategory =
-              new Category(
-                  category.getName(),
-                  category.getColors(),
-                  new NumberRange(clazz, nodata, false, max, range.isMaxIncluded()));
-          newCategories.add(rightCategory);
-        }
-      } else if (!category.getName().equals(Category.NODATA.getName())) {
+      } else {
         // This category does not contain no data value, just keep it as is.
         newCategories.add(category);
       }
     }
 
     // Add the no data value as a new category
-    Number nodata =
-        TypeMap.wrapSample(noDataValue, sampleDimension.getSampleDimensionType(), false);
     newCategories.add(
         new Category(
             Category.NODATA.getName(),
             new Color(0, 0, 0, 0),
-            new NumberRange(nodata.getClass(), nodata, nodata)));
+            new NumberRange(wrappedNoData.getClass(), wrappedNoData, wrappedNoData)));
 
     return new GridSampleDimension(
-        description, newCategories.toArray(new Category[0]), offset, scale);
+        description, newCategories.toArray(new Category[0]), scale, offset);
   }
 
   public static GridSampleDimension createSampleDimensionWithNoDataValue(
@@ -393,7 +422,7 @@ public class RasterUtils {
     double offset = sampleDimension.getOffset();
     double scale = sampleDimension.getScale();
     return new GridSampleDimension(
-        description, newCategories.toArray(new Category[0]), offset, scale);
+        description, newCategories.toArray(new Category[0]), scale, offset);
   }
 
   /**
@@ -403,6 +432,11 @@ public class RasterUtils {
    * categories as no data value, which is not what we want. Additionally, the GeoTiff writer and
    * ArcGrid writer uses the same algorithm as our method for finding no data values when writing
    * the metadata of raster bands.
+   *
+   * <p>NaN is itself a legal no data value (GDAL writes {@code GDAL_NODATA=nan} for floating point
+   * rasters), so a NaN result is ambiguous: use {@link #hasNoDataValue(GridSampleDimension)} to
+   * tell a NaN no data value from a missing one, and {@link #isNoData(double, Double)} to compare
+   * pixels against it.
    *
    * @param sampleDimension The sample dimension to be processed.
    * @return The no data value, or {@link Double#NaN} if the sample dimension does not contain no
@@ -417,6 +451,44 @@ public class RasterUtils {
       }
     }
     return Double.NaN;
+  }
+
+  /**
+   * Tells whether the given sample dimension declares a no data value. Unlike {@link
+   * #getNoDataValue(GridSampleDimension)}, this distinguishes a band whose no data value is {@link
+   * Double#NaN} (as written by GDAL for floating point rasters) from a band without any no data
+   * value.
+   *
+   * @param sampleDimension The sample dimension to be processed.
+   * @return true if the sample dimension carries a no data category, false otherwise.
+   */
+  public static boolean hasNoDataValue(GridSampleDimension sampleDimension) {
+    InternationalString noDataCategoryName = Category.NODATA.getName();
+    for (Category category : sampleDimension.getCategories()) {
+      if (category.getName().equals(noDataCategoryName)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Tells whether a pixel value is the no data value of its band. This is the comparison every no
+   * data check should use: it is NaN-safe (a NaN pixel matches a NaN no data value, which the
+   * {@code ==} operator never does) and treats {@code -0.0} as {@code 0.0}, unlike {@link
+   * Double#compare(double, double)}.
+   *
+   * @param value The pixel value.
+   * @param noDataValue The no data value of the band, or null if the band has none.
+   * @return true if the pixel is a no data pixel, false otherwise (always false when the band has
+   *     no no data value).
+   */
+  public static boolean isNoData(double value, Double noDataValue) {
+    if (noDataValue == null) {
+      return false;
+    }
+    double noData = noDataValue;
+    return value == noData || (Double.isNaN(value) && Double.isNaN(noData));
   }
 
   /**
@@ -465,37 +537,12 @@ public class RasterUtils {
 
   public static Point2D getWorldCornerCoordinates(GridCoverage2D raster, int colX, int rowY)
       throws TransformException {
-    Point2D.Double gridCoord = new Position2D(colX - 1, rowY - 1);
+    // Subtract in double: colX - 1 in int wraps Integer.MIN_VALUE to Integer.MAX_VALUE.
+    Point2D.Double gridCoord = new Position2D(colX - 1.0, rowY - 1.0);
     return raster
         .getGridGeometry()
         .getGridToCRS2D(PixelOrientation.UPPER_LEFT)
         .transform(gridCoord, null);
-  }
-
-  /**
-   * * Returns the world coordinates of the given grid coordinate. The expected grid coordinates are
-   * 1 indexed. The function also enforces a range check to make sure given grid coordinates are
-   * actually inside the grid.
-   *
-   * @param raster
-   * @param colX
-   * @param rowY
-   * @return
-   * @throws IndexOutOfBoundsException
-   * @throws TransformException
-   */
-  public static Point2D getWorldCornerCoordinatesWithRangeCheck(
-      GridCoverage2D raster, int colX, int rowY)
-      throws IndexOutOfBoundsException, TransformException {
-    Point2D.Double gridCoordinates2D = new Position2D(colX - 1, rowY - 1);
-    if (!(raster.getGridGeometry().getGridRange2D().contains(gridCoordinates2D)))
-      throw new IndexOutOfBoundsException(
-          String.format(
-              "Specified pixel coordinates (%d, %d) do not lie in the raster", colX, rowY));
-    return raster
-        .getGridGeometry()
-        .getGridToCRS2D(PixelOrientation.UPPER_LEFT)
-        .transform(gridCoordinates2D, null);
   }
 
   public static int[] getGridCoordinatesFromWorld(
@@ -549,8 +596,8 @@ public class RasterUtils {
     // In Sedona vector, we do not perform implicit CRS transform. Everything must be done
     // explicitly via ST_Transform
     // In Sedona raster, we do implicit CRS transform if the raster has a CRS. If the SRID of
-    // the geometry is 0, we assume it is 4326.
-    if (geomSRID == 0) {
+    // the geometry is not positive, we assume it is 4326.
+    if (geomSRID <= 0) {
       geomSRID = 4326;
     }
     if (targetCRS != null && !(targetCRS instanceof DefaultEngineeringCRS)) {
@@ -562,6 +609,30 @@ public class RasterUtils {
       }
     }
     return geometry;
+  }
+
+  /**
+   * Transforms a geometry into a raster's coordinate space. Missing raster CRS metadata is
+   * interpreted as WGS84, matching the existing raster predicate policy.
+   *
+   * @param raster raster whose coordinate space is the target
+   * @param geometry geometry to transform
+   * @return geometry expressed in the raster's coordinate space
+   */
+  public static Geometry transformToRasterCRS(GridCoverage2D raster, Geometry geometry) {
+    CoordinateReferenceSystem targetCRS = raster.getCoordinateReferenceSystem();
+    if (targetCRS == null || targetCRS instanceof DefaultEngineeringCRS) {
+      targetCRS = DefaultGeographicCRS.WGS84;
+    }
+    int geometrySRID = geometry.getSRID();
+    if (geometrySRID <= 0) {
+      geometrySRID = 4326;
+    }
+    if (RasterPredicates.isCRSMatchesSRID(targetCRS, geometrySRID)) {
+      // Preserve the identifier-only fast path for the common matched-CRS case.
+      return geometry;
+    }
+    return convertCRSIfNeeded(geometry, targetCRS);
   }
 
   /**
@@ -645,6 +716,158 @@ public class RasterUtils {
       default:
         return false;
     }
+  }
+
+  /**
+   * Verifies that {@code noDataValue} can be stored in the pixel type named by {@code pixelType}
+   * without silent coercion, returning it unchanged when it can. NaN is supported as a nodata value
+   * on floating-point bands. Other values are checked by {@link #assertRepresentable(double,
+   * String, String, boolean)} with the argument name {@code "noDataValue"}.
+   *
+   * @param noDataValue the candidate nodata / background value
+   * @param pixelType a Sedona pixel type string accepted by {@link #getDataTypeCode(String)} (for
+   *     example {@code "B"}, {@code "I"}, {@code "D"})
+   * @return {@code noDataValue}, unchanged, when it is representable in the pixel type
+   * @throws IllegalArgumentException when {@code noDataValue} cannot be represented in the pixel
+   *     type
+   */
+  public static double assertNoDataValueRepresentable(double noDataValue, String pixelType) {
+    if (Double.isNaN(noDataValue) && !isDataTypeIntegral(getDataTypeCode(pixelType))) {
+      return noDataValue;
+    }
+    // A nodata value is a sentinel: it must be stored without any coercion (an exact 32-bit float
+    // round-trip, and no negative-zero collapse on integer bands) so the stored background always
+    // matches the recorded nodata metadata.
+    return assertRepresentable(noDataValue, pixelType, "noDataValue", true);
+  }
+
+  /**
+   * Verifies that a burn value can be stored in {@code pixelType}. Unlike a nodata sentinel, a burn
+   * value is ordinary pixel data and does not have to round-trip exactly: a fractional value on a
+   * float / double band (for example {@code 0.1} on {@code "F"}, stored as {@code 0.10000000149…})
+   * is accepted and rounded to the pixel type, matching PostGIS {@code ST_AsRaster} and {@code
+   * gdal_rasterize}. An out-of-range or fractional value on an integer band is still rejected,
+   * since that would burn a different whole number than the caller asked for.
+   *
+   * @param value the candidate burn value
+   * @param pixelType a Sedona pixel type string accepted by {@link #getDataTypeCode(String)}
+   * @return {@code value}, unchanged, when it is storable in the pixel type
+   * @throws IllegalArgumentException when {@code value} cannot be stored in the pixel type
+   */
+  public static double assertBurnValueRepresentable(double value, String pixelType) {
+    return assertRepresentable(value, pixelType, "value", false);
+  }
+
+  /**
+   * Verifies that {@code value} (a nodata / background value, or a burn value) can be stored in the
+   * pixel type named by {@code pixelType} without silent coercion, returning it unchanged when it
+   * can. Writing a value that is out of the pixel type's range, or fractional for an integer pixel
+   * type, coerces the stored sample to a different number than the value the caller asked for (for
+   * example -1.0 or 300.0 wraps to 255 or 44 in an unsigned 8-bit band), so the sample would read
+   * back as a different number than requested. Any non-finite value (NaN or +/-Infinity) is always
+   * rejected. When {@code requireExactStorage} is true the value is treated as a sentinel that must
+   * round-trip byte-for-byte, so a float / double value that does not survive 32-bit float storage,
+   * and negative zero on an integer band (whose sign an integer sample cannot preserve), are also
+   * rejected; burn values pass false, since rounding to the pixel type is expected of ordinary
+   * pixel data. Such a violation is a correctness error, not a per-row data condition, so this
+   * rejects it with an {@link IllegalArgumentException} instead of coercing.
+   *
+   * @param value the candidate value
+   * @param pixelType a Sedona pixel type string accepted by {@link #getDataTypeCode(String)} (for
+   *     example {@code "B"}, {@code "I"}, {@code "D"})
+   * @param argName the name of the argument being validated (for example {@code "noDataValue"} or
+   *     {@code "value"}), used in the exception message
+   * @param requireExactStorage true to require the value be stored without any coercion (a nodata
+   *     sentinel); false to allow rounding to the pixel type (a burn value)
+   * @return {@code value}, unchanged, when it is representable in the pixel type
+   * @throws IllegalArgumentException when {@code value} cannot be represented in the pixel type
+   */
+  public static double assertRepresentable(
+      double value, String pixelType, String argName, boolean requireExactStorage) {
+    int dataTypeCode = getDataTypeCode(pixelType);
+    long min;
+    long max;
+    String description;
+    switch (dataTypeCode) {
+      case DataBuffer.TYPE_BYTE:
+        min = 0;
+        max = 255;
+        description = "unsigned 8-bit";
+        break;
+      case DataBuffer.TYPE_USHORT:
+        min = 0;
+        max = 65535;
+        description = "unsigned 16-bit";
+        break;
+      case DataBuffer.TYPE_SHORT:
+        min = Short.MIN_VALUE;
+        max = Short.MAX_VALUE;
+        description = "signed 16-bit";
+        break;
+      case DataBuffer.TYPE_INT:
+        min = Integer.MIN_VALUE;
+        max = Integer.MAX_VALUE;
+        description = "signed 32-bit";
+        break;
+      case DataBuffer.TYPE_FLOAT:
+        // NaN nodata is handled by assertNoDataValueRepresentable. Burn values must remain finite,
+        // and infinity cannot be used as a GeoTools nodata category bound.
+        if (!Double.isFinite(value)) {
+          throw new IllegalArgumentException(
+              String.format(
+                  "%s %s is not supported for pixel type '%s'; use a finite value",
+                  argName, value, pixelType));
+        }
+        // A nodata sentinel must round-trip exactly through the band's 32-bit float storage —
+        // otherwise the stored sentinel differs from the value the caller set (e.g. 0.1 would be
+        // stored as 0.10000000149...), and comparisons against the caller's value would miss it. A
+        // burn value is ordinary data, so it is allowed to round to the pixel type (as PostGIS and
+        // gdal_rasterize do) and skips this check.
+        if (requireExactStorage && (double) (float) value != value) {
+          throw new IllegalArgumentException(
+              String.format(
+                  "%s %s is not exactly representable in pixel type '%s' (32-bit float)",
+                  argName, value, pixelType));
+        }
+        return value;
+      case DataBuffer.TYPE_DOUBLE:
+      default:
+        // 64-bit float represents every finite double value; only NaN and infinities are rejected
+        // (see the float arm for why).
+        if (!Double.isFinite(value)) {
+          throw new IllegalArgumentException(
+              String.format(
+                  "%s %s is not supported for pixel type '%s'; use a finite value",
+                  argName, value, pixelType));
+        }
+        return value;
+    }
+
+    // A nodata sentinel of negative zero cannot be stored in an integer sample: the sign is lost,
+    // so the background reads back as +0 while the recorded nodata metadata is -0.0, leaving the
+    // background counted as data (and B/US fail later constructing the category as "Ranges
+    // overlap").
+    // Ordinary comparisons treat -0.0 as +0.0, so it slips through the range/fractional check
+    // below;
+    // reject it explicitly for integer pixel types. +0.0 and float/double -0.0 are unaffected, and
+    // burn values (requireExactStorage == false) are ordinary data, so -0.0 simply stores as 0.
+    if (requireExactStorage
+        && Double.doubleToRawLongBits(value) == Double.doubleToRawLongBits(-0.0d)) {
+      throw new IllegalArgumentException(
+          String.format(
+              "%s %s is not representable in pixel type '%s' (%s integer): negative zero cannot be "
+                  + "stored in an integer sample; use 0",
+              argName, value, pixelType, description));
+    }
+
+    // Integer pixel types: reject out-of-range and fractional values (Math.rint also rejects NaN).
+    if (value < min || value > max || value != Math.rint(value)) {
+      throw new IllegalArgumentException(
+          String.format(
+              "%s %s is not representable in pixel type '%s' (%s integer, valid range %d..%d)",
+              argName, value, pixelType, description, min, max));
+    }
+    return value;
   }
 
   /**
@@ -847,7 +1070,7 @@ public class RasterUtils {
 
         if (nx >= 0 && nx < width && ny >= 0 && ny < height && !(dx == 0 && dy == 0)) {
           double value = raster.getSampleDouble(nx, ny, band); // Now checks the specified band
-          if (value != noDataValue) {
+          if (!isNoData(value, noDataValue)) {
             neighbors.add(value);
           }
         }
@@ -857,12 +1080,37 @@ public class RasterUtils {
   }
 
   /**
-   * Replaces noDataValue pixels in each band with mean of neighboring pixel values
+   * Replaces noDataValue pixels in each band with the median of their valid neighboring pixels. A
+   * single pass leaves the nodata pixels whose neighbors are all nodata untouched; see {@link
+   * #replaceNoDataValues(GridCoverage2D, int)} to fill deeper holes.
    *
    * @param raster
    * @return A new grid coverage with noDataValues pixels replaced
    */
   public static GridCoverage2D replaceNoDataValues(GridCoverage2D raster) {
+    return replaceNoDataValues(raster, 1);
+  }
+
+  /**
+   * Replaces noDataValue pixels in each band with the median of their valid neighboring pixels,
+   * repeating the pass so that each pass sees the pixels filled by the previous one. A caller that
+   * interpolates over the result should ask for as many passes as the interpolation kernel radius,
+   * otherwise a nodata sentinel deep inside a hole leaks into the interpolated pixels around it.
+   *
+   * @param raster
+   * @param passes the number of filling passes; each fills one more pixel inwards from the hole
+   *     border
+   * @return A new grid coverage with noDataValues pixels replaced
+   */
+  public static GridCoverage2D replaceNoDataValues(GridCoverage2D raster, int passes) {
+    GridCoverage2D result = raster;
+    for (int pass = 0; pass < passes; pass++) {
+      result = replaceNoDataValuesOnce(result);
+    }
+    return result;
+  }
+
+  private static GridCoverage2D replaceNoDataValuesOnce(GridCoverage2D raster) {
     Raster rasterData = raster.getRenderedImage().getData();
     WritableRaster writableRaster = rasterData.createCompatibleWritableRaster();
 
@@ -871,13 +1119,13 @@ public class RasterUtils {
     // Iterate over each band
     for (int band = 0; band < raster.getNumSampleDimensions(); band++) {
       GridSampleDimension sampleDimension = raster.getSampleDimension(band);
-      double noDataValue = RasterUtils.getNoDataValue(sampleDimension);
+      Double noDataValue = hasNoDataValue(sampleDimension) ? getNoDataValue(sampleDimension) : null;
 
       // Replace no data values with the median of neighboring pixels for each band
       for (int y = 0; y < rasterData.getHeight(); y++) {
         for (int x = 0; x < rasterData.getWidth(); x++) {
           double originalValue = rasterData.getSampleDouble(x, y, band);
-          if (originalValue == noDataValue) {
+          if (isNoData(originalValue, noDataValue)) {
             List<Double> neighbors =
                 RasterUtils.getNeighboringPixels(x, y, band, rasterData, noDataValue);
             double[] neighborArray = neighbors.stream().mapToDouble(Double::doubleValue).toArray();
@@ -904,10 +1152,14 @@ public class RasterUtils {
   }
 
   /**
-   * Filters out the noDataValue pixels from each band as a grid coverage
+   * Builds a mask flagging the no data pixels of each band: 1 where the pixel is the band's no data
+   * value, 0 elsewhere. The flag is representable in every pixel type, so the mask can be built for
+   * integer bands (a NaN marker would collapse to 0 there) and for bands whose no data value is
+   * itself NaN. {@link #applyRasterMask(GridCoverage2D, GridCoverage2D)} restores the flagged
+   * pixels to the band's no data value.
    *
-   * @param raster
-   * @return Returns a grid coverage with noDataValues and valid data values as Double.Nan
+   * @param raster The raster to extract the mask from.
+   * @return A raster of the same shape and type holding 1 for no data pixels and 0 otherwise.
    */
   public static GridCoverage2D extractNoDataValueMask(GridCoverage2D raster) {
     Raster rasterData = raster.getRenderedImage().getData();
@@ -918,16 +1170,12 @@ public class RasterUtils {
     // Iterate over each band
     for (int band = 0; band < raster.getNumSampleDimensions(); band++) {
       GridSampleDimension sampleDimension = raster.getSampleDimension(band);
-      Double noDataValue = RasterUtils.getNoDataValue(sampleDimension);
+      Double noDataValue = hasNoDataValue(sampleDimension) ? getNoDataValue(sampleDimension) : null;
 
       for (int y = 0; y < rasterData.getHeight(); y++) {
         for (int x = 0; x < rasterData.getWidth(); x++) {
           double originalValue = rasterData.getSampleDouble(x, y, band);
-          if (originalValue == noDataValue) {
-            writableRaster.setSample(x, y, band, originalValue);
-          } else {
-            writableRaster.setSample(x, y, band, Double.NaN);
-          }
+          writableRaster.setSample(x, y, band, isNoData(originalValue, noDataValue) ? 1 : 0);
         }
       }
     }
@@ -939,18 +1187,19 @@ public class RasterUtils {
             raster.getSampleDimensions(),
             raster,
             null,
-            true);
+            false);
     return modifiedRaster;
   }
 
   /**
-   * Superimposes the mask values onto the original raster, maintaining the original values where
-   * the mask is NaN.
+   * Restores the no data pixels flagged by a mask from {@link
+   * #extractNoDataValueMask(GridCoverage2D)}: wherever the mask is non-zero, the pixel is set to
+   * the no data value of the corresponding band of {@code raster}; every other pixel keeps its
+   * value.
    *
-   * @param raster The original raster to which the mask will be applied.
-   * @param mask Grid coverage mask to be applied, containing the values to overlay. This mask
-   *     should have the same dimensions and number of bands as the original raster.
-   * @return A new GridCoverage2D object with the mask applied.
+   * @param raster The raster to restore no data pixels in; its bands carry the no data values.
+   * @param mask The flag mask, with the same dimensions and number of bands as the raster.
+   * @return A new GridCoverage2D object with the no data pixels restored.
    */
   public static GridCoverage2D applyRasterMask(GridCoverage2D raster, GridCoverage2D mask) {
     Raster rasterData = raster.getRenderedImage().getData();
@@ -961,12 +1210,14 @@ public class RasterUtils {
 
     // Iterate over each band
     for (int band = 0; band < raster.getNumSampleDimensions(); band++) {
+      GridSampleDimension sampleDimension = raster.getSampleDimension(band);
+      Double noDataValue = hasNoDataValue(sampleDimension) ? getNoDataValue(sampleDimension) : null;
       for (int y = 0; y < rasterData.getHeight(); y++) {
         for (int x = 0; x < rasterData.getWidth(); x++) {
           double originalValue = rasterData.getSampleDouble(x, y, band);
-          double maskValue = maskData.getSampleDouble(x, y, band);
-          if (!Double.isNaN(maskValue)) {
-            writableRaster.setSample(x, y, band, maskValue);
+          boolean flagged = maskData.getSampleDouble(x, y, band) != 0;
+          if (flagged && noDataValue != null) {
+            writableRaster.setSample(x, y, band, noDataValue);
           } else {
             writableRaster.setSample(x, y, band, originalValue);
           }
@@ -983,5 +1234,171 @@ public class RasterUtils {
             null,
             false);
     return modifiedRaster;
+  }
+
+  /**
+   * This function calculates the upper-left Y world coordinate of the raster. It accounts for both
+   * bottom-up and top-down raster conventions.
+   *
+   * <p>For bottom-up rasters (metadata[5] > 0), the upper-left Y world coordinate is directly taken
+   * from metadata[1]. - For top-down rasters (metadata[5] < 0), the upper-left Y coordinate is
+   * adjusted by adding the product of the raster height and the scale factor (metadata[5]).
+   *
+   * @param metadata The metadata array containing raster properties.
+   * @return The upper-left Y world coordinate of the raster.
+   */
+  public static double getRasterUpperLeftY(double[] metadata) {
+    if (metadata[5] < 0) {
+      return metadata[1];
+    } else {
+      int rasterHeight = (int) metadata[3];
+      return metadata[1] + (rasterHeight * metadata[5]);
+    }
+  }
+
+  /**
+   * This function calculates the Y scale factor of the raster. It ensures that the scale factor is
+   * always negative, regardless of the raster convention.
+   *
+   * <p>For bottom-up rasters (metadata[5] > 0), the scale factor is returned as-is. - For top-down
+   * rasters (metadata[5] < 0), the scale factor is negated to maintain consistency.
+   *
+   * @param metadata The metadata array containing raster properties.
+   * @return The Y scale factor of the raster.
+   */
+  public static double getRasterScaleY(double[] metadata) {
+    if (metadata[5] < 0) {
+      return metadata[5];
+    } else {
+      return -metadata[5];
+    }
+  }
+
+  /**
+   * GRID SPACE: Grid space refers to the raster's index space (col, row). Pixel values remain at
+   * the same array indices, but the grid-to-CRS affine transform is rewritten.
+   *
+   * <p>EFFECT: - The raster is reinterpreted spatially (top-down ↔ bottom-up). - Pixel values are
+   * NOT moved in memory. - Pixel world coordinates DO change. - The world envelope (bounding box)
+   * is preserved.
+   *
+   * <p>Use this when you want to change how the raster is oriented in CRS space without touching
+   * the pixel data.
+   */
+  public static GridCoverage2D flipVerticallyGridSpace(GridCoverage2D raster) {
+
+    GridGeometry2D gridGeometry = raster.getGridGeometry();
+
+    MathTransform mt = gridGeometry.getGridToCRS2D();
+    if (!(mt instanceof AffineTransform2D)) {
+      throw new UnsupportedOperationException(
+          "flipVertically only supports AffineTransform2D grid-to-CRS transforms");
+    }
+
+    AffineTransform2D affine = (AffineTransform2D) mt;
+
+    RenderedImage image = raster.getRenderedImage();
+    int height = image.getHeight();
+
+    /*
+     * Affine transform definition (GeoTools / GDAL compatible):
+     *
+     *   worldX = scaleX * col + shearX * row + translateX
+     *   worldY = shearY * col + scaleY * row + translateY
+     */
+    double scaleX = affine.getScaleX();
+    double shearX = affine.getShearX();
+    double shearY = affine.getShearY();
+    double scaleY = affine.getScaleY();
+    double translateX = affine.getTranslateX();
+    double translateY = affine.getTranslateY();
+
+    /*
+     * Apply grid-space vertical flip:
+     *
+     *   row = (H - 1) - row'
+     */
+    double newShearX = -shearX;
+    double newScaleY = -scaleY;
+
+    double newTranslateX = translateX + shearX * (height - 1);
+    double newTranslateY = translateY + scaleY * (height - 1);
+
+    AffineTransform2D flippedAffine =
+        new AffineTransform2D(scaleX, shearY, newShearX, newScaleY, newTranslateX, newTranslateY);
+
+    GridGeometry2D newGridGeometry =
+        new GridGeometry2D(
+            gridGeometry.getGridRange(),
+            flippedAffine,
+            gridGeometry.getCoordinateReferenceSystem());
+
+    return RasterUtils.clone(
+        raster.getRenderedImage(),
+        newGridGeometry,
+        raster.getSampleDimensions(),
+        raster,
+        null,
+        true);
+  }
+
+  /**
+   * PIXEL SPACE: Pixel space refers to pixel values anchored at their world coordinates. Pixel
+   * values are physically rearranged so that each value remains at the same CRS location.
+   *
+   * <p>EFFECT: - Raster rows are reversed in memory. - The affine transform is updated accordingly.
+   * - Pixel world coordinates are preserved. - The world envelope (bounding box) is preserved.
+   *
+   * <p>Use this when pixel values must remain fixed at their geographic locations.
+   */
+  public static GridCoverage2D flipVerticallyPixelSpace(GridCoverage2D raster) {
+    GridGeometry2D gridGeometry = raster.getGridGeometry();
+
+    MathTransform mt = gridGeometry.getGridToCRS2D();
+    if (!(mt instanceof AffineTransform2D)) {
+      throw new UnsupportedOperationException(
+          "flipVertically only supports AffineTransform2D grid-to-CRS transforms");
+    }
+
+    AffineTransform2D affine = (AffineTransform2D) mt;
+
+    RenderedImage image = raster.getRenderedImage();
+    int height = image.getHeight();
+
+    // Flip the affine transformation
+    double scaleX = affine.getScaleX();
+    double shearX = affine.getShearX();
+    double shearY = affine.getShearY();
+    double scaleY = affine.getScaleY();
+    double translateX = affine.getTranslateX();
+    double translateY = affine.getTranslateY();
+
+    double newShearX = -shearX;
+    double newScaleY = -scaleY;
+    double newTranslateX = translateX + shearX * (height - 1);
+    double newTranslateY = translateY + scaleY * (height - 1);
+
+    AffineTransform2D flippedAffine =
+        new AffineTransform2D(scaleX, shearY, newShearX, newScaleY, newTranslateX, newTranslateY);
+
+    // Create a new WritableRaster to preserve pixel values
+    Raster originalRaster = RasterUtils.getRaster(image);
+    WritableRaster flippedRaster = originalRaster.createCompatibleWritableRaster();
+
+    // Copy pixel values to the flipped raster
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < image.getWidth(); x++) {
+        flippedRaster.setPixel(x, height - y - 1, originalRaster.getPixel(x, y, (double[]) null));
+      }
+    }
+
+    GridGeometry2D newGridGeometry =
+        new GridGeometry2D(
+            gridGeometry.getGridRange(),
+            flippedAffine,
+            gridGeometry.getCoordinateReferenceSystem());
+
+    return RasterUtils.clone(
+        flippedRaster, newGridGeometry, raster.getSampleDimensions(), raster, null, true);
   }
 }

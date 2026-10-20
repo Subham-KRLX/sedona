@@ -79,6 +79,8 @@ Here are the contents of the DataFrame:
 
 The geometry column can contain many different geometric objects like points, polygons, and many more.
 
+Since Sedona 2.0.0, reads preserve declared Z/M dimensions even for empty points, lines, and polygons or NaN ordinates. If collecting mixed layouts raises a heterogeneous-layout error, see [ST_Collect](../../api/sql/Geometry-Editors/ST_Collect.md).
+
 You can also see the metadata of the GeoPackage file:
 
 ```python
@@ -99,6 +101,54 @@ Here are the contents:
 |  my_layer| features|  my_layer|           |2025-02-25 06:28:...|  0.0|  0.0|  7.0|  6.0| 99999|
 +----------+---------+----------+-----------+--------------------+-----+-----+-----+-----+------+
 ```
+
+### Listing layers and declared geometry types
+
+Since Sedona 2.0.0, `includeGeometryType=true` adds a nullable `geometry_type`
+column to `showMetadata=true`. The default metadata schema is unchanged.
+
+```python
+layers = (
+    sedona.read.format("geopackage")
+    .option("showMetadata", "true")
+    .option("includeGeometryType", "true")
+    .load("/tmp/my_file.gpkg")
+)
+layers.select("table_name", "data_type", "geometry_type").show()
+```
+
+This reads `gpkg_contents` and `gpkg_geometry_columns`, not feature or tile rows.
+Empty feature layers are included. Core geometry types use names such as `Point`,
+`MultiPolygon`, and `GeometryCollection`. Concrete types allowing Z, including
+optional Z, have a ` Z` suffix. M is not represented in the label, matching
+GeoPandas with Pyogrio. Generic `GEOMETRY` layers report `Unknown`; non-feature
+tables have a null geometry type.
+Unsupported geometry extension types or invalid feature metadata cause an error.
+A file containing only attributes or tiles does not need `gpkg_geometry_columns`.
+
+`includeGeometryType` requires `showMetadata=true` and exactly one resolved file.
+A directory or glob resolving to multiple files is rejected. Without this option,
+the existing metadata mode still reads the first file only.
+
+The GeoPandas API provides the same information as a local pandas DataFrame:
+
+```python
+import sedona.spark.geopandas as sgpd
+
+layers = sgpd.list_layers("/tmp/my_file.gpkg")
+# Columns: name, geometry_type; sorted by name.
+```
+
+`list_layers` includes registered vector layers and nonspatial tables, including
+legacy `aspatial` tables, but excludes raster tiles. It accepts string or path-like
+`.gpkg` paths, including Hadoop-supported URLs such as `s3a://bucket/city.gpkg`.
+Other formats, bytes, and file-like objects are not supported. No Pyogrio
+installation is required.
+
+Only the small layer catalog is collected to the driver. For remote paths, the
+reader first copies the **entire GeoPackage** to executor-local temporary storage.
+Network I/O and temporary disk requirements therefore scale with the file size,
+even though no geometries are decoded.
 
 ## Reading many GeoPackage files with Sedona and Spark
 

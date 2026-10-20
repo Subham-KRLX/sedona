@@ -21,6 +21,7 @@ package org.apache.sedona.flink;
 import static org.apache.flink.table.api.Expressions.$;
 import static org.apache.flink.table.api.Expressions.call;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 
 import org.apache.flink.table.api.Table;
 import org.apache.sedona.flink.expressions.Predicates;
@@ -35,31 +36,100 @@ public class PredicateTest extends TestBase {
   }
 
   @Test
-  public void testBoxIntersects() {
+  public void testIntersectsOnBox2D() {
     Table t =
         tableEnv.sqlQuery(
             "WITH boxes AS ("
                 + " SELECT ST_Box2D(ST_GeomFromWKT('POLYGON((0 0, 0 5, 5 5, 5 0, 0 0))')) AS a,"
                 + " ST_Box2D(ST_GeomFromWKT('POLYGON((3 3, 3 7, 7 7, 7 3, 3 3))')) AS overlap,"
                 + " ST_Box2D(ST_GeomFromWKT('POLYGON((6 6, 6 7, 7 7, 7 6, 6 6))')) AS disjoint)"
-                + " SELECT ST_BoxIntersects(a, overlap), ST_BoxIntersects(a, disjoint) FROM boxes");
+                + " SELECT ST_Intersects(a, overlap), ST_Intersects(a, disjoint) FROM boxes");
     org.apache.flink.types.Row row = first(t);
     assertEquals(true, row.getField(0));
     assertEquals(false, row.getField(1));
   }
 
   @Test
-  public void testBoxContains() {
+  public void testContainsOnBox2D() {
     Table t =
         tableEnv.sqlQuery(
             "WITH boxes AS ("
                 + " SELECT ST_Box2D(ST_GeomFromWKT('POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))')) AS outer_box,"
                 + " ST_Box2D(ST_GeomFromWKT('POLYGON((2 2, 2 5, 5 5, 5 2, 2 2))')) AS inner_box,"
                 + " ST_Box2D(ST_GeomFromWKT('POLYGON((5 5, 5 11, 11 11, 11 5, 5 5))')) AS overlap)"
-                + " SELECT ST_BoxContains(outer_box, inner_box), ST_BoxContains(outer_box, overlap) FROM boxes");
+                + " SELECT ST_Contains(outer_box, inner_box), ST_Contains(outer_box, overlap) FROM boxes");
     org.apache.flink.types.Row row = first(t);
     assertEquals(true, row.getField(0));
     assertEquals(false, row.getField(1));
+  }
+
+  @Test
+  public void testIntersectsOnBox3D() {
+    Table t =
+        tableEnv.sqlQuery(
+            "WITH boxes AS ("
+                + " SELECT ST_3DMakeBox(ST_PointZ(0, 0, 0), ST_PointZ(5, 5, 5)) AS a,"
+                + " ST_3DMakeBox(ST_PointZ(3, 3, 3), ST_PointZ(7, 7, 7)) AS overlap,"
+                + " ST_3DMakeBox(ST_PointZ(0, 0, 10), ST_PointZ(5, 5, 11)) AS zdisjoint,"
+                + " ST_3DMakeBox(ST_PointZ(6, 6, 6), ST_PointZ(7, 7, 7)) AS disjoint)"
+                + " SELECT ST_Intersects(a, overlap), ST_Intersects(a, zdisjoint),"
+                + " ST_Intersects(a, disjoint) FROM boxes");
+    org.apache.flink.types.Row row = first(t);
+    assertEquals(true, row.getField(0));
+    // Overlaps in XY but separated in Z — Box3D intersection must reject it.
+    assertEquals(false, row.getField(1));
+    assertEquals(false, row.getField(2));
+  }
+
+  @Test
+  public void testContainsOnBox3D() {
+    Table t =
+        tableEnv.sqlQuery(
+            "WITH boxes AS ("
+                + " SELECT ST_3DMakeBox(ST_PointZ(0, 0, 0), ST_PointZ(10, 10, 10)) AS outer_box,"
+                + " ST_3DMakeBox(ST_PointZ(2, 2, 2), ST_PointZ(5, 5, 5)) AS inner_box,"
+                + " ST_3DMakeBox(ST_PointZ(2, 2, 2), ST_PointZ(5, 5, 99)) AS zout)"
+                + " SELECT ST_Contains(outer_box, inner_box), ST_Contains(outer_box, zout)"
+                + " FROM boxes");
+    org.apache.flink.types.Row row = first(t);
+    assertEquals(true, row.getField(0));
+    // Contained in XY but pokes out of the Z range — not contained in 3D.
+    assertEquals(false, row.getField(1));
+  }
+
+  @Test
+  public void test3DDWithin() {
+    // Two POINT Z 3 units apart in Z only.
+    Table within =
+        tableEnv.sqlQuery(
+            "SELECT ST_3DDWithin(ST_PointZ(0, 0, 0), ST_PointZ(0, 0, 3), 3.0),"
+                + " ST_3DDWithin(ST_PointZ(0, 0, 0), ST_PointZ(0, 0, 3), 2.9)");
+    org.apache.flink.types.Row row = first(within);
+    assertEquals(true, row.getField(0));
+    assertEquals(false, row.getField(1));
+
+    // Box3D-on-Box3D: faces 4 units apart in Z.
+    Table boxes =
+        tableEnv.sqlQuery(
+            "WITH b AS ("
+                + " SELECT ST_3DMakeBox(ST_PointZ(0, 0, 0), ST_PointZ(1, 1, 1)) AS a,"
+                + " ST_3DMakeBox(ST_PointZ(0, 0, 5), ST_PointZ(1, 1, 6)) AS far)"
+                + " SELECT ST_3DDWithin(a, far, 4.0), ST_3DDWithin(a, far, 3.9) FROM b");
+    org.apache.flink.types.Row boxRow = first(boxes);
+    assertEquals(true, boxRow.getField(0));
+    assertEquals(false, boxRow.getField(1));
+
+    // NULL distance propagates to NULL rather than throwing on autounbox.
+    Table nullDist =
+        tableEnv.sqlQuery(
+            "SELECT ST_3DDWithin(ST_PointZ(0, 0, 0), ST_PointZ(0, 0, 3),"
+                + " CAST(NULL AS DOUBLE)) AS geom_null,"
+                + " ST_3DDWithin(ST_3DMakeBox(ST_PointZ(0, 0, 0), ST_PointZ(1, 1, 1)),"
+                + " ST_3DMakeBox(ST_PointZ(0, 0, 5), ST_PointZ(1, 1, 6)),"
+                + " CAST(NULL AS DOUBLE)) AS box_null");
+    org.apache.flink.types.Row nullRow = first(nullDist);
+    assertNull(nullRow.getField(0));
+    assertNull(nullRow.getField(1));
   }
 
   @Test
@@ -137,6 +207,53 @@ public class PredicateTest extends TestBase {
   }
 
   @Test
+  public void testEqualsExact() {
+    Table table =
+        tableEnv.sqlQuery(
+            "SELECT"
+                + " ST_EqualsExact(ST_Point(0.0, 0.0), ST_Point(0.03, 0.04), 0.05)"
+                + " AS within_tolerance,"
+                + " ST_EqualsExact(ST_Point(0.0, 0.0), ST_Point(0.03, 0.04), 0.049)"
+                + " AS outside_tolerance,"
+                + " ST_EqualsExact(ST_GeomFromWKT(CAST(NULL AS STRING)),"
+                + " ST_Point(0.0, 0.0), 0.0) AS null_left,"
+                + " ST_EqualsExact(ST_Point(0.0, 0.0),"
+                + " ST_GeomFromWKT(CAST(NULL AS STRING)), 0.0) AS null_right,"
+                + " ST_EqualsExact(ST_Point(0.0, 0.0), ST_Point(0.0, 0.0),"
+                + " CAST(NULL AS DOUBLE)) AS null_tolerance");
+    org.apache.flink.types.Row row = first(table);
+    assertEquals(true, row.getField(0));
+    assertEquals(false, row.getField(1));
+    assertNull(row.getField(2));
+    assertNull(row.getField(3));
+    assertNull(row.getField(4));
+  }
+
+  @Test
+  public void testEqualsIdentical() {
+    Table table =
+        tableEnv.sqlQuery(
+            "SELECT"
+                + " ST_EqualsIdentical(ST_GeomFromWKT('POINT Z (1 2 3)'),"
+                + " ST_GeomFromWKT('POINT Z (1 2 3)')) AS identical,"
+                + " ST_EqualsIdentical(ST_GeomFromWKT('POINT Z (1 2 3)'),"
+                + " ST_GeomFromWKT('POINT Z (1 2 4)')) AS different_z,"
+                + " ST_EqualsIdentical(ST_GeomFromWKT('POINT Z (1 2 3)'),"
+                + " ST_GeomFromWKT('POINT M (1 2 3)')) AS different_dimension,"
+                + " ST_EqualsIdentical("
+                + " ST_GeomFromWKT('LINESTRING (0 0, 1 1)'),"
+                + " ST_GeomFromWKT('LINESTRING (1 1, 0 0)')) AS different_order,"
+                + " ST_EqualsIdentical(ST_GeomFromWKT(CAST(NULL AS STRING)),"
+                + " ST_Point(0.0, 0.0)) AS null_left");
+    org.apache.flink.types.Row row = first(table);
+    assertEquals(true, row.getField(0));
+    assertEquals(false, row.getField(1));
+    assertEquals(false, row.getField(2));
+    assertEquals(false, row.getField(3));
+    assertNull(row.getField(4));
+  }
+
+  @Test
   public void testOrderingEquals() {
     Table lineStringTable = createLineStringTable(testDataSize);
     String lineString = createLineStringWKT(testDataSize).get(0).getField(0).toString();
@@ -211,6 +328,39 @@ public class PredicateTest extends TestBase {
         table.select(call(Predicates.ST_DWithin.class.getSimpleName(), $("origin"), $("p1"), 1));
     Boolean actual = (Boolean) first(table).getField(0);
     assertEquals(true, actual);
+  }
+
+  @Test
+  public void testDWithinNullArguments() {
+    // Any NULL argument propagates to NULL rather than NPE-ing on autounbox / null geometry.
+    Table t =
+        tableEnv.sqlQuery(
+            "SELECT ST_DWithin(ST_GeomFromWKT('POINT (0 0)'), ST_GeomFromWKT('POINT (1 0)'),"
+                + " CAST(NULL AS DOUBLE)) AS null_dist,"
+                + " ST_DWithin(ST_GeomFromWKT(CAST(NULL AS STRING)),"
+                + " ST_GeomFromWKT('POINT (1 0)'), 1.0) AS null_geom,"
+                + " ST_DWithin(ST_GeomFromWKT('POINT (0 0)'), ST_GeomFromWKT('POINT (1 0)'), 1.0,"
+                + " CAST(NULL AS BOOLEAN)) AS null_sphere");
+    org.apache.flink.types.Row row = first(t);
+    assertNull(row.getField(0));
+    assertNull(row.getField(1));
+    assertNull(row.getField(2));
+  }
+
+  @Test
+  public void testDWithinEmptyGeometries() {
+    Table t =
+        tableEnv.sqlQuery(
+            "SELECT ST_DWithin(ST_GeomFromWKT('POINT (0 0)'), ST_GeomFromWKT('POLYGON EMPTY'),"
+                + " 1000.0, true),"
+                + " ST_DWithin(ST_GeomFromWKT('POINT EMPTY'), ST_GeomFromWKT('POINT (0 0)'),"
+                + " 1000.0, true),"
+                + " ST_DWithin(ST_GeomFromWKT('POINT (0 0)'), ST_GeomFromWKT('POLYGON EMPTY'),"
+                + " 1000.0)");
+    org.apache.flink.types.Row row = first(t);
+    for (int i = 0; i < row.getArity(); i++) {
+      assertEquals(false, row.getField(i));
+    }
   }
 
   @Test

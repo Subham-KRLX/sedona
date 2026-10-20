@@ -103,11 +103,11 @@ SedonaSQL 详细 API 说明请参阅 [SedonaSQL API](../api/sql/Overview.md)。�
 
 	config = SedonaContext.builder() .\
 	    config('spark.jars.packages',
-	           'org.apache.sedona:sedona-spark-shaded-3.3_2.12:{{ sedona.current_version }},'
+	           'org.apache.sedona:sedona-spark-shaded-3.5_2.12:{{ sedona.current_version }},'
 	           'org.datasyslab:geotools-wrapper:{{ sedona.current_geotools }}'). \
 	    getOrCreate()
 	```
-    如使用其他 Spark 版本，请将 sedona-spark-shaded 包名中的 `3.3` 替换为对应的 Spark major.minor 版本，例如 `sedona-spark-shaded-3.4_2.12:{{ sedona.current_version }}`。
+    如使用其他 Spark 版本，请将 sedona-spark-shaded 包名中的 `3.5` 替换为对应的 Spark major.minor 版本，例如 `sedona-spark-shaded-4.0_2.13:{{ sedona.current_version }}`。
 
 ## 初始化 SedonaContext
 
@@ -138,6 +138,54 @@ SedonaSQL 详细 API 说明请参阅 [SedonaSQL API](../api/sql/Overview.md)。�
 	```
 
 也可以通过在 `spark-submit` 或 `spark-shell` 中传入 `--conf spark.sql.extensions=org.apache.sedona.sql.SedonaSqlExtensions` 完成注册。
+
+## 参数化查询（Python）
+
+`sedona.sql` 支持 [SparkSession.sql](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.SparkSession.sql.html) 提供的命名参数。请通过 `args` 绑定值，而不要用 f-string 或字符串拼接将值插入 SQL。可以将 DataFrame 作为关键字参数传入，并通过 `{占位符}` 引用；Spark 会自动管理临时视图。
+
+```python
+points = sedona.sql("""
+    SELECT 1 AS id, ST_Point(1D, 1D) AS geometry
+    UNION ALL
+    SELECT 2 AS id, ST_Point(5D, 5D) AS geometry
+""")
+region_wkt = "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))"
+
+result = sedona.sql(
+    """
+    SELECT id
+    FROM {points}
+    WHERE ST_Intersects(geometry, ST_GeomFromWKT(:region))
+    """,
+    args={"region": region_wkt},
+    points=points,
+)
+result.show()
+```
+
+```text
++---+
+| id|
++---+
+|  1|
++---+
+```
+
+不要给 `:region` 或 `{points}` 加引号。`:region` 将 WKT 字符串绑定为 SQL 值，`{points}` 则引用 DataFrame。
+
+不能直接绑定 Shapely 几何对象。可以将 `geometry.wkt` 传给 `ST_GeomFromWKT`，或绑定 `geometry.wkb` 并使用 `ST_GeomFromWKB`：
+
+```python
+from shapely.geometry import Point
+
+geometry = Point(1, 1)
+result = sedona.sql(
+    "SELECT ST_AsText(ST_GeomFromWKB(:geometry)) AS wkt",
+    args={"geometry": geometry.wkb},
+)
+print(result.first().wkt)
+# POINT (1 1)
+```
 
 ## 从文本文件加载数据
 

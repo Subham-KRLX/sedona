@@ -20,14 +20,60 @@ package org.apache.sedona.common;
 
 import static org.junit.Assert.*;
 
+import java.util.EnumSet;
 import org.apache.sedona.common.geometryObjects.Box2D;
+import org.apache.sedona.common.geometrySerde.CoordinateType;
+import org.apache.sedona.common.geometrySerde.GeometrySerializer;
 import org.apache.sedona.common.utils.GeomUtils;
 import org.junit.Test;
 import org.locationtech.jts.geom.*;
+import org.locationtech.jts.io.Ordinate;
 import org.locationtech.jts.io.ParseException;
+import org.locationtech.jts.io.WKBReader;
 import org.locationtech.jts.io.WKBWriter;
 
 public class ConstructorsTest {
+
+  @Test
+  public void geomFromWKTKeepsTaggedDimensionsWhoseValuesAreAllNaN() throws ParseException {
+    // WKT, layout it is stored with
+    Object[][] cases = {
+      {"POINT Z (1 2 NaN)", CoordinateType.XYZ},
+      {"POINT Z EMPTY", CoordinateType.XYZ},
+      {"LINESTRING ZM (0 0 NaN NaN, 1 1 NaN NaN)", CoordinateType.XYZM},
+      {"POLYGON Z ((0 0 NaN, 1 0 NaN, 1 1 NaN, 0 0 NaN))", CoordinateType.XYZ},
+      {"MULTIPOINT Z (0 0 NaN, 1 1 NaN)", CoordinateType.XYZ},
+      {"POINT M (1 2 NaN)", CoordinateType.XYM},
+      // Untagged WKT is read as before, including a Z in the old JTS syntax
+      {"POINT (1 2)", CoordinateType.XY},
+      {"POINT (1 2 3)", CoordinateType.XYZ},
+      {"POINT (1 2 NaN)", CoordinateType.XY},
+      {"POINT EMPTY", CoordinateType.XY},
+    };
+    for (Object[] c : cases) {
+      Geometry geometry = Constructors.geomFromWKT((String) c[0], 0);
+      assertEquals((String) c[0], c[1], GeometrySerializer.getCoordinateType(geometry));
+      Geometry stored = GeometrySerializer.deserialize(GeometrySerializer.serialize(geometry));
+      assertEquals((String) c[0], c[1], GeometrySerializer.getCoordinateType(stored));
+    }
+    Geometry ewkt = Constructors.geomFromEWKT("SRID=4326;POINT Z (1 2 NaN)");
+    assertEquals(4326, ewkt.getSRID());
+    assertEquals(CoordinateType.XYZ, GeometrySerializer.getCoordinateType(ewkt));
+  }
+
+  @Test
+  public void geomFromWKBReadsAPointWithOneNaNOrdinate() throws ParseException {
+    Geometry nanX =
+        Constructors.geomFromWKB(
+            WKBReader.hexToBytes("0101000000000000000000F87F000000000000F03F"));
+    assertFalse(nanX.isEmpty());
+    assertTrue(Double.isNaN(nanX.getCoordinate().getX()));
+    assertEquals(1.0, nanX.getCoordinate().getY(), 0.0);
+    // POINT (NaN NaN) is how WKB encodes POINT EMPTY
+    assertTrue(
+        Constructors.geomFromWKB(WKBReader.hexToBytes("0101000000000000000000F87F000000000000F87F"))
+            .isEmpty());
+  }
 
   @Test
   public void geomFromWKT() throws ParseException {
@@ -104,6 +150,43 @@ public class ConstructorsTest {
     assertEquals(geom, result);
     assertEquals(0, result.getSRID());
     assertEquals(0, result.getFactory().getSRID());
+  }
+
+  @Test
+  public void geomFromWKBPreservesDeclaredDimensionForEmptyGeometry() throws ParseException {
+    GeometryFactory factory = new GeometryFactory();
+    int[][] layouts = {{2, 0}, {3, 0}, {3, 1}, {4, 1}};
+
+    for (int[] layout : layouts) {
+      int dimension = layout[0];
+      int measures = layout[1];
+      EnumSet<Ordinate> ordinates = EnumSet.of(Ordinate.X, Ordinate.Y);
+      if (dimension - measures > 2) {
+        ordinates.add(Ordinate.Z);
+      }
+      if (measures > 0) {
+        ordinates.add(Ordinate.M);
+      }
+      WKBWriter writer = new WKBWriter(dimension);
+      writer.setOutputOrdinates(ordinates);
+
+      CoordinateSequence pointSequence =
+          factory.getCoordinateSequenceFactory().create(0, dimension, measures);
+      Geometry result = Constructors.geomFromWKB(writer.write(factory.createPoint(pointSequence)));
+      assertTrue(result instanceof Point);
+      assertEquals(dimension, ((Point) result).getCoordinateSequence().getDimension());
+      assertEquals(measures, ((Point) result).getCoordinateSequence().getMeasures());
+
+      CoordinateSequence ringSequence =
+          factory.getCoordinateSequenceFactory().create(0, dimension, measures);
+      Polygon polygon = factory.createPolygon(factory.createLinearRing(ringSequence));
+      result = Constructors.geomFromWKB(writer.write(polygon));
+      assertTrue(result instanceof Polygon);
+      CoordinateSequence resultSequence =
+          ((Polygon) result).getExteriorRing().getCoordinateSequence();
+      assertEquals(dimension, resultSequence.getDimension());
+      assertEquals(measures, resultSequence.getMeasures());
+    }
   }
 
   @Test

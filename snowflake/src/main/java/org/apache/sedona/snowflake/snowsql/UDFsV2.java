@@ -24,6 +24,7 @@ import org.apache.sedona.common.FunctionsProj4;
 import org.apache.sedona.common.Predicates;
 import org.apache.sedona.common.sphere.Haversine;
 import org.apache.sedona.common.sphere.Spheroid;
+import org.apache.sedona.common.utils.HilbertDistance;
 import org.apache.sedona.snowflake.snowsql.annotations.UDFAnnotations;
 import org.locationtech.jts.geom.Geometry;
 import org.locationtech.jts.geom.Point;
@@ -481,7 +482,7 @@ public class UDFsV2 {
   @UDFAnnotations.ParamMeta(
       argNames = {"left", "right"},
       argTypes = {"Geometry", "Geometry"})
-  public static double ST_Distance(String left, String right) {
+  public static Double ST_Distance(String left, String right) {
     return Functions.distance(GeometrySerde.deserGeoJson(left), GeometrySerde.deserGeoJson(right));
   }
 
@@ -560,6 +561,26 @@ public class UDFsV2 {
       argTypes = {"Geometry", "Geometry"})
   public static boolean ST_Equals(String leftGeometry, String rightGeometry) {
     return Predicates.equals(
+        GeometrySerde.deserGeoJson(leftGeometry), GeometrySerde.deserGeoJson(rightGeometry));
+  }
+
+  @UDFAnnotations.ParamMeta(
+      argNames = {"leftGeometry", "rightGeometry", "tolerance"},
+      argTypes = {"Geometry", "Geometry", "double"})
+  public static boolean ST_EqualsExact(
+      String leftGeometry, String rightGeometry, double tolerance) {
+    return Predicates.equalsExact(
+        GeometrySerde.deserGeoJson(leftGeometry),
+        GeometrySerde.deserGeoJson(rightGeometry),
+        tolerance);
+  }
+
+  @UDFAnnotations.GeometryOnly
+  @UDFAnnotations.ParamMeta(
+      argNames = {"leftGeometry", "rightGeometry"},
+      argTypes = {"Geometry", "Geometry"})
+  public static boolean ST_EqualsIdentical(String leftGeometry, String rightGeometry) {
+    return Predicates.equalsIdentical(
         GeometrySerde.deserGeoJson(leftGeometry), GeometrySerde.deserGeoJson(rightGeometry));
   }
 
@@ -660,7 +681,7 @@ public class UDFsV2 {
   @UDFAnnotations.ParamMeta(
       argNames = {"geom1", "geom2"},
       argTypes = {"Geometry", "Geometry"})
-  public static double ST_HausdorffDistance(String geom1, String geom2) {
+  public static Double ST_HausdorffDistance(String geom1, String geom2) {
     return Functions.hausdorffDistance(
         GeometrySerde.deserGeoJson(geom1), GeometrySerde.deserGeoJson(geom2));
   }
@@ -668,9 +689,18 @@ public class UDFsV2 {
   @UDFAnnotations.ParamMeta(
       argNames = {"geom1", "geom2", "densifyFrac"},
       argTypes = {"Geometry", "Geometry", "double"})
-  public static double ST_HausdorffDistance(String geom1, String geom2, double densifyFrac) {
+  public static Double ST_HausdorffDistance(String geom1, String geom2, double densifyFrac) {
     return Functions.hausdorffDistance(
         GeometrySerde.deserGeoJson(geom1), GeometrySerde.deserGeoJson(geom2), densifyFrac);
+  }
+
+  @UDFAnnotations.ParamMeta(
+      argNames = {"geometry", "xmin", "ymin", "xmax", "ymax", "level"},
+      argTypes = {"Geometry", "double", "double", "double", "double", "int"})
+  public static long ST_HilbertDistance(
+      String geometry, double xmin, double ymin, double xmax, double ymax, int level) {
+    return HilbertDistance.compute(
+        GeometrySerde.deserGeoJson(geometry), xmin, ymin, xmax, ymax, level);
   }
 
   @UDFAnnotations.ParamMeta(
@@ -689,6 +719,17 @@ public class UDFsV2 {
   public static String ST_Intersection(String leftGeometry, String rightGeometry) {
     return GeometrySerde.serGeoJson(
         Functions.intersection(
+            GeometrySerde.deserGeoJson(leftGeometry), GeometrySerde.deserGeoJson(rightGeometry)));
+  }
+
+  @UDFAnnotations.GeometryOnly
+  @UDFAnnotations.ParamMeta(
+      argNames = {"leftGeometry", "rightGeometry"},
+      argTypes = {"Geometry", "Geometry"},
+      returnTypes = "Geometry")
+  public static String ST_SharedPaths(String leftGeometry, String rightGeometry) {
+    return GeometrySerde.serGeoJson(
+        Functions.sharedPaths(
             GeometrySerde.deserGeoJson(leftGeometry), GeometrySerde.deserGeoJson(rightGeometry)));
   }
 
@@ -719,6 +760,13 @@ public class UDFsV2 {
       argTypes = {"Geometry"})
   public static boolean ST_IsEmpty(String geometry) {
     return Functions.isEmpty(GeometrySerde.deserGeoJson(geometry));
+  }
+
+  @UDFAnnotations.ParamMeta(
+      argNames = {"geometry"},
+      argTypes = {"Geometry"})
+  public static boolean ST_IsLineStringCCW(String geometry) {
+    return Functions.isLineStringCCW(GeometrySerde.deserGeoJson(geometry));
   }
 
   @UDFAnnotations.ParamMeta(

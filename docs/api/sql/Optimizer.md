@@ -282,6 +282,24 @@ These queries could be planned as RangeJoin or BroadcastIndexJoin. Here is an ex
    +- LocalTableScan [geom#24, id#25]
 ```
 
+### Raster distance join
+
+`RS_DWithin(left, right, distance)` is recognised as a distance-join predicate. `distance` is always in **meters**: both sides are projected to WGS84 first, each side's envelope is expanded by `distance` meters using the Haversine polar-radius approximation (the same envelope expansion `ST_DistanceSphere` uses), and the resulting envelopes drive an R-tree filter. Surviving candidates are refined per-row by `RS_DWithin`, which delegates to the Geography `dWithin` to compute the minimum geodesic distance between the convex hulls via S2's `ClosestEdgeQuery` (overlap or touch returns 0). `BroadcastIndexJoinExec` is chosen when one side is small enough to broadcast, otherwise `DistanceJoinExec`.
+
+Rasters whose planar WGS84 envelope already spans more than half the globe in longitude or grazes a pole — e.g. polar projections (EPSG:3996, EPSG:3413) and antimeridian-crossing UTM zones (EPSG:32601) — are given a global filter envelope instead. The R-tree filter is intentionally permissive for those rows so they pair with every counterpart, and the per-row S2 predicate produces the final answer. Mid-latitude rasters retain the tight Haversine bound and the partitioning speedup that comes with it.
+
+```sql
+-- Raster-geometry distance join (broadcastable), 1 km radius
+SELECT /*+ BROADCAST(points) */ r.id, p.id
+FROM rasters r
+JOIN points p ON RS_DWithin(r.raster, p.geom, 1000)
+
+-- Raster-raster distance join (partitioned spatial join), 5 km radius
+SELECT a.id, b.id
+FROM rasters a
+JOIN rasters b ON RS_DWithin(a.raster, b.raster, 5000)
+```
+
 ## Google S2 based approximate equi-join
 
 If the performance of Sedona optimized join is not ideal, which is possibly caused by  complicated and overlapping geometries, you can resort to Sedona built-in Google S2-based approximate equi-join. This equi-join leverages Spark's internal equi-join algorithm and might be performant given that you can opt to skip the refinement step  by sacrificing query accuracy.
@@ -416,3 +434,55 @@ We can compare the metrics of querying the GeoParquet dataset with or without th
 | ![Scan geoparquet without spatial predicate](../../image/scan-parquet-without-spatial-pred.png) | ![Scan geoparquet with spatial predicate](../../image/scan-parquet-with-spatial-pred.png) |
 
 Spatial predicate push-down to GeoParquet is enabled by default. Users can manually disable it by setting the Spark configuration `spark.sedona.geoparquet.spatialFilterPushDown` to `false`.
+
+## Box2D filter pushdown
+
+When a query filters on a `Box2D`-typed column (see [Box2D Functions](box2d/Box2D-Functions.md)) using [ST_Intersects](Predicates/ST_Intersects.md) or [ST_Contains](Predicates/ST_Contains.md) against a literal `Box2D`, Sedona translates the predicate into Parquet row-group inequalities on the column's underlying `xmin` / `ymin` / `xmax` / `ymax` leaves and pushes them down via `ParquetInputFormat.setFilterPredicate`. Parquet's row-group statistics machinery then skips row groups whose recorded min/max disprove the predicate — no file metadata scan is required.
+
+The pushdown applies whenever both arguments resolve to Spark `Box2DUDT`. The simplest way to get a Box2D column is to materialise it with `ST_Box2D(geom)` before writing the dataset, or to use the SQL cast `CAST(geom AS box2d)`. Sedona's auto-generated `<geom>_bbox` covering column is written as a plain `struct<xmin, ymin, xmax, ymax>` — it satisfies the GeoParquet 1.1 covering-bbox contract but is not a `Box2D`, so the Box2D pushdown does not target it directly. Use it through [Push spatial predicates to GeoParquet](#push-spatial-predicates-to-geoparquet) (which prunes via the file-level bbox metadata), or write the column explicitly as `ST_Box2D(geom)` if you want row-group-level pruning.
+
+SQL Example
+
+```sql
+SELECT *
+FROM geoparquet_dataset
+WHERE ST_Intersects(
+    geom_bbox,
+    ST_MakeBox2D(ST_Point(0.0, 0.0), ST_Point(10.0, 10.0)))
+```
+
+Predicate types and the per-row inequality system they translate to:
+
+| Predicate (Box2D / Box2D)               | Pushed-down conjunction (per row)                                                                                                            |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ST_Intersects(box_col, lit)`           | `box.xmax >= lit.xmin AND box.xmin <= lit.xmax AND box.ymax >= lit.ymin AND box.ymin <= lit.ymax` (symmetric — reverse arg order is identical) |
+| `ST_Contains(box_col, lit)`             | `box.xmin <= lit.xmin AND box.xmax >= lit.xmax AND box.ymin <= lit.ymin AND box.ymax >= lit.ymax`                                            |
+| `ST_Contains(lit, box_col)`             | `box.xmin >= lit.xmin AND box.xmax <= lit.xmax AND box.ymin >= lit.ymin AND box.ymax <= lit.ymax`                                            |
+
+Pushdown is enabled by default and is gated by two flags. The optimizer rule that attaches the Box2D spatial filter is controlled by `spark.sedona.geoparquet.spatialFilterPushDown` (Sedona's master spatial-pushdown toggle, default `true`); the actual injection into the Parquet read path is then additionally gated by Spark's `spark.sql.parquet.filterPushdown` (default `true`). Disabling either disables Box2D pushdown.
+
+Inverted-bound literals (`xmin > xmax` / `ymin > ymax`) are not pushed down — the predicate falls back to per-row evaluation so callers see the expected `IllegalArgumentException` from the scalar contract.
+
+## Box2D spatial join
+
+`ST_Intersects` and `ST_Contains` between two `Box2D` columns route through the same physical operators as their `Geometry` counterparts (`ST_Intersects` / `ST_Covers`). The planner picks the bbox path when both children resolve to `Box2DUDT`. At the executor boundary each `Box2D` row is materialised into the implied rectangular polygon, after which the partitioner, R-tree index, and refine evaluator run unchanged. JTS short-circuits axis-aligned rectangle predicates via `RectangleIntersects` / `RectangleContains`, so the refine step pays only the four-double envelope comparison.
+
+`ST_Contains` between two Box2D columns uses `SpatialPredicate.COVERS` semantics at the join layer — JTS `covers` matches the closed-interval contract (JTS `contains`, strict-interior, would reject edge-sharing pairs).
+
+SQL Example — range join:
+
+```sql
+SELECT *
+FROM left_boxes L, right_boxes R
+WHERE ST_Intersects(L.box, R.box)
+```
+
+SQL Example — broadcast index join:
+
+```sql
+SELECT /*+ BROADCAST(R) */ *
+FROM left_boxes L, right_boxes R
+WHERE ST_Intersects(L.box, R.box)
+```
+
+Inverted-bound input on either side raises `IllegalArgumentException` from the join-side validation path, matching the scalar predicate contract.

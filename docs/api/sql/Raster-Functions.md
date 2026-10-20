@@ -38,11 +38,11 @@ These functions work with individual pixel geometry representations.
 
 | Function | Return type | Description | Since |
 | :--- | :--- | :--- | :--- |
-| [RS_PixelAsCentroid](Pixel-Functions/RS_PixelAsCentroid.md) | Geometry | Returns the centroid (point geometry) of the specified pixel's area. The pixel coordinates specified are 1-indexed. If `colX` and `rowY` are out of bounds for the raster, they are interpolated assu... | v1.5.0 |
+| [RS_PixelAsCentroid](Pixel-Functions/RS_PixelAsCentroid.md) | Geometry | Returns the centroid (point geometry) of the specified pixel's area. The pixel coordinates specified are 1-indexed. If `colX` and `rowY` are out of bounds for the raster, they are extrapolated assu... | v1.5.0 |
 | [RS_PixelAsCentroids](Pixel-Functions/RS_PixelAsCentroids.md) | `Array<Struct>` | Returns a list of the centroid point geometry, the pixel value and its raster X and Y coordinates for each pixel in the raster at the specified band. Each centroid represents the geometric center o... | v1.5.1 |
 | [RS_PixelAsPoint](Pixel-Functions/RS_PixelAsPoint.md) | Geometry | Returns a point geometry of the specified pixel's upper-left corner. The pixel coordinates specified are 1-indexed. | v1.5.0 |
 | [RS_PixelAsPoints](Pixel-Functions/RS_PixelAsPoints.md) | `Array<Struct>` | Returns a list of the pixel's upper-left corner point geometry, the pixel value and its raster X and Y coordinates for each pixel in the raster at the specified band. | v1.5.1 |
-| [RS_PixelAsPolygon](Pixel-Functions/RS_PixelAsPolygon.md) | Geometry | Returns a polygon geometry that bounds the specified pixel. The pixel coordinates specified are 1-indexed. If `colX` and `rowY` are out of bounds for the raster, they are interpolated assuming the ... | v1.5.0 |
+| [RS_PixelAsPolygon](Pixel-Functions/RS_PixelAsPolygon.md) | Geometry | Returns a polygon geometry that bounds the specified pixel. The pixel coordinates specified are 1-indexed. If `colX` and `rowY` are out of bounds for the raster, they are extrapolated assuming the ... | v1.5.0 |
 | [RS_PixelAsPolygons](Pixel-Functions/RS_PixelAsPolygons.md) | `Array<Struct>` | Returns a list of the polygon geometry, the pixel value and its raster X and Y coordinates for each pixel in the raster at the specified band. | v1.5.1 |
 
 ## Raster Geometry Functions
@@ -102,6 +102,7 @@ These functions test spatial relationships involving raster objects.
 | Function | Return type | Description | Since |
 | :--- | :--- | :--- | :--- |
 | [RS_Contains](Raster-Predicates/RS_Contains.md) | Boolean | Returns true if the geometry or raster on the left side contains the geometry or raster on the right side. The convex hull of the raster is considered in the test. | v1.5.0 |
+| [RS_DWithin](Raster-Predicates/RS_DWithin.md) | Boolean | Returns true if the minimum geodesic distance between the raster or geometry on the left side and the raster or geometry on the right side is at most `distance` meters (inputs are projected to WGS84 before the test; overlap or touch returns 0). The convex hull of the raster is considered in the test. | v1.9.1 |
 | [RS_Intersects](Raster-Predicates/RS_Intersects.md) | Boolean | Returns true if raster or geometry on the left side intersects with the raster or geometry on the right side. The convex hull of the raster is considered in the test. | v1.5.0 |
 | [RS_Within](Raster-Predicates/RS_Within.md) | Boolean | Returns true if the geometry or raster on the left side is within the geometry or raster on the right side. The convex hull of the raster is considered in the test. | v1.5.0 |
 
@@ -117,6 +118,7 @@ These functions perform operations on raster objects.
 | [RS_MetaData](Raster-Operators/RS_MetaData.md) | `Array<Double>` | Returns the metadata of the raster as a struct. The struct has the following schema: | v1.4.1 |
 | [RS_NormalizeAll](Raster-Operators/RS_NormalizeAll.md) | Raster | Normalizes values in all bands of a raster between a given normalization range. The function maintains the data type of the raster values by ensuring that the normalized values are cast back to the... | v1.6.0 |
 | [RS_NumBands](Raster-Operators/RS_NumBands.md) | Integer | Returns the number of the bands in the raster. | v1.4.0 |
+| [RS_ReplaceBandNoDataValue](Raster-Operators/RS_ReplaceBandNoDataValue.md) | Raster | Moves the no-data value of a band to a new value, rewriting the pixels that hold the current no-data value so they keep reading as no-data. | v2.0.0 |
 | [RS_ReprojectMatch](Raster-Operators/RS_ReprojectMatch.md) | Raster | Reproject a raster to match the geo-reference, CRS, and envelope of a reference raster. The output raster always have the same extent and resolution as the reference raster. For pixels not covered ... | v1.6.0 |
 | [RS_Resample](Raster-Operators/RS_Resample.md) | Raster | Resamples a raster using a given resampling algorithm and new dimensions (width and height), a new grid corner to pivot the raster at (gridX and gridY) and a set of georeferencing attributes (scale... | v1.5.0 |
 | [RS_SetBandNoDataValue](Raster-Operators/RS_SetBandNoDataValue.md) | Raster | This sets the no data value for a specified band in the raster. If the band index is not provided, band 1 is assumed by default. Passing a `null` value for `noDataValue` will remove the no data val... | v1.5.0 |
@@ -128,7 +130,7 @@ These functions perform operations on raster objects.
 | [RS_SetValues](Raster-Operators/RS_SetValues.md) | Raster | Returns a raster by replacing the values of pixels in a specified rectangular region. The top left corner of the region is defined by the `colX` and `rowY` coordinates. The `width` and `height` par... | v1.5.0 |
 | [RS_SRID](Raster-Operators/RS_SRID.md) | Integer | Returns the spatial reference system identifier (SRID) of the raster geometry. | v1.4.1 |
 | [RS_CRS](Raster-Operators/RS_CRS.md) | String | Returns the coordinate reference system (CRS) of the raster as a string in the specified format (projjson, wkt2, wkt1, proj). Defaults to PROJJSON. | v1.9.0 |
-| [RS_Union](Raster-Operators/RS_Union.md) | Raster | Returns a combined multi-band raster from 2 or more input Rasters. The order of bands in the resultant raster will be in the order of the input rasters. For example if `RS_Union` is called on two 2... | v1.6.0 |
+| [RS_Stack](Raster-Operators/RS_Stack.md) | Raster | Returns a combined multi-band raster from 2 or more input Rasters, stacking their bands. The order of bands in the resultant raster will be in the order of the input rasters. For example if `RS_Stack` is c... | v2.0.0 |
 | [RS_Value](Raster-Operators/RS_Value.md) | Double | Returns the value at the given point in the raster. If no band number is specified it defaults to 1. | v1.4.0 |
 | [RS_Values](Raster-Operators/RS_Values.md) | `Array<Double>` | Returns the values at the given points or grid coordinates in the raster. If no band number is specified it defaults to 1. | v1.4.0 |
 | [RS_AsRaster](Raster-Operators/RS_AsRaster.md) | Raster | Converts a vector geometry into a raster dataset by assigning a specified value to all pixels covered by the geometry. | v1.5.0 |
@@ -144,13 +146,16 @@ These functions split rasters into tiles.
 
 ## Raster Map Algebra Operators
 
-These functions convert between raster bands and arrays for map algebra operations.
+These functions convert between raster bands and arrays for map algebra operations. Note that
+`RS_MapAlgebra` is deprecated — see [Raster UDFs](Raster-UDF.md) for the recommended way to process
+rasters, and [Map algebra](Raster-map-algebra.md) for the array-based functions, which are not
+deprecated.
 
 | Function | Return type | Description | Since |
 | :--- | :--- | :--- | :--- |
 | [RS_AddBandFromArray](Raster-Map-Algebra-Operators/RS_AddBandFromArray.md) | Raster | Add a band to a raster from an array of doubles. | v1.5.0 |
 | [RS_BandAsArray](Raster-Map-Algebra-Operators/RS_BandAsArray.md) | `Array<Double>` | Extract a band from a raster as an array of doubles. | v1.4.1 |
-| [RS_MapAlgebra](Raster-Map-Algebra-Operators/RS_MapAlgebra.md) | Raster | Apply a map algebra script on a raster. | v1.5.0 |
+| [RS_MapAlgebra](Raster-Map-Algebra-Operators/RS_MapAlgebra.md) | Raster | Apply a map algebra script on a raster. **Deprecated since v1.9.1, to be removed** — use a [Raster UDF](Raster-UDF.md). | v1.5.0 |
 
 ## Map Algebra Operators
 
@@ -187,7 +192,7 @@ These functions perform aggregate operations on groups of rasters.
 
 | Function | Return type | Description | Since |
 | :--- | :--- | :--- | :--- |
-| [RS_Union_Aggr](Raster-Aggregate-Functions/RS_Union_Aggr.md) | Raster | This function combines multiple rasters into a single multiband raster by stacking the bands of each input raster sequentially. The function arranges the bands in the output raster according to the... | v1.5.1 |
+| [RS_Stack_Aggr](Raster-Aggregate-Functions/RS_Stack_Aggr.md) | Raster | This function combines multiple rasters into a single multiband raster by stacking the bands of each input raster sequentially. The function arranges the bands in the output raster according to the... | v2.0.0 |
 
 ## Raster Output
 

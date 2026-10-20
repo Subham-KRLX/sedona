@@ -48,37 +48,23 @@ import org.geotools.coverage.grid.io.AbstractGridFormat;
 import org.geotools.gce.arcgrid.ArcGridWriteParams;
 import org.geotools.gce.arcgrid.ArcGridWriter;
 import org.geotools.gce.geotiff.GeoTiffWriteParams;
-import org.geotools.gce.geotiff.GeoTiffWriter;
 import org.geotools.referencing.operation.transform.AffineTransform2D;
 
 public class RasterOutputs {
   public static byte[] asGeoTiff(
       GridCoverage2D raster, String compressionType, double compressionQuality) {
-    ByteArrayOutputStream out = new ByteArrayOutputStream();
-    GridCoverageWriter writer;
-    try {
-      writer = new GeoTiffWriter(out);
-    } catch (IOException e) {
-      throw new RuntimeException(e);
-    }
-    ParameterValueGroup defaultParams = writer.getFormat().getWriteParameters();
+    GeoTiffWriteParams params = new GeoTiffWriteParams();
     if (compressionType != null && compressionQuality >= 0 && compressionQuality <= 1) {
-      GeoTiffWriteParams params = new GeoTiffWriteParams();
       params.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
       // Available compression types: None, PackBits, Deflate, Huffman, LZW and JPEG
       params.setCompressionType(compressionType);
       // Should be a value between 0 and 1
       // 0 means max compression, 1 means no compression
       params.setCompressionQuality((float) compressionQuality);
-      defaultParams
-          .parameter(AbstractGridFormat.GEOTOOLS_WRITE_PARAMS.getName().toString())
-          .setValue(params);
     }
-    GeneralParameterValue[] wps = defaultParams.values().toArray(new GeneralParameterValue[0]);
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
     try {
-      writer.write(raster, wps);
-      writer.dispose();
-      out.close();
+      GeoTiffWriters.write(raster, params, out);
     } catch (IOException e) {
       throw new RuntimeException(e);
     }

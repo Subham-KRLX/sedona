@@ -65,14 +65,16 @@ public class FunctionEditorsTest extends RasterTestBase {
     Geometry geom = Constructors.geomFromWKT(polygon, 0);
     GridCoverage2D result = PixelFunctionEditors.setValues(emptyRaster, 1, geom, 10, false, false);
     actual = MapAlgebra.bandAsArray(result, 1);
+    // The line (2 -8, 7 -8) ends exactly on the pixel column boundary x = 7; the cell to the
+    // right is touched only at that point and is not burned (GH-3120), matching GDAL.
     expected =
         new double[] {
           0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0,
-          10.0, 0.0, 0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0,
+          10.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0,
           10.0, 0.0, 10.0, 10.0, 0.0, 0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-          0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 0.0,
+          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 0.0, 10.0, 0.0,
           0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0,
-          10.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+          10.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         };
     assertArrayEquals(actual, expected, 0.0);
 
@@ -204,32 +206,40 @@ public class FunctionEditorsTest extends RasterTestBase {
         Constructors.geomFromWKT("LINESTRING(1 -1, 1 -4, 2 -2, 3 -3, 4 -4, 5 -4, 6 -6)", 0);
     GridCoverage2D raster = PixelFunctionEditors.setValues(emptyRaster, 1, geom, 4235, false);
     double[] actual = MapAlgebra.bandAsArray(raster, 1);
+    // Every vertex of this polyline lands exactly on a pixel corner. Cells the line only touches
+    // at such a corner point are not burned (GH-3120): (1, 0) was an artifact of the traversal
+    // running past a segment that ends on a corner, and (0, 3) is only poked at its top-left
+    // corner by the two segments meeting there.
     double[] expected =
         new double[] {
-          4235.0, 0.0, 0.0, 0.0, 4235.0, 4235.0, 0.0, 0.0, 4235.0, 0.0, 4235.0, 0.0, 4235.0, 0.0,
-          0.0, 4235.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+          4235.0, 0.0, 0.0, 0.0, 4235.0, 4235.0, 0.0, 0.0, 4235.0, 0.0, 4235.0, 0.0, 0.0, 0.0, 0.0,
+          4235.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         };
     assertArrayEquals(expected, actual, 0.1d);
 
-    // Point
+    // Point on the raster's right edge (x = 5 on a raster spanning x 1..5). Under GDAL's half-open
+    // rule a cell does not contain its right edge, so the point covers no pixel and the raster is
+    // left unchanged, as with rasterio all_touched=True.
     geom = Constructors.geomFromWKT("POINT(5 -5)", 0);
     raster = PixelFunctionEditors.setValues(emptyRaster, 1, geom, 35);
     actual = MapAlgebra.bandAsArray(raster, 1);
     expected =
         new double[] {
-          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 35.0, 0.0, 0.0,
-          0.0, 35.0, 0.0, 0.0, 0.0, 0.0
+          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+          0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         };
     assertArrayEquals(expected, actual, 0.1d);
 
-    // MultiPoint
+    // MultiPoint: each point burns the one half-open cell containing it, as in GDAL. (2 -2) and
+    // (3 -3) sit on grid corners and (2 -1) on the top edge, so each burns the cell right of and
+    // below it; (4 -7) lies on the bottom edge and burns nothing.
     geom = Constructors.geomFromWKT("MULTIPOINT((2 -2), (2 -1), (3 -3), (4 -7))", 0);
     raster = PixelFunctionEditors.setValues(emptyRaster, 1, geom, 400, false);
     actual = MapAlgebra.bandAsArray(raster, 1);
     expected =
         new double[] {
-          400.0, 400.0, 0.0, 0.0, 400.0, 400.0, 400.0, 0.0, 0.0, 400.0, 400.0, 0.0, 0.0, 0.0, 0.0,
-          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 400.0, 400.0
+          0.0, 400.0, 0.0, 0.0, 0.0, 400.0, 0.0, 0.0, 0.0, 0.0, 400.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         };
     assertArrayEquals(expected, actual, 0.1d);
 

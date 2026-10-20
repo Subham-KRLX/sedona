@@ -25,9 +25,10 @@ import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.spark.SparkException
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.SaveMode
-import org.apache.spark.sql.execution.datasources.geoparquet.{Covering, GeoParquetMetaData}
+import org.apache.spark.sql.execution.datasources.geoparquet.{Covering, GeoParquetMetaData, GeometryFieldMetaData}
 import org.apache.spark.sql.execution.datasources.geoparquet.internal.ParquetReadSupport
 import org.apache.spark.sql.functions.{col, expr}
 import org.apache.spark.sql.sedona_sql.UDT.GeometryUDT
@@ -44,6 +45,7 @@ import org.scalatest.BeforeAndAfterAll
 
 import java.io.File
 import java.nio.ByteOrder
+import java.nio.file.Files
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
 import java.time.LocalDateTime
@@ -61,6 +63,12 @@ class geoparquetIOTests extends TestBaseScala with BeforeAndAfterAll {
   val geoparquetoutputlocation: String = resourceFolder + "geoparquet/geoparquet_output/"
   val overtureBBOX: String = resourceFolder + "geoparquet/overture/bbox.geoparquet"
   override def afterAll(): Unit = FileUtils.deleteDirectory(new File(geoparquetoutputlocation))
+
+  private def withEmptyDirectory(f: String => Unit): Unit = {
+    val dir = Files.createTempDirectory("geoparquet-empty").toFile
+    try f(dir.getPath)
+    finally FileUtils.deleteDirectory(dir)
+  }
 
   describe("GeoParquet IO tests") {
     it("GEOPARQUET Test example1 i.e. naturalearth_lowers dataset's Read and Write") {
@@ -237,6 +245,40 @@ class geoparquetIOTests extends TestBaseScala with BeforeAndAfterAll {
       assert(rows(0).getAs[AnyRef]("g1").isInstanceOf[Geometry])
     }
 
+    it("GeoParquet read without a path should say that no path was given") {
+      // PySpark's load(None) calls the JVM load() with no paths.
+      val e = intercept[AnalysisException] {
+        sparkSession.read.format("geoparquet").load()
+      }
+      assert(e.getMessage.contains("no input files found"))
+      assert(e.getMessage.contains("no path was given"))
+    }
+
+    it("GeoParquet read of an empty directory should say that no input files were found") {
+      withEmptyDirectory { dir =>
+        val e = intercept[AnalysisException] {
+          sparkSession.read.format("geoparquet").load(dir)
+        }
+        assert(e.getMessage.contains("no input files found"))
+      }
+    }
+
+    it("GeoParquet read of an empty directory with a user-specified schema returns no rows") {
+      withEmptyDirectory { dir =>
+        val df = sparkSession.read.format("geoparquet").schema("id INT").load(dir)
+        assert(df.count() == 0)
+      }
+    }
+
+    it("GeoParquet read of a glob that matches nothing should report the missing path") {
+      withEmptyDirectory { dir =>
+        val e = intercept[AnalysisException] {
+          sparkSession.read.format("geoparquet").load(dir + "/*.parquet")
+        }
+        assert(e.getMessage.contains("Path does not exist"))
+      }
+    }
+
     it("GeoParquet save should work with empty dataframes") {
       val schema = StructType(
         Seq(
@@ -259,6 +301,25 @@ class geoparquetIOTests extends TestBaseScala with BeforeAndAfterAll {
         // bbox-based file pruning in downstream readers). See issue #2880.
         assert((geo \ "columns" \ "g" \ "bbox") == org.json4s.JNothing)
       }
+    }
+
+    it("GeoParquet save should fail before running any task when there is no geometry column") {
+      val df = sparkSession
+        .range(10)
+        .selectExpr("id", "CAST(id AS STRING) AS severity")
+        .repartition(2)
+      val geoParquetSavePath = geoparquetoutputlocation + "/no_geometry.parquet"
+      FileUtils.deleteQuietly(new File(geoParquetSavePath))
+
+      // A failure inside a write task would reach us wrapped in a SparkException, after the job
+      // launched and the task was retried; a plan-time failure is thrown as is.
+      val e = intercept[IllegalArgumentException] {
+        df.write.format("geoparquet").mode("overwrite").save(geoParquetSavePath)
+      }
+      assert(e.getMessage.contains("GeoParquet requires at least one geometry column"))
+      assert(e.getMessage.contains("severity"))
+      assert(e.getMessage.contains("format(\"parquet\")"))
+      assert(!new File(geoParquetSavePath).exists())
     }
 
     it("GeoParquet save should work with snake_case column names") {
@@ -1411,10 +1472,12 @@ class geoparquetIOTests extends TestBaseScala with BeforeAndAfterAll {
         SELECT ARRAY(STRUCT(ST_POINT(1.0, 1.1) AS geometry)) AS nested_geom_array
       """)
 
-      // Writing nested geometry to GeoParquet should fail according to the specification
-      assertThrows[SparkException] {
+      // Writing nested geometry to GeoParquet should fail according to the specification. There
+      // is no geometry column at the root, so it fails when the write is planned.
+      val e = intercept[IllegalArgumentException] {
         df.write.mode("overwrite").format("geoparquet").save(testPath)
       }
+      assert(e.getMessage.contains("GeoParquet requires at least one geometry column"))
     }
 
     it("should handle deeply nested arrays with geometry UDT") {
@@ -1439,6 +1502,67 @@ class geoparquetIOTests extends TestBaseScala with BeforeAndAfterAll {
     }
   }
 
+  describe("GeoParquetMetaData serialization") {
+    it("should preserve PROJJSON keys when metadata is serialized and parsed") {
+      val crs = parseJson(
+        """{"type":"ProjectedCRS","name":"WGS 84 / UTM zone 32N",""" +
+          """"base_crs":{"datum":{"ellipsoid":{"semi_major_axis":6378137,""" +
+          """"inverse_flattening":298.257223563}}},""" +
+          """"conversion":{"parameters":[{"name":"Longitude of natural origin","value":9,""" +
+          """"unit":{"conversion_factor":0.017453292519943295}}]},""" +
+          """"coordinate_system":{"subtype":"Cartesian"},""" +
+          """"vendorExtension":{"nestedProperty":"preserveMe"},""" +
+          """"id":{"authority":"EPSG","code":32632}}""")
+      val metadata = GeoParquetMetaData(
+        Some(GeoParquetMetaData.VERSION),
+        "geometry",
+        Map(
+          "geometry" -> GeometryFieldMetaData(
+            encoding = "WKB",
+            geometryTypes = Seq("Point"),
+            bbox = None,
+            crs = Some(crs))))
+
+      val serialized = GeoParquetMetaData.toJson(metadata)
+      assert((parseJson(serialized) \ "columns" \ "geometry" \ "crs") == crs)
+
+      val parsed = GeoParquetMetaData
+        .parseKeyValueMetaData(Collections.singletonMap("geo", serialized))
+        .get
+
+      assert(parsed.columns("geometry").crs.contains(crs))
+    }
+  }
+
+  describe("GeoParquetMetaData.sridToProjJson") {
+    it("should preserve authoritative polar axis metadata") {
+      implicit val formats: org.json4s.Formats = org.json4s.DefaultFormats
+      val crs =
+        GeoParquetMetaData.sridToProjJson(32661).getOrElse(fail("EPSG:32661 should resolve"))
+
+      assert((crs \ "id" \ "authority").extract[String] == "EPSG")
+      assert((crs \ "id" \ "code").extract[Int] == 32661)
+
+      val axes = (crs \ "coordinate_system" \ "axis").children
+      assert(axes.map(axis => (axis \ "abbreviation").extract[String]) == List("N", "E"))
+      assert(axes.map(axis => (axis \ "direction").extract[String]) == List("south", "south"))
+      assert(
+        axes.map(axis => (axis \ "meridian" \ "longitude" \ "value").extract[Double]) ==
+          List(180.0, 90.0))
+    }
+
+    it("should generate and recover NAD27 projected CRS metadata") {
+      implicit val formats: org.json4s.Formats = org.json4s.DefaultFormats
+      val crs =
+        GeoParquetMetaData.sridToProjJson(26711).getOrElse(fail("EPSG:26711 should resolve"))
+
+      assert((crs \ "type").extract[String] == "ProjectedCRS")
+      assert((crs \ "id" \ "authority").extract[String] == "EPSG")
+      assert((crs \ "id" \ "code").extract[Int] == 26711)
+      assert(GeoParquetMetaData.extractSridFromCrs(Some(crs)) == 26711)
+    }
+  }
+
   describe("GeoParquetMetaData.extractSridFromCrs") {
     it("should return 4326 when CRS is omitted (None)") {
       assert(GeoParquetMetaData.extractSridFromCrs(None) == 4326)
@@ -1454,30 +1578,37 @@ class geoparquetIOTests extends TestBaseScala with BeforeAndAfterAll {
       assert(GeoParquetMetaData.extractSridFromCrs(Some(projjson)) == 4326)
     }
 
-    it("should extract non-4326 EPSG code") {
-      // Use a complete ProjectedCRS PROJJSON so proj4sedona can parse it
-      val projjson = parseJson(
-        """{"type":"ProjectedCRS","name":"WGS 84 / UTM zone 32N",""" +
-          """"base_crs":{"name":"WGS 84","datum":{"type":"GeodeticReferenceFrame",""" +
-          """"name":"World Geodetic System 1984",""" +
-          """"ellipsoid":{"name":"WGS 84","semi_major_axis":6378137,"inverse_flattening":298.257223563}}},""" +
-          """"conversion":{"name":"UTM zone 32N","method":{"name":"Transverse Mercator"},""" +
-          """"parameters":[{"name":"Latitude of natural origin","value":0},""" +
-          """{"name":"Longitude of natural origin","value":9},""" +
-          """{"name":"Scale factor at natural origin","value":0.9996},""" +
-          """{"name":"False easting","value":500000},""" +
-          """{"name":"False northing","value":0}]},""" +
-          """"coordinate_system":{"subtype":"Cartesian","axis":[""" +
-          """{"name":"Easting","direction":"east","unit":"metre"},""" +
-          """{"name":"Northing","direction":"north","unit":"metre"}]},""" +
-          """"id":{"authority":"EPSG","code":32632}}""")
+    it("should extract a declared EPSG code without requiring a complete CRS definition") {
+      val projjson =
+        parseJson("""{"type":"ProjectedCRS","id":{"authority":"EPSG","code":32632}}""")
       assert(GeoParquetMetaData.extractSridFromCrs(Some(projjson)) == 32632)
     }
 
-    it("should return 4326 for OGC:CRS84") {
+    it("should accept a positive EPSG code represented as a string") {
       val projjson =
-        parseJson("""{"type":"GeographicCRS","id":{"authority":"OGC","code":"CRS84"}}""")
+        parseJson("""{"type":"ProjectedCRS","id":{"authority":"epsg","code":"32632"}}""")
+      assert(GeoParquetMetaData.extractSridFromCrs(Some(projjson)) == 32632)
+    }
+
+    it("should return 0 for an invalid EPSG code") {
+      Seq("0", "-1", "not-a-code").foreach { code =>
+        val projjson =
+          parseJson(s"""{"type":"ProjectedCRS","id":{"authority":"EPSG","code":"$code"}}""")
+        assert(GeoParquetMetaData.extractSridFromCrs(Some(projjson)) == 0)
+      }
+    }
+
+    it("should return 4326 for OGC:CRS84 regardless of case") {
+      val projjson =
+        parseJson("""{"type":"GeographicCRS","id":{"authority":"ogc","code":"crs84"}}""")
       assert(GeoParquetMetaData.extractSridFromCrs(Some(projjson)) == 4326)
+    }
+
+    it("should extract the first recognized identifier from a PROJJSON ids array") {
+      val projjson = parseJson(
+        """{"type":"ProjectedCRS","ids":[{"authority":"IAU","code":49900},""" +
+          """{"authority":"epsg","code":"32632"}]}""")
+      assert(GeoParquetMetaData.extractSridFromCrs(Some(projjson)) == 32632)
     }
 
     it("should return 0 for CRS without id field") {

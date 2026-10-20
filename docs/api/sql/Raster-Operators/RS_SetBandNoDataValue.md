@@ -21,20 +21,12 @@
 
 Introduction: This sets the no data value for a specified band in the raster. If the band index is not provided, band 1 is assumed by default. Passing a `null` value for `noDataValue` will remove the no data value and that will ensure all pixels are included in functions rather than excluded as no data.
 
-Since `v1.5.1`, this function supports the ability to replace the current no-data value with the new `noDataValue`.
+Only the band's metadata changes; pixel values are left as they are. To move the no-data value while carrying the existing no-data pixels over to the new value, use [RS_ReplaceBandNoDataValue](RS_ReplaceBandNoDataValue.md).
 
 !!!Note
-    When `replace` is true, any pixels matching the provided `noDataValue` will be considered as no-data in the output raster.
-
-    An `IllegalArgumentException` will be thrown if the input raster does not already have a no-data value defined. Replacing existing values with `noDataValue` requires a defined no-data baseline to evaluate against.
-
-    To use this for no-data replacement, the input raster must first set its no-data value, which can then be selectively replaced via this function.
+    Since `v2.0.0`, the four-argument form `RS_SetBandNoDataValue(raster, bandIndex, noDataValue, replace)` is removed. Replace `RS_SetBandNoDataValue(raster, bandIndex, noDataValue, true)` with `RS_ReplaceBandNoDataValue(raster, bandIndex, noDataValue)`.
 
 Format:
-
-```
-RS_SetBandNoDataValue(raster: Raster, bandIndex: Integer, noDataValue: Double, replace: Boolean)
-```
 
 ```
 RS_SetBandNoDataValue(raster: Raster, bandIndex: Integer = 1, noDataValue: Double)
@@ -59,4 +51,23 @@ Output:
 
 ```
 -999
+```
+
+SQL Example
+
+`NaN` can be used as the no data value of a floating point band. Every `NaN` pixel then counts as no data. Setting `NaN` on an integer band throws an `IllegalArgumentException`.
+
+```sql
+SELECT RS_BandNoDataValue(
+        RS_SetBandNoDataValue(
+            RS_MakeEmptyRaster(1, 'F', 20, 20, 2, 22, 1),
+            double('NaN')
+            )
+        )
+```
+
+Output:
+
+```
+NaN
 ```

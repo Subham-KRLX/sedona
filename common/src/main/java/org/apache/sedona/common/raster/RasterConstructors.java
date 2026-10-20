@@ -114,10 +114,14 @@ public class RasterConstructors {
    * @param pixelType The data type of pixel/cell of resultant raster
    * @param allTouched When set to true, rasterizes all pixels touched by geom
    * @param value The value of the pixel of the resultant raster
-   * @param noDataValue The noDataValue of the resultant raster
+   * @param noDataValue The noDataValue of the resultant raster; pixels not covered by the geometry
+   *     are set to this value
    * @param useGeometryExtent The way to generate extent of the resultant raster. Use the extent of
    *     the geometry to convert if true, else use the extent of the reference raster
-   * @return Rasterized Geometry
+   * @return Rasterized Geometry, or null when useGeometryExtent is true and the geometry neither
+   *     burns nor overlaps any pixel of the reference raster (for example a polygon that only
+   *     touches its boundary, or a line along its right or bottom edge), so there is nothing to
+   *     crop to
    * @throws FactoryException
    */
   public static GridCoverage2D asRaster(
@@ -130,8 +134,39 @@ public class RasterConstructors {
       boolean useGeometryExtent)
       throws FactoryException {
 
+    // Reject a burn value that cannot be stored as a whole number in an integer pixel type (for
+    // example 265 -> 9 in an unsigned 8-bit band), which would burn a different number than the
+    // caller asked for. Unlike the noDataValue this is ordinary pixel data, not a sentinel, so a
+    // fractional value on a float / double band is accepted and rounded to the pixel type (matching
+    // PostGIS ST_AsRaster and gdal_rasterize) rather than rejected.
+    RasterUtils.assertBurnValueRepresentable(value, pixelType);
+
+    // Reject a noDataValue that cannot be represented in the target pixel type rather than
+    // silently coercing it: writing an out-of-range or fractional value into an integer sample
+    // stores a different number than the value recorded as the band's nodata metadata, so the
+    // background would read back as data. Validating once here keeps the background fill and the
+    // nodata metadata below using the same value.
+    if (noDataValue != null) {
+      noDataValue = RasterUtils.assertNoDataValueRepresentable(noDataValue, pixelType);
+    }
+
+    // If the burn value equals the noDataValue, every covered pixel reads back as nodata, so the
+    // geometry would vanish from the output. Reject rather than produce an all-nodata raster; this
+    // also catches the default burn value of 1 colliding with an inherited nodata of 1.0.
+    if (noDataValue != null && Double.compare(value, noDataValue) == 0) {
+      throw new IllegalArgumentException(
+          String.format(
+              "RS_AsRaster: burn value (%s) equals the noDataValue, so every covered pixel would "
+                  + "read as nodata; use a different value or noDataValue",
+              value));
+    }
+
     List<Object> objects =
-        Rasterization.rasterize(geom, raster, pixelType, value, useGeometryExtent, allTouched);
+        Rasterization.rasterize(
+            geom, raster, pixelType, value, useGeometryExtent, allTouched, noDataValue);
+    if (objects == null) {
+      return null;
+    }
 
     WritableRaster writableRaster = (WritableRaster) objects.get(0);
     GridCoverage2D rasterized = (GridCoverage2D) objects.get(1);
@@ -178,7 +213,8 @@ public class RasterConstructors {
 
   /**
    * Returns a raster that is converted from the geometry provided. A convenience function for
-   * asRaster.
+   * asRaster. Because this overload takes no noDataValue argument, the noDataValue is inherited
+   * from the reference raster band (see {@link #inheritReferenceNoDataValue}).
    *
    * @param geom The geometry to convert
    * @param raster The reference raster
@@ -188,12 +224,14 @@ public class RasterConstructors {
    */
   public static GridCoverage2D asRaster(Geometry geom, GridCoverage2D raster, String pixelType)
       throws FactoryException {
-    return asRaster(geom, raster, pixelType, false, 1, null);
+    return asRaster(
+        geom, raster, pixelType, false, 1, inheritReferenceNoDataValue(raster, pixelType));
   }
 
   /**
    * Returns a raster that is converted from the geometry provided. A convenience function for
-   * asRaster.
+   * asRaster. Because this overload takes no noDataValue argument, the noDataValue is inherited
+   * from the reference raster band (see {@link #inheritReferenceNoDataValue}).
    *
    * @param geom The geometry to convert
    * @param raster The reference raster
@@ -205,12 +243,14 @@ public class RasterConstructors {
   public static GridCoverage2D asRaster(
       Geometry geom, GridCoverage2D raster, String pixelType, boolean allTouched)
       throws FactoryException {
-    return asRaster(geom, raster, pixelType, allTouched, 1, null);
+    return asRaster(
+        geom, raster, pixelType, allTouched, 1, inheritReferenceNoDataValue(raster, pixelType));
   }
 
   /**
    * Returns a raster that is converted from the geometry provided. A convenience function for
-   * asRaster.
+   * asRaster. Because this overload takes no noDataValue argument, the noDataValue is inherited
+   * from the reference raster band (see {@link #inheritReferenceNoDataValue}).
    *
    * @param geom The geometry to convert
    * @param raster The reference raster
@@ -223,7 +263,46 @@ public class RasterConstructors {
   public static GridCoverage2D asRaster(
       Geometry geom, GridCoverage2D raster, String pixelType, boolean allTouched, double value)
       throws FactoryException {
-    return asRaster(geom, raster, pixelType, allTouched, value, null);
+    return asRaster(
+        geom, raster, pixelType, allTouched, value, inheritReferenceNoDataValue(raster, pixelType));
+  }
+
+  /**
+   * Resolves the noDataValue that the overloads without a noDataValue argument inherit from the
+   * reference raster. Those overloads fill every pixel the geometry does not cover with, and record
+   * as the output band's nodata metadata, the reference raster's first band nodata value. A
+   * reference band that carries no nodata value leaves nothing to inherit, so this rejects the call
+   * rather than silently producing a raster with no nodata value and a zero background; the caller
+   * then either passes an explicit noDataValue, or passes a null noDataValue through the widest
+   * overload to opt out of a nodata value entirely.
+   *
+   * @param raster the reference raster whose first band nodata value is inherited
+   * @param pixelType the output pixel type the inherited value must be representable in
+   * @return the reference band's nodata value
+   * @throws IllegalArgumentException when the reference band has no nodata value to inherit, or
+   *     when its nodata value is not representable in {@code pixelType}
+   */
+  private static double inheritReferenceNoDataValue(GridCoverage2D raster, String pixelType) {
+    Double referenceNoDataValue = RasterBandAccessors.getBandNoDataValue(raster, 1);
+    if (referenceNoDataValue == null) {
+      throw new IllegalArgumentException(
+          "RS_AsRaster: noDataValue omitted but reference raster band 1 has no nodata value to "
+              + "inherit; pass an explicit noDataValue, or pass NULL for no nodata");
+    }
+    // The inherited value must be representable in the output pixel type. The core asRaster would
+    // reject it too, but with a generic message that neither says the value was inherited nor how
+    // to override it; rethrow with actionable inherit-specific guidance instead.
+    try {
+      RasterUtils.assertNoDataValueRepresentable(referenceNoDataValue, pixelType);
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException(
+          String.format(
+              "RS_AsRaster: the reference raster band 1 nodata value (%s) is not representable in "
+                  + "the output pixel type '%s'; pass an explicit noDataValue representable in '%s' "
+                  + "to override it",
+              referenceNoDataValue, pixelType, pixelType));
+    }
+    return referenceNoDataValue;
   }
 
   /**
@@ -582,7 +661,8 @@ public class RasterConstructors {
    * @param tileHeight the height of the tiles
    * @param padWithNoData whether to pad the tiles with no data value
    * @param padNoDataValue the no data value for padded tiles, only used when padWithNoData is true.
-   *     If the value is NaN, the no data value of the original band will be used.
+   *     If null, the no data value of the original band is used; an explicit NaN pads with NaN and
+   *     declares NaN as the no data value of the padded tiles.
    * @return a lazy iterator of tiles
    */
   public static TileGenerator.TileIterator generateTiles(
@@ -591,7 +671,7 @@ public class RasterConstructors {
       int tileWidth,
       int tileHeight,
       boolean padWithNoData,
-      double padNoDataValue) {
+      Double padNoDataValue) {
     int numBands = gridCoverage2D.getNumSampleDimensions();
     if (bandIndices == null || bandIndices.length == 0) {
       // Select all the bands
@@ -612,6 +692,26 @@ public class RasterConstructors {
         gridCoverage2D, bandIndices, tileWidth, tileHeight, padWithNoData, padNoDataValue);
   }
 
+  /**
+   * Backward-compatible tiling entry point whose {@code NaN} padding marker inherits the source
+   * band's no data value.
+   */
+  public static TileGenerator.TileIterator generateTiles(
+      GridCoverage2D gridCoverage2D,
+      int[] bandIndices,
+      int tileWidth,
+      int tileHeight,
+      boolean padWithNoData,
+      double padNoDataValue) {
+    return generateTiles(
+        gridCoverage2D,
+        bandIndices,
+        tileWidth,
+        tileHeight,
+        padWithNoData,
+        Double.isNaN(padNoDataValue) ? null : Double.valueOf(padNoDataValue));
+  }
+
   public static GridCoverage2D[] rsTile(
       GridCoverage2D gridCoverage2D,
       int[] bandIndices,
@@ -621,9 +721,6 @@ public class RasterConstructors {
       Double padNoDataValue) {
     if (gridCoverage2D == null) {
       return null;
-    }
-    if (padNoDataValue == null) {
-      padNoDataValue = Double.NaN;
     }
     TileGenerator.TileIterator tileIterator =
         generateTiles(
@@ -643,7 +740,7 @@ public class RasterConstructors {
       int tileWidth,
       int tileHeight,
       boolean padWithNoData) {
-    return rsTile(gridCoverage2D, bandIndices, tileWidth, tileHeight, padWithNoData, Double.NaN);
+    return rsTile(gridCoverage2D, bandIndices, tileWidth, tileHeight, padWithNoData, null);
   }
 
   public static GridCoverage2D[] rsTile(

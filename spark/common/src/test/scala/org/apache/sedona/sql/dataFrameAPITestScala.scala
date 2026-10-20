@@ -651,6 +651,58 @@ class dataFrameAPITestScala extends TestBaseScala {
       assert(actualResult == expectedResult)
     }
 
+    it("Passed ST_Box3D") {
+      val geomDf =
+        sparkSession.sql("SELECT ST_GeomFromWKT('LINESTRING Z(0 0 -3, 5 10 7)') AS geom")
+      val actual = geomDf.select(ST_Box3D("geom")).first().get(0).toString
+      assert(actual == "BOX3D(0.0 0.0 -3.0, 5.0 10.0 7.0)")
+    }
+
+    it("Passed ST_3DMakeBox") {
+      val pointsDf =
+        sparkSession.sql("SELECT ST_PointZ(0.0, 0.0, 0.0) AS ll, ST_PointZ(2.0, 4.0, 6.0) AS ur")
+      val actual = pointsDf.select(ST_3DMakeBox("ll", "ur")).first().get(0).toString
+      assert(actual == "BOX3D(0.0 0.0 0.0, 2.0 4.0 6.0)")
+    }
+
+    it("Passed ST_Intersects on Box3D inputs") {
+      val boxesDf = sparkSession.sql(
+        "SELECT ST_3DMakeBox(ST_PointZ(0, 0, 0), ST_PointZ(5, 5, 5)) AS a, " +
+          "ST_3DMakeBox(ST_PointZ(1, 1, 1), ST_PointZ(2, 2, 2)) AS b, " +
+          "ST_3DMakeBox(ST_PointZ(10, 10, 10), ST_PointZ(11, 11, 11)) AS c")
+      val row = boxesDf.select(ST_Intersects("a", "b"), ST_Intersects("a", "c")).first()
+      assert(row.getBoolean(0))
+      assert(!row.getBoolean(1))
+    }
+
+    it("Passed ST_Contains on Box3D inputs") {
+      val boxesDf = sparkSession.sql(
+        "SELECT ST_3DMakeBox(ST_PointZ(0, 0, 0), ST_PointZ(5, 5, 5)) AS a, " +
+          "ST_3DMakeBox(ST_PointZ(1, 1, 1), ST_PointZ(2, 2, 2)) AS b, " +
+          "ST_3DMakeBox(ST_PointZ(4, 4, 4), ST_PointZ(6, 6, 6)) AS c")
+      val row = boxesDf.select(ST_Contains("a", "b"), ST_Contains("a", "c")).first()
+      assert(row.getBoolean(0))
+      assert(!row.getBoolean(1))
+    }
+
+    it("Passed ST_3DDWithin") {
+      val ptsDf = sparkSession.sql(
+        "SELECT ST_PointZ(0, 0, 0) AS a, ST_PointZ(1, 1, 1) AS b, ST_PointZ(5, 5, 5) AS c")
+      // 3D distance from a to b is sqrt(3) ≈ 1.732; threshold 2.0 includes, 1.0 excludes the a→c pair.
+      val row = ptsDf
+        .select(ST_3DDWithin("a", "b", 2.0), ST_3DDWithin("a", "c", 1.0))
+        .first()
+      assert(row.getBoolean(0))
+      assert(!row.getBoolean(1))
+    }
+
+    it("Passed ST_3DExtent") {
+      val pointsDf = sparkSession.sql("SELECT explode(array(" +
+        "ST_PointZ(0.0, 0.0, -1.0), ST_PointZ(2.0, 4.0, 6.0), ST_PointZ(1.0, 1.0, 1.0))) AS geom")
+      val actual = pointsDf.select(ST_3DExtent("geom")).first().get(0).toString
+      assert(actual == "BOX3D(0.0 0.0 -1.0, 2.0 4.0 6.0)")
+    }
+
     it("Passed ST_Expand") {
       val baseDf = sparkSession.sql(
         "SELECT ST_GeomFromWKT('POLYGON ((50 50 1, 50 80 2, 80 80 3, 80 50 2, 50 50 1))') as geom")
@@ -1109,6 +1161,19 @@ class dataFrameAPITestScala extends TestBaseScala {
       assert(actualResult == expectedResult)
     }
 
+    it("Passed ST_SharedPaths") {
+      val lineDf = sparkSession.sql(
+        "SELECT ST_GeomFromWKT('LINESTRING (0 0, 10 0)') AS a, ST_GeomFromWKT('LINESTRING (15 0, 5 0)') AS b")
+      val expectedResult =
+        "GEOMETRYCOLLECTION (MULTILINESTRING EMPTY, MULTILINESTRING ((5 0, 10 0)))"
+
+      val stringResult = lineDf.select(ST_SharedPaths("a", "b")).first().getAs[Geometry](0)
+      assertEquals(expectedResult, stringResult.toText)
+
+      val columnResult = lineDf.select(ST_SharedPaths($"a", $"b")).first().getAs[Geometry](0)
+      assertEquals(expectedResult, columnResult.toText)
+    }
+
     it("Passed ST_Union") {
       val polygonDf = sparkSession.sql(
         "SELECT ST_GeomFromWKT('POLYGON ((-3 -3, 3 -3, 3 3, -3 3, -3 -3))') AS a, ST_GeomFromWKT('POLYGON ((-2 1, 2 1, 2 4, -2 4, -2 1))') AS b")
@@ -1264,7 +1329,7 @@ class dataFrameAPITestScala extends TestBaseScala {
 
     it("Passed ST_GeometryN") {
       val baseDf = sparkSession.sql("SELECT ST_GeomFromWKT('MULTIPOINT ((0 0))') AS geom")
-      val df = baseDf.select(ST_GeometryN("geom", 0))
+      val df = baseDf.select(ST_GeometryN("geom", 1))
       val actualResult = df.take(1)(0).get(0).asInstanceOf[Geometry].toText()
       val expectedResult = "POINT (0 0)"
       assert(actualResult == expectedResult)
@@ -1273,7 +1338,7 @@ class dataFrameAPITestScala extends TestBaseScala {
     it("Passed ST_InteriorRingN") {
       val baseDf = sparkSession.sql(
         "SELECT ST_GeomFromWKT('POLYGON ((0 0, 3 0, 3 3, 0 0), (1 1, 2 2, 2 1, 1 1))') AS geom")
-      val df = baseDf.select(ST_InteriorRingN("geom", 0))
+      val df = baseDf.select(ST_InteriorRingN("geom", 1))
       val actualResult = df.take(1)(0).get(0).asInstanceOf[Geometry].toText()
       val expectedResult = "LINESTRING (1 1, 2 2, 2 1, 1 1)"
       assert(actualResult == expectedResult)
@@ -1839,6 +1904,33 @@ class dataFrameAPITestScala extends TestBaseScala {
       assert(!actualResult)
     }
 
+    it("Passed ST_EqualsExact") {
+      val baseDf = sparkSession.sql("SELECT ST_Point(0.0, 0.0) AS a, ST_Point(0.03, 0.04) AS b")
+      val result = baseDf
+        .select(
+          ST_EqualsExact("a", "b", 0.051).alias("within"),
+          ST_EqualsExact("a", "b", 0.049).alias("outside"))
+        .first()
+      assert(result.getBoolean(0))
+      assert(!result.getBoolean(1))
+    }
+
+    it("Passed ST_EqualsIdentical") {
+      val baseDf = sparkSession.sql("""
+        SELECT
+          ST_GeomFromWKT('POINT Z (1 2 3)') AS a,
+          ST_GeomFromWKT('POINT Z (1 2 3)') AS identical,
+          ST_GeomFromWKT('POINT M (1 2 3)') AS different_dimension
+      """)
+      val result = baseDf
+        .select(
+          ST_EqualsIdentical("a", "identical").alias("identical"),
+          ST_EqualsIdentical(col("a"), col("different_dimension")).alias("different"))
+        .first()
+      assert(result.getBoolean(0))
+      assert(!result.getBoolean(1))
+    }
+
     it("Passed ST_Covers") {
       val baseDf = sparkSession.sql(
         "SELECT ST_GeomFromWKT('POLYGON ((0 0, 1 0, 1 1, 0 0))') AS a, ST_Point(1.0, 0.0) AS b, ST_Point(0.0, 1.0) AS c")
@@ -1992,6 +2084,82 @@ class dataFrameAPITestScala extends TestBaseScala {
         .get(0)
         .asInstanceOf[mutable.WrappedArray[Long]]
       assert(neighborsExactRing.toSet.subsetOf(neighborsAll.toSet))
+    }
+
+    it("Passed ST_H3ToParent") {
+      val result = sparkSession
+        .sql("SELECT ST_Point(1.0, 2.0) geom")
+        .withColumn("cell", element_at(ST_H3CellIDs("geom", 8, true), 1))
+        .select(col("cell"), ST_H3ToParent(col("cell"), 5))
+        .first()
+
+      assert(result.getLong(0) == 614552609325318143L)
+      assert(result.getLong(1) == 601041811137363967L)
+    }
+
+    it("Passed ST_H3ToChildren") {
+      val cell = 601041811137363967L
+      val result = sparkSession
+        .sql(s"SELECT $cell AS cell, 6 AS resolution")
+        .select(
+          ST_H3ToChildren(col("cell"), col("resolution")),
+          ST_H3ToChildren(col("cell"), 6),
+          ST_H3ToChildren(cell, 6))
+        .first()
+      val children = result.getSeq[Long](0)
+      assert(children.size == 7)
+      assert(children.distinct.size == 7)
+      assert(result.getSeq[Long](1) == children)
+      assert(result.getSeq[Long](2) == children)
+      children.foreach { child =>
+        assert(org.apache.sedona.common.Functions.h3ToParent(child, 5) == cell)
+      }
+    }
+
+    it("Passed ST_H3ToCenterChild") {
+      val cell = 601041811137363967L
+      val result = sparkSession
+        .sql(s"SELECT $cell AS cell, 6 AS resolution")
+        .select(
+          ST_H3ToCenterChild(col("cell"), col("resolution")),
+          ST_H3ToCenterChild(col("cell"), 6),
+          ST_H3ToCenterChild(cell, 6))
+        .first()
+      (0 until 3).foreach(i => assert(result.getLong(i) == 605545409825210367L))
+    }
+
+    it("Passed ST_H3Compact") {
+      val cell = 601041811137363967L
+      val children = org.apache.sedona.common.Functions.h3ToChildren(cell, 6).map(_.longValue())
+      val result = sparkSession
+        .sql(s"SELECT ST_H3ToChildren($cell, 6) AS cells")
+        .select(ST_H3Compact(col("cells")), ST_H3Compact(children))
+        .first()
+      assert(result.getSeq[Long](0) == Seq(cell))
+      assert(result.getSeq[Long](1) == Seq(cell))
+      assert(
+        sparkSession
+          .range(1)
+          .select(ST_H3Compact(Array.empty[Long]))
+          .first()
+          .getSeq[Long](0)
+          .isEmpty)
+    }
+
+    it("Passed ST_H3Uncompact") {
+      val cell = 601041811137363967L
+      val result = sparkSession
+        .sql(s"SELECT array($cell) AS cells, 6 AS resolution")
+        .select(
+          ST_H3Uncompact(col("cells"), col("resolution")),
+          ST_H3Uncompact(col("cells"), 6),
+          ST_H3Uncompact(Array(cell), 6))
+        .first()
+      val cells = result.getSeq[Long](0)
+      assert(cells.size == 7)
+      assert(cells.toSet == org.apache.sedona.common.Functions.h3ToChildren(cell, 6).toSet)
+      assert(result.getSeq[Long](1) == cells)
+      assert(result.getSeq[Long](2) == cells)
     }
 
     it("Passed ST_DistanceSphere") {
@@ -2213,6 +2381,14 @@ class dataFrameAPITestScala extends TestBaseScala {
       assertFalse(actual)
     }
 
+    it("Passed ST_IsLineStringCCW") {
+      val baseDf =
+        sparkSession.sql("SELECT ST_GeomFromWKT('LINESTRING (0 0, 1 0, 1 1, 0 1, 0 0)') AS line")
+
+      assertTrue(baseDf.select(ST_IsLineStringCCW("line")).first().getBoolean(0))
+      assertTrue(baseDf.select(ST_IsLineStringCCW(col("line"))).first().getBoolean(0))
+    }
+
     it("Passed ST_Translate") {
       val polyDf = sparkSession.sql(
         "SELECT ST_GeomFromWKT('POLYGON ((1 0 1, 1 1 1, 2 1 1, 2 0 1, 1 0 1))') AS geom")
@@ -2428,6 +2604,20 @@ class dataFrameAPITestScala extends TestBaseScala {
         "POINT (61.64205411585366 104.55256764481707)",
         actual.getAs[Geometry](1))
       assertEquals(45.18896951053177, actual.getDouble(2), 1e-6)
+
+      val triangleDf =
+        sparkSession.sql("SELECT ST_GeomFromWKT('POLYGON ((0 0, 1 0, 1 1, 0 0))') AS geom")
+      val coarse: Row =
+        triangleDf.select(ST_MaximumInscribedCircle("geom", 2.0)).first().getAs[Row](0)
+      assertGeometryEquals("POINT (0.75 0.5)", coarse.getAs[Geometry](0))
+      assertGeometryEquals("POINT (0.625 0.625)", coarse.getAs[Geometry](1))
+      assertEquals(0.1767766952966369, coarse.getDouble(2), 1e-12)
+
+      val explicitDefault: Row =
+        triangleDf.select(ST_MaximumInscribedCircle("geom", 0.0)).first().getAs[Row](0)
+      val implicitDefault: Row =
+        triangleDf.select(ST_MaximumInscribedCircle("geom")).first().getAs[Row](0)
+      assertEquals(implicitDefault, explicitDefault)
     }
 
     it("Should pass ST_IsValidTrajectory") {

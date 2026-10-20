@@ -57,6 +57,22 @@ def ST_Extent(geometry: ColumnOrName) -> Column:
 
 
 @validate_argument_types
+def ST_3DExtent(geometry: ColumnOrName) -> Column:
+    """Aggregate Function: Get the 3D bounding box (Box3D) of a geometry column.
+
+    Returns NULL when the input contains no rows or all rows are null/empty
+    geometries. Geometries without a Z dimension contribute ``z = 0`` per
+    coordinate, matching PostGIS. Mirrors PostGIS ST_3DExtent.
+
+    :param geometry: Geometry column to aggregate.
+    :type geometry: ColumnOrName
+    :return: Box3D representing the union of 3D bounding boxes of the geometry column.
+    :rtype: Column
+    """
+    return _call_aggregate_function("ST_3DExtent", geometry)
+
+
+@validate_argument_types
 def ST_Intersection_Aggr(geometry: ColumnOrName) -> Column:
     """Aggregate Function: Get the aggregate intersection of a geometry column.
 
@@ -139,9 +155,9 @@ def ST_Union_Agg(geometry: ColumnOrName) -> Column:
     return ST_Union_Aggr(geometry)
 
 
-# Automatically populate __all__
+# Export the functions defined in this module. Imported helpers, such as lit, stay out of star imports.
 __all__ = [
     name
     for name, obj in inspect.getmembers(sys.modules[__name__])
-    if inspect.isfunction(obj)
+    if inspect.isfunction(obj) and obj.__module__ == __name__
 ]

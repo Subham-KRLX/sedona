@@ -553,10 +553,24 @@ private[apache] case class ST_MakeBox2D(inputExpressions: Seq[Expression])
 }
 
 /**
+ * Construct a Box3D from two corner POINT Z geometries. Mirrors PostGIS `ST_3DMakeBox`.
+ * Coordinates are taken verbatim; ordering is not validated. POINT inputs without a Z dimension
+ * contribute `z = 0`.
+ *
+ * @param inputExpressions
+ */
+private[apache] case class ST_3DMakeBox(inputExpressions: Seq[Expression])
+    extends InferredExpression(Constructors.make3DBox _) {
+
+  protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]) = {
+    copy(inputExpressions = newChildren)
+  }
+}
+
+/**
  * Convert a Box2D to a closed rectangular polygon Geometry. Equivalent to PostGIS {@code
- * box2d::geometry}. Exposed as a function rather than a Catalyst implicit cast because UDT-to-UDT
- * implicit casts require Catalyst-level work; ST_GeomFromBox2D lives alongside the other
- * ST_GeomFrom* constructors.
+ * box2d::geometry}. `CAST(box AS geometry)` is also accepted (resolved to this expression by the
+ * Box2D cast resolution rule).
  *
  * @param inputExpressions
  */

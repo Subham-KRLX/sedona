@@ -18,10 +18,19 @@
  */
 package org.apache.sedona.flink.expressions;
 
+import java.io.IOException;
+import java.util.Arrays;
 import org.apache.flink.table.annotation.DataTypeHint;
+import org.apache.flink.table.annotation.FunctionHint;
 import org.apache.flink.table.functions.AggregateFunction;
+import org.apache.sedona.common.S2Geography.Geography;
+import org.apache.sedona.common.S2Geography.GeographyWKBSerializer;
 import org.apache.sedona.common.geometryObjects.Box2D;
+import org.apache.sedona.common.geometryObjects.Box3D;
+import org.apache.sedona.flink.AccGeometryCollectionTypeSerializer;
 import org.apache.sedona.flink.Box2DTypeSerializer;
+import org.apache.sedona.flink.Box3DTypeSerializer;
+import org.apache.sedona.flink.GeographyTypeSerializer;
 import org.apache.sedona.flink.GeometryTypeSerializer;
 import org.locationtech.jts.geom.Coordinate;
 import org.locationtech.jts.geom.Envelope;
@@ -168,6 +177,69 @@ public class Aggregators {
     }
   }
 
+  // Aggregate the 3D bounding box of all input geometries as a Box3D. Mirrors PostGIS
+  // ST_3DExtent. Geometries without a Z dimension fold into z = 0 per coordinate (via
+  // Functions.box3D). Returns null when there are no rows or all inputs are null/empty.
+  @DataTypeHint(value = "RAW", rawSerializer = Box3DTypeSerializer.class, bridgedTo = Box3D.class)
+  public static class ST_3DExtent extends AggregateFunction<Box3D, Accumulators.Envelope3D> {
+
+    @Override
+    public Accumulators.Envelope3D createAccumulator() {
+      return new Accumulators.Envelope3D();
+    }
+
+    @Override
+    @DataTypeHint(value = "RAW", rawSerializer = Box3DTypeSerializer.class, bridgedTo = Box3D.class)
+    public Box3D getValue(Accumulators.Envelope3D acc) {
+      if (acc.minX > acc.maxX) return null;
+      return new Box3D(acc.minX, acc.minY, acc.minZ, acc.maxX, acc.maxY, acc.maxZ);
+    }
+
+    public void accumulate(
+        Accumulators.Envelope3D acc,
+        @DataTypeHint(
+                value = "RAW",
+                rawSerializer = GeometryTypeSerializer.class,
+                bridgedTo = Geometry.class)
+            Object o) {
+      if (o == null) return;
+      // Functions.box3D folds missing Z to 0 and returns null for empty geometries.
+      Box3D box = org.apache.sedona.common.Functions.box3D((Geometry) o);
+      if (box == null) return;
+      acc.minX = Math.min(acc.minX, box.getXMin());
+      acc.minY = Math.min(acc.minY, box.getYMin());
+      acc.minZ = Math.min(acc.minZ, box.getZMin());
+      acc.maxX = Math.max(acc.maxX, box.getXMax());
+      acc.maxY = Math.max(acc.maxY, box.getYMax());
+      acc.maxZ = Math.max(acc.maxZ, box.getZMax());
+    }
+
+    public void retract(
+        Accumulators.Envelope3D acc,
+        @DataTypeHint(
+                value = "RAW",
+                rawSerializer = GeometryTypeSerializer.class,
+                bridgedTo = Geometry.class)
+            Object o) {
+      assert (false);
+    }
+
+    public void merge(Accumulators.Envelope3D acc, Iterable<Accumulators.Envelope3D> it) {
+      for (Accumulators.Envelope3D a : it) {
+        acc.minX = Math.min(acc.minX, a.minX);
+        acc.minY = Math.min(acc.minY, a.minY);
+        acc.minZ = Math.min(acc.minZ, a.minZ);
+        acc.maxX = Math.max(acc.maxX, a.maxX);
+        acc.maxY = Math.max(acc.maxY, a.maxY);
+        acc.maxZ = Math.max(acc.maxZ, a.maxZ);
+      }
+    }
+
+    public void resetAccumulator(Accumulators.Envelope3D acc) {
+      acc.reset();
+    }
+  }
+
   // Compute the Union boundary of numbers of geometries
   //
   @DataTypeHint(
@@ -307,6 +379,173 @@ public class Aggregators {
     }
   }
 
+  /**
+   * Collects all non-null Geometry or Geography inputs while preserving order and duplicates.
+   *
+   * <p>The output spatial type follows the input type. Geography values in a group must use the
+   * same SRID.
+   */
+  @FunctionHint(
+      input =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = GeometryTypeSerializer.class,
+              bridgedTo = Geometry.class),
+      accumulator =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = AccGeometryCollectionTypeSerializer.class,
+              bridgedTo = Accumulators.AccGeometryCollection.class),
+      output =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = GeometryTypeSerializer.class,
+              bridgedTo = Geometry.class))
+  @FunctionHint(
+      input =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = GeographyTypeSerializer.class,
+              bridgedTo = Geography.class),
+      accumulator =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = AccGeometryCollectionTypeSerializer.class,
+              bridgedTo = Accumulators.AccGeometryCollection.class),
+      output =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = GeographyTypeSerializer.class,
+              bridgedTo = Geography.class))
+  public static class ST_Collect_Aggr
+      extends AggregateFunction<Object, Accumulators.AccGeometryCollection> {
+
+    @Override
+    public Accumulators.AccGeometryCollection createAccumulator() {
+      return new Accumulators.AccGeometryCollection();
+    }
+
+    @Override
+    public Object getValue(Accumulators.AccGeometryCollection acc) {
+      if (acc.values.isEmpty()) {
+        return null;
+      }
+      if (Boolean.TRUE.equals(acc.geography)) {
+        Geography[] geographies = new Geography[acc.values.size()];
+        try {
+          for (int i = 0; i < geographies.length; i++) {
+            geographies[i] = GeographyWKBSerializer.deserialize(acc.values.get(i));
+          }
+        } catch (IOException e) {
+          throw new IllegalStateException("Failed to deserialize Geography collection", e);
+        }
+        return org.apache.sedona.common.geography.Functions.createMultiGeography(geographies);
+      }
+
+      Geometry[] geometries = new Geometry[acc.values.size()];
+      for (int i = 0; i < geometries.length; i++) {
+        geometries[i] =
+            org.apache.sedona.common.geometrySerde.GeometrySerializer.deserialize(
+                acc.values.get(i));
+      }
+      return org.apache.sedona.common.Functions.createMultiGeometry(geometries);
+    }
+
+    public void accumulate(Accumulators.AccGeometryCollection acc, Object value) {
+      if (value == null) {
+        return;
+      }
+      if (value instanceof Geography) {
+        Geography geography = (Geography) value;
+        requireType(acc, true);
+        requireMatchingSrid(acc, geography.getSRID());
+        try {
+          acc.values.add(GeographyWKBSerializer.serialize(geography));
+        } catch (IOException e) {
+          throw new IllegalStateException("Failed to serialize Geography", e);
+        }
+      } else if (value instanceof Geometry) {
+        requireType(acc, false);
+        acc.values.add(
+            org.apache.sedona.common.geometrySerde.GeometrySerializer.serialize((Geometry) value));
+      } else {
+        throw new IllegalArgumentException(
+            "ST_Collect_Aggr only accepts Geometry or Geography values");
+      }
+    }
+
+    public void retract(Accumulators.AccGeometryCollection acc, Object value) {
+      if (value == null || acc.values.isEmpty()) {
+        return;
+      }
+
+      byte[] serialized;
+      if (value instanceof Geography) {
+        requireType(acc, true);
+        requireMatchingSrid(acc, ((Geography) value).getSRID());
+        try {
+          serialized = GeographyWKBSerializer.serialize((Geography) value);
+        } catch (IOException e) {
+          throw new IllegalStateException("Failed to serialize Geography", e);
+        }
+      } else if (value instanceof Geometry) {
+        requireType(acc, false);
+        serialized =
+            org.apache.sedona.common.geometrySerde.GeometrySerializer.serialize((Geometry) value);
+      } else {
+        throw new IllegalArgumentException(
+            "ST_Collect_Aggr only accepts Geometry or Geography values");
+      }
+
+      for (int i = 0; i < acc.values.size(); i++) {
+        if (Arrays.equals(acc.values.get(i), serialized)) {
+          acc.values.remove(i);
+          break;
+        }
+      }
+      if (acc.values.isEmpty()) {
+        acc.reset();
+      }
+    }
+
+    public void merge(
+        Accumulators.AccGeometryCollection acc,
+        Iterable<Accumulators.AccGeometryCollection> accumulators) {
+      for (Accumulators.AccGeometryCollection other : accumulators) {
+        if (other.values.isEmpty()) {
+          continue;
+        }
+        requireType(acc, Boolean.TRUE.equals(other.geography));
+        if (Boolean.TRUE.equals(other.geography)) {
+          requireMatchingSrid(acc, other.srid);
+        }
+        acc.values.addAll(other.values);
+      }
+    }
+
+    public void resetAccumulator(Accumulators.AccGeometryCollection acc) {
+      acc.reset();
+    }
+
+    private static void requireType(Accumulators.AccGeometryCollection acc, boolean geography) {
+      if (acc.geography == null) {
+        acc.geography = geography;
+      } else if (acc.geography != geography) {
+        throw new IllegalArgumentException(
+            "ST_Collect_Aggr cannot mix Geometry and Geography values");
+      }
+    }
+
+    private static void requireMatchingSrid(Accumulators.AccGeometryCollection acc, int inputSrid) {
+      if (acc.values.isEmpty()) {
+        acc.srid = inputSrid;
+      } else if (acc.srid != inputSrid) {
+        throw new IllegalArgumentException(
+            "ST_Collect_Aggr requires all Geography values to have the same SRID");
+      }
+    }
+  }
+
   // Aliases for *_Aggr functions with *_Agg suffix
   @DataTypeHint(
       value = "RAW",
@@ -325,4 +564,38 @@ public class Aggregators {
       rawSerializer = GeometryTypeSerializer.class,
       bridgedTo = Geometry.class)
   public static class ST_Union_Agg extends ST_Union_Aggr {}
+
+  @FunctionHint(
+      input =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = GeometryTypeSerializer.class,
+              bridgedTo = Geometry.class),
+      accumulator =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = AccGeometryCollectionTypeSerializer.class,
+              bridgedTo = Accumulators.AccGeometryCollection.class),
+      output =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = GeometryTypeSerializer.class,
+              bridgedTo = Geometry.class))
+  @FunctionHint(
+      input =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = GeographyTypeSerializer.class,
+              bridgedTo = Geography.class),
+      accumulator =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = AccGeometryCollectionTypeSerializer.class,
+              bridgedTo = Accumulators.AccGeometryCollection.class),
+      output =
+          @DataTypeHint(
+              value = "RAW",
+              rawSerializer = GeographyTypeSerializer.class,
+              bridgedTo = Geography.class))
+  public static class ST_Collect_Agg extends ST_Collect_Aggr {}
 }

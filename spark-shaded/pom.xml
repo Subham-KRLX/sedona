@@ -22,7 +22,7 @@
     <parent>
         <artifactId>sedona-parent</artifactId>
         <groupId>org.apache.sedona</groupId>
-        <version>1.9.1-SNAPSHOT</version>
+        <version>2.0.0-SNAPSHOT</version>
     </parent>
     <artifactId>sedona-spark-shaded-${spark.compat.version}_${scala.compat.version}</artifactId>
 
@@ -230,10 +230,24 @@
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
                                     <resource>reference.conf</resource>
                                 </transformer>
+                                <!-- Each JAI-EXT module and some GeoTools/JAITools jars ship their own JAI operation
+                                     registry file; append them so every operation stays registered when GeoTools is
+                                     bundled (-Dgeotools). -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                                    <resource>META-INF/registryFile.jaiext</resource>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                                    <resource>META-INF/registryFile.jai</resource>
+                                </transformer>
                             </transformers>
                             <artifactSet>
                                 <excludes>
-                                    <exclude>org.scala-lang:scala-library</exclude>
+                                    <!-- Never bundle the Scala toolchain (scala-library, scala-reflect,
+                                         scala-compiler): the runtime provides its own, and an unrelocated
+                                         copy shadows it, breaking Scala-compiler users such as
+                                         almond/Ammonite kernels. The groupId match is exact, so
+                                         org.scala-lang.modules artifacts are still bundled. -->
+                                    <exclude>org.scala-lang:*</exclude>
                                     <exclude>org.apache.commons:commons-*</exclude>
                                     <exclude>commons-pool:commons-pool</exclude>
                                     <exclude>commons-io:commons-io</exclude>

@@ -365,6 +365,9 @@ public class TestFunctions extends TestBase {
     verifySqlSingleRes(
         "select sedona.ST_Distance(sedona.ST_GeomFromText('POINT(1 2)'), sedona.ST_GeomFromText('POINT(3 2)'))",
         2.0);
+    verifySqlSingleRes(
+        "select sedona.ST_Distance(sedona.ST_GeomFromText('POINT(1 2)'), sedona.ST_GeomFromText('POLYGON EMPTY'))",
+        null);
   }
 
   @Test
@@ -488,7 +491,7 @@ public class TestFunctions extends TestBase {
   public void test_ST_GeometryN() {
     registerUDF("ST_GeometryN", byte[].class, int.class);
     verifySqlSingleRes(
-        "select sedona.ST_AsText(sedona.ST_GeometryN(sedona.ST_GeomFromText('MULTIPOINT((10 40), (40 30), (20 20), (30 10))'), 1))",
+        "select sedona.ST_AsText(sedona.ST_GeometryN(sedona.ST_GeomFromText('MULTIPOINT((10 40), (40 30), (20 20), (30 10))'), 2))",
         "POINT (40 30)");
   }
 
@@ -511,13 +514,34 @@ public class TestFunctions extends TestBase {
     verifySqlSingleRes(
         "select sedona.ST_HausdorffDistance(sedona.ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'), sedona.ST_GeomFromText('LINESTRING(0 0, 1 1, 3 3)'))",
         1.4142135623730951);
+    verifySqlSingleRes(
+        "select sedona.ST_HausdorffDistance(sedona.ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'), sedona.ST_GeomFromText('POLYGON EMPTY'))",
+        null);
+  }
+
+  @Test
+  public void test_ST_HilbertDistance() {
+    registerUDF(
+        "ST_HilbertDistance",
+        byte[].class,
+        double.class,
+        double.class,
+        double.class,
+        double.class,
+        int.class);
+    verifySqlSingleRes(
+        "select sedona.ST_HilbertDistance(sedona.ST_GeomFromText('POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))'), 0, 0, 1, 1, 2) = 2",
+        true);
+    verifySqlSingleRes(
+        "select sedona.ST_HilbertDistance(sedona.ST_GeomFromText('POINT (1 0)'), 0, 0, 1, 1, 16) = 4294967295",
+        true);
   }
 
   @Test
   public void test_ST_InteriorRingN() {
     registerUDF("ST_InteriorRingN", byte[].class, int.class);
     verifySqlSingleRes(
-        "select sedona.ST_AsText(sedona.ST_InteriorRingN(sedona.ST_GeomFromText('POLYGON((0 0, 0 5, 5 5, 5 0, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1), (1 3, 2 3, 2 4, 1 4, 1 3), (3 3, 4 3, 4 4, 3 4, 3 3))'), 0))",
+        "select sedona.ST_AsText(sedona.ST_InteriorRingN(sedona.ST_GeomFromText('POLYGON((0 0, 0 5, 5 5, 5 0, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1), (1 3, 2 3, 2 4, 1 4, 1 3), (3 3, 4 3, 4 4, 3 4, 3 3))'), 1))",
         "LINESTRING (1 1, 2 1, 2 2, 1 2, 1 1)");
   }
 
@@ -527,6 +551,14 @@ public class TestFunctions extends TestBase {
     verifySqlSingleRes(
         "select sedona.ST_AsText(sedona.ST_Intersection(sedona.ST_GeomFromText('LINESTRING(0 0, 2 2)'), sedona.ST_GeomFromText('LINESTRING(0 2, 2 0)')))",
         "POINT (1 1)");
+  }
+
+  @Test
+  public void test_ST_SharedPaths() {
+    registerUDF("ST_SharedPaths", byte[].class, byte[].class);
+    verifySqlSingleRes(
+        "select sedona.ST_AsText(sedona.ST_SharedPaths(sedona.ST_GeomFromText('LINESTRING(0 0, 10 0)'), sedona.ST_GeomFromText('LINESTRING(15 0, 5 0)')))",
+        "GEOMETRYCOLLECTION (MULTILINESTRING EMPTY, MULTILINESTRING ((5 0, 10 0)))");
   }
 
   @Test
@@ -550,6 +582,17 @@ public class TestFunctions extends TestBase {
   public void test_ST_IsEmpty() {
     registerUDF("ST_IsEmpty", byte[].class);
     verifySqlSingleRes("select sedona.ST_IsEmpty(sedona.ST_GeomFromText('POINT(1 2)'))", false);
+  }
+
+  @Test
+  public void test_ST_IsLineStringCCW() {
+    registerUDF("ST_IsLineStringCCW", byte[].class);
+    verifySqlSingleRes(
+        "select sedona.ST_IsLineStringCCW(sedona.ST_GeomFromText('LINESTRING (0 0, 1 0, 1 1, 0 1, 0 0)'))",
+        true);
+    verifySqlSingleRes(
+        "select sedona.ST_IsLineStringCCW(sedona.ST_GeomFromText('LINESTRING (0 1, 0 -1, -1 -2, 3 -2)'))",
+        false);
   }
 
   @Test
@@ -685,12 +728,9 @@ public class TestFunctions extends TestBase {
     verifySqlSingleRes("select sedona.ST_AsText(sedona.ST_MakePoint(1, 2))", "POINT (1 2)");
     registerUDF("ST_MakePoint", double.class, double.class, double.class);
     verifySqlSingleRes("select sedona.ST_AsText(sedona.ST_MakePoint(1, 2, 3))", "POINT Z(1 2 3)");
-    // TODO: fix this when https://github.com/locationtech/jts/pull/734 gets merged.
-    // Sedona Snowflake uses WKB to serialize geometries, and JTS's WKBReader and Writer ignores M
-    // values.
     registerUDF("ST_MakePoint", double.class, double.class, double.class, double.class);
     verifySqlSingleRes(
-        "select sedona.ST_AsText(sedona.ST_MakePoint(1, 2, 3, 4))", "POINT Z(1 2 3)");
+        "select sedona.ST_AsText(sedona.ST_MakePoint(1, 2, 3, 4))", "POINT ZM(1 2 3 4)");
   }
 
   @Test
@@ -1256,6 +1296,22 @@ public class TestFunctions extends TestBase {
     verifySqlSingleRes(
         "SELECT sedona.ST_IsPolygonCW(sedona.ST_GeomFromWKT('POLYGON ((20 35, 45 20, 30 5, 10 10, 10 30, 20 35), (30 20, 20 25, 20 15, 30 20))'))",
         true);
+    verifySqlSingleRes(
+        "SELECT sedona.ST_IsPolygonCW(sedona.ST_GeomFromWKT('POLYGON EMPTY'))", true);
+    verifySqlSingleRes(
+        "SELECT sedona.ST_IsPolygonCW(sedona.ST_GeomFromWKT('MULTIPOLYGON EMPTY'))", true);
+    // Non-polygonal geometries and geometry collections with no polygonal components have
+    // nothing to violate the orientation, so PostGIS parity requires true here.
+    verifySqlSingleRes("SELECT sedona.ST_IsPolygonCW(sedona.ST_GeomFromWKT('POINT (0 0)'))", true);
+    verifySqlSingleRes(
+        "SELECT sedona.ST_IsPolygonCW(sedona.ST_GeomFromWKT('LINESTRING (0 0, 1 0, 0 0)'))", true);
+    // Recurses into nested geometry collections to find the polygonal component.
+    verifySqlSingleRes(
+        "SELECT sedona.ST_IsPolygonCW(sedona.ST_GeomFromWKT("
+            + "'GEOMETRYCOLLECTION (POINT (2 2), GEOMETRYCOLLECTION (POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))))'))",
+        true);
+    // Snowflake short-circuits SQL NULL input before invoking the handler.
+    verifySqlSingleRes("SELECT sedona.ST_IsPolygonCW(sedona.ST_GeomFromWKT(NULL))", null);
   }
 
   @Test
@@ -1280,6 +1336,22 @@ public class TestFunctions extends TestBase {
     verifySqlSingleRes(
         "SELECT sedona.ST_IsPolygonCCW(sedona.ST_GeomFromWKT('POLYGON ((20 35, 10 30, 10 10, 30 5, 45 20, 20 35),(30 20, 20 15, 20 25, 30 20))'))",
         true);
+    verifySqlSingleRes(
+        "SELECT sedona.ST_IsPolygonCCW(sedona.ST_GeomFromWKT('POLYGON EMPTY'))", true);
+    verifySqlSingleRes(
+        "SELECT sedona.ST_IsPolygonCCW(sedona.ST_GeomFromWKT('MULTIPOLYGON EMPTY'))", true);
+    // Non-polygonal geometries and geometry collections with no polygonal components have
+    // nothing to violate the orientation, so PostGIS parity requires true here.
+    verifySqlSingleRes("SELECT sedona.ST_IsPolygonCCW(sedona.ST_GeomFromWKT('POINT (0 0)'))", true);
+    verifySqlSingleRes(
+        "SELECT sedona.ST_IsPolygonCCW(sedona.ST_GeomFromWKT('LINESTRING (0 0, 1 0, 0 0)'))", true);
+    // Recurses into nested geometry collections to find the polygonal component.
+    verifySqlSingleRes(
+        "SELECT sedona.ST_IsPolygonCCW(sedona.ST_GeomFromWKT("
+            + "'GEOMETRYCOLLECTION (POINT (2 2), GEOMETRYCOLLECTION (POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))))'))",
+        true);
+    // Snowflake short-circuits SQL NULL input before invoking the handler.
+    verifySqlSingleRes("SELECT sedona.ST_IsPolygonCCW(sedona.ST_GeomFromWKT(NULL))", null);
   }
 
   @Test
@@ -1333,7 +1405,7 @@ public class TestFunctions extends TestBase {
     registerUDF("ST_Translate", byte[].class, double.class, double.class, double.class);
     verifySqlSingleRes(
         "SELECT sedona.ST_AsText(sedona.ST_Translate(sedona.ST_GeomFromText('GEOMETRYCOLLECTION(MULTIPOLYGON (((1 0 0, 1 1 0, 2 1 0, 2 0 0, 1 0 0)), ((1 2 0, 3 4 0, 3 5 0, 1 2 0))), POINT(1 1 1), LINESTRING EMPTY))'), 2, 2, 3))",
-        "GEOMETRYCOLLECTION Z(MULTIPOLYGON Z(((3 2 3, 3 3 3, 4 3 3, 4 2 3, 3 2 3)), ((3 4 3, 5 6 3, 5 7 3, 3 4 3))), POINT Z(3 3 4), LINESTRING ZEMPTY)");
+        "GEOMETRYCOLLECTION Z(MULTIPOLYGON Z(((3 2 3, 3 3 3, 4 3 3, 4 2 3, 3 2 3)), ((3 4 3, 5 6 3, 5 7 3, 3 4 3))), POINT Z(3 3 4), LINESTRING Z EMPTY)");
   }
 
   @Test

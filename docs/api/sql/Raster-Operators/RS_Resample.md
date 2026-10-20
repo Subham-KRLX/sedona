@@ -31,7 +31,7 @@ The `useScale` parameter controls whether to use width-height or scaleX-scaleY. 
 
 Currently, RS_Resample does not support skewed rasters, and hence even if a skewed reference raster is provided, its skew values are ignored. If the input raster is skewed, the output raster geometry and interpolation may be incorrect.
 
-The default algorithm used for resampling is `NearestNeighbor`, and hence if a null, empty or invalid value of algorithm is provided, RS_Resample defaults to using `NearestNeighbor`. However, the algorithm parameter is non-optional.
+The default algorithm used for resampling is `NearestNeighbor`: if a null or empty algorithm is provided, RS_Resample defaults to using `NearestNeighbor`. An unknown algorithm name raises an `IllegalArgumentException`. The algorithm parameter is non-optional.
 
 Following are valid values for the algorithm parameter (Case-insensitive):
 
@@ -49,7 +49,7 @@ For more information about ScaleX, ScaleY, SkewX, SkewY, please refer to the [Af
 Format:
 
 ```sql
-RS_Resample(raster: Raster, widthOrScale: Double, heightOrScale: Double, gridX: Double, gridY: Double, useScale: Boolean, algorithm: String)
+RS_Resample(raster: Raster, referenceRaster: Raster, useScale: Boolean, algorithm: String)
 ```
 
 ```sql
@@ -57,7 +57,7 @@ RS_Resample(raster: Raster, widthOrScale: Double, heightOrScale: Double, useScal
 ```
 
 ```sql
-RS_Resample(raster: Raster, referenceRaster: Raster, useScale: Boolean, algorithm: String)
+RS_Resample(raster: Raster, widthOrScale: Double, heightOrScale: Double, gridX: Double, gridY: Double, useScale: Boolean, algorithm: String)
 ```
 
 Return type: `Raster`

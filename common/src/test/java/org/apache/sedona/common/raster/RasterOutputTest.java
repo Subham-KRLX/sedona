@@ -20,14 +20,46 @@ package org.apache.sedona.common.raster;
 
 import static org.junit.Assert.*;
 
+import java.awt.image.DataBuffer;
+import java.awt.image.WritableRaster;
 import java.io.File;
 import java.io.IOException;
 import java.net.URLConnection;
+import javax.media.jai.RasterFactory;
+import org.apache.sedona.common.utils.RasterUtils;
 import org.geotools.api.referencing.FactoryException;
+import org.geotools.api.referencing.crs.CoordinateReferenceSystem;
+import org.geotools.api.referencing.datum.PixelInCell;
 import org.geotools.coverage.grid.GridCoverage2D;
+import org.geotools.coverage.grid.GridEnvelope2D;
+import org.geotools.coverage.grid.GridGeometry2D;
+import org.geotools.gce.geotiff.GeoTiffWriteParams;
+import org.geotools.referencing.CRS;
+import org.geotools.referencing.operation.transform.AffineTransform2D;
 import org.junit.Test;
 
 public class RasterOutputTest extends RasterTestBase {
+
+  @Test
+  public void testAsGeoTiffDoesNotInventNoDataValue() throws FactoryException, IOException {
+    // GeoTiffWriter writes a default GDAL_NODATA of 0 unless told otherwise, which made a
+    // raster that never had a no-data value read back claiming one.
+    GridCoverage2D raster = RasterConstructors.makeEmptyRaster(1, 20, 20, 0, 0, 1, -1, 0, 0, 4326);
+    assertNull(RasterBandAccessors.getBandNoDataValue(raster, 1));
+
+    GridCoverage2D roundTripped = RasterConstructors.fromGeoTiff(RasterOutputs.asGeoTiff(raster));
+    assertNull(RasterBandAccessors.getBandNoDataValue(roundTripped, 1));
+  }
+
+  @Test
+  public void testAsGeoTiffKeepsNoDataValue() throws FactoryException, IOException {
+    // The opt-out must only apply when there is no no-data value to write.
+    GridCoverage2D raster = RasterConstructors.makeEmptyRaster(1, 20, 20, 0, 0, 1, -1, 0, 0, 4326);
+    raster = RasterBandEditors.setBandNoDataValue(raster, 1, -999d);
+
+    GridCoverage2D roundTripped = RasterConstructors.fromGeoTiff(RasterOutputs.asGeoTiff(raster));
+    assertEquals(-999d, RasterBandAccessors.getBandNoDataValue(roundTripped, 1), 0.0001d);
+  }
 
   @Test
   public void testAsBase64() throws IOException {
@@ -78,6 +110,35 @@ public class RasterOutputTest extends RasterTestBase {
     File f = new File(dirPath + "test2.png");
     String mimeType = URLConnection.guessContentTypeFromName(f.getName());
     assertEquals("image/png", mimeType);
+  }
+
+  @Test
+  public void testGeoTiffOutputsAreLittleEndian() throws FactoryException, IOException {
+    // Some readers decode pixel data in the platform's byte order without checking the header, so
+    // the files must be little endian, and the pixels must survive the trip in that byte order.
+    // Float32 values whose bytes are not palindromic catch a header/pixel byte order mismatch.
+    int width = 300;
+    int height = 300;
+    double[] values = new double[width * height];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = (float) (i * 0.001 - 30);
+    }
+    GridCoverage2D raster =
+        RasterConstructors.makeEmptyRaster(1, "F", width, height, 0, 0, 10, -10, 0, 0, 32610);
+    raster = MapAlgebra.addBandFromArray(raster, values, 1);
+
+    byte[][] outputs = {
+      RasterOutputs.asGeoTiff(raster),
+      RasterOutputs.asGeoTiff(raster, "Deflate", 0.5),
+      RasterOutputs.asGeoTiff(raster, "LZW", 1.0),
+      RasterOutputs.asCOG(raster, "Deflate", 256),
+    };
+    for (byte[] bytes : outputs) {
+      assertEquals('I', bytes[0]);
+      assertEquals('I', bytes[1]);
+      GridCoverage2D roundTripped = RasterConstructors.fromGeoTiff(bytes);
+      assertArrayEquals(values, MapAlgebra.bandAsArray(roundTripped, 1), 0.0);
+    }
   }
 
   @Test
@@ -352,5 +413,144 @@ public class RasterOutputTest extends RasterTestBase {
     byte[] cog3 = RasterOutputs.asCOG(raster, "packbits");
     assertNotNull(cog3);
     assertTrue(cog3.length > 0);
+  }
+
+  @Test
+  public void testAsGeoTiffPreservesNaNNoData() throws IOException {
+    GridCoverage2D raster =
+        rasterFromGeoTiff(resourceFolder + "raster_geotiff_nodata/nan_nodata.tif");
+
+    GridCoverage2D roundTrip = RasterConstructors.fromGeoTiff(RasterOutputs.asGeoTiff(raster));
+    Double noDataValue = RasterBandAccessors.getBandNoDataValue(roundTrip, 1);
+    assertNotNull(noDataValue);
+    assertTrue(Double.isNaN(noDataValue));
+    assertEquals(14, RasterBandAccessors.getCount(roundTrip, 1, true));
+
+    // A NaN nodata value declared in memory, without any image-level nodata property, is
+    // written as well.
+    GridCoverage2D inMemory =
+        RasterBandEditors.setBandNoDataValue(
+            RasterConstructors.makeNonEmptyRaster(
+                1, "f", 2, 2, 0, 0, 1, -1, 0, 0, 4326, new double[][] {{1, Double.NaN, 3, 4}}),
+            1,
+            Double.NaN);
+    GridCoverage2D inMemoryRoundTrip =
+        RasterConstructors.fromGeoTiff(RasterOutputs.asGeoTiff(inMemory));
+    noDataValue = RasterBandAccessors.getBandNoDataValue(inMemoryRoundTrip, 1);
+    assertNotNull(noDataValue);
+    assertTrue(Double.isNaN(noDataValue));
+    assertEquals(3, RasterBandAccessors.getCount(inMemoryRoundTrip, 1, true));
+
+    // A float raster without a nodata value must not gain one just because it holds NaN pixels.
+    GridCoverage2D noNoData =
+        RasterConstructors.makeNonEmptyRaster(
+            1, "f", 2, 2, 0, 0, 1, -1, 0, 0, 4326, new double[][] {{1, Double.NaN, 3, 4}});
+    assertNull(
+        RasterBandAccessors.getBandNoDataValue(
+            RasterConstructors.fromGeoTiff(RasterOutputs.asGeoTiff(noNoData)), 1));
+
+    // A nodata value changed after reading wins over the value that was read from the file.
+    GridCoverage2D changed = RasterBandEditors.replaceBandNoDataValue(raster, 1, -9999.0);
+    GridCoverage2D changedRoundTrip =
+        RasterConstructors.fromGeoTiff(RasterOutputs.asGeoTiff(changed));
+    assertEquals(-9999.0, RasterBandAccessors.getBandNoDataValue(changedRoundTrip, 1), 0);
+    assertEquals(14, RasterBandAccessors.getCount(changedRoundTrip, 1, true));
+  }
+
+  @Test
+  public void testAsGeoTiffPreservesGeoreference() throws IOException, FactoryException {
+    double[][] data = {{1, 2, 3, 4, 5, 6}};
+    // projected, axis-aligned
+    assertGeoreferenceSurvivesRoundTrip(
+        RasterConstructors.makeNonEmptyRaster(1, "d", 3, 2, 1000, 2000, 10, -10, 0, 0, 3857, data));
+    // geographic, longitude first
+    assertGeoreferenceSurvivesRoundTrip(
+        RasterConstructors.makeNonEmptyRaster(
+            1, "d", 3, 2, -120.5, 45.25, 0.25, -0.25, 0, 0, 4326, data));
+    // rotated grid: the georeference needs a full model transformation, not tie point and scale
+    assertGeoreferenceSurvivesRoundTrip(
+        RasterConstructors.makeNonEmptyRaster(
+            1, "d", 3, 2, 1000, 2000, 10, -10, 0.5, 0.2, 3857, data));
+  }
+
+  private void assertGeoreferenceSurvivesRoundTrip(GridCoverage2D raster)
+      throws IOException, FactoryException {
+    GridCoverage2D roundTrip = RasterConstructors.fromGeoTiff(RasterOutputs.asGeoTiff(raster));
+    AffineTransform2D expected = RasterUtils.getGDALAffineTransform(raster);
+    AffineTransform2D actual = RasterUtils.getGDALAffineTransform(roundTrip);
+    assertEquals(expected.getTranslateX(), actual.getTranslateX(), 1e-9);
+    assertEquals(expected.getTranslateY(), actual.getTranslateY(), 1e-9);
+    assertEquals(expected.getScaleX(), actual.getScaleX(), 1e-9);
+    assertEquals(expected.getScaleY(), actual.getScaleY(), 1e-9);
+    assertEquals(expected.getShearX(), actual.getShearX(), 1e-9);
+    assertEquals(expected.getShearY(), actual.getShearY(), 1e-9);
+    assertEquals(RasterAccessors.srid(raster), RasterAccessors.srid(roundTrip));
+    assertTrue(
+        CRS.equalsIgnoreMetadata(
+            raster.getCoordinateReferenceSystem(), roundTrip.getCoordinateReferenceSystem()));
+    assertArrayEquals(MapAlgebra.bandAsArray(raster, 1), MapAlgebra.bandAsArray(roundTrip, 1), 0);
+    roundTrip.dispose(true);
+  }
+
+  @Test
+  public void testAsGeoTiffWritesLongitudeFirstForLatitudeFirstCrs() throws Exception {
+    // GeoTIFF model space is always longitude/latitude. A coverage whose CRS lists latitude
+    // first must be written swapped, so it reads back with the same georeference as its
+    // longitude-first twin.
+    CoordinateReferenceSystem latitudeFirst = CRS.decode("EPSG:4326");
+    assertEquals(CRS.AxisOrder.NORTH_EAST, CRS.getAxisOrder(latitudeFirst));
+    // pixel corner (col, row) -> (lat, lon): lat = 45.25 - 0.25 * row, lon = -120.5 + 0.25 * col
+    AffineTransform2D gridToLatLon = new AffineTransform2D(0, 0.25, -0.25, 0, 45.25, -120.5);
+    GridGeometry2D gridGeometry =
+        new GridGeometry2D(
+            new GridEnvelope2D(0, 0, 3, 2),
+            PixelInCell.CELL_CORNER,
+            gridToLatLon,
+            latitudeFirst,
+            null);
+    WritableRaster pixels = RasterFactory.createBandedRaster(DataBuffer.TYPE_DOUBLE, 3, 2, 1, null);
+    pixels.setSamples(0, 0, 3, 2, 0, new double[] {1, 2, 3, 4, 5, 6});
+    GridCoverage2D raster = RasterUtils.create(pixels, gridGeometry, null);
+
+    GridCoverage2D roundTrip = RasterConstructors.fromGeoTiff(RasterOutputs.asGeoTiff(raster));
+    assertEquals(
+        CRS.AxisOrder.EAST_NORTH, CRS.getAxisOrder(roundTrip.getCoordinateReferenceSystem()));
+    AffineTransform2D actual = RasterUtils.getGDALAffineTransform(roundTrip);
+    assertEquals(-120.5, actual.getTranslateX(), 1e-9);
+    assertEquals(45.25, actual.getTranslateY(), 1e-9);
+    assertEquals(0.25, actual.getScaleX(), 1e-9);
+    assertEquals(-0.25, actual.getScaleY(), 1e-9);
+    assertEquals(0, actual.getShearX(), 1e-9);
+    assertEquals(0, actual.getShearY(), 1e-9);
+    assertEquals(4326, RasterAccessors.srid(roundTrip));
+    assertArrayEquals(new double[] {1, 2, 3, 4, 5, 6}, MapAlgebra.bandAsArray(roundTrip, 1), 0);
+    roundTrip.dispose(true);
+  }
+
+  @Test
+  public void testAsGeoTiffRejectsUnsupportedCrs() {
+    // srid 0 gives an engineering CRS, which GeoTIFF cannot describe
+    GridCoverage2D raster =
+        RasterConstructors.makeNonEmptyRaster(
+            1, "d", 2, 2, 0, 0, 1, -1, 0, 0, 0, new double[][] {{1, 2, 3, 4}});
+    assertThrows(RuntimeException.class, () -> RasterOutputs.asGeoTiff(raster));
+  }
+
+  @Test
+  public void testGeoTiffWritersRejectsPartialWrites() {
+    GridCoverage2D raster =
+        RasterConstructors.makeNonEmptyRaster(
+            1, "d", 3, 2, 0, 0, 1, -1, 0, 0, 4326, new double[][] {{1, 2, 3, 4, 5, 6}});
+    GeoTiffWriteParams region = new GeoTiffWriteParams();
+    region.setSourceRegion(new java.awt.Rectangle(0, 0, 2, 2));
+    GeoTiffWriteParams subsampled = new GeoTiffWriteParams();
+    subsampled.setSourceSubsampling(2, 2, 0, 0);
+    for (GeoTiffWriteParams params : new GeoTiffWriteParams[] {region, subsampled}) {
+      IllegalArgumentException e =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> GeoTiffWriters.write(raster, params, new java.io.ByteArrayOutputStream()));
+      assertTrue(e.getMessage(), e.getMessage().contains("whole coverages only"));
+    }
   }
 }

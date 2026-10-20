@@ -16,6 +16,8 @@
 # under the License.
 from __future__ import annotations
 
+import builtins
+from functools import wraps
 from typing import Any, Literal, Callable, Union
 import typing
 
@@ -27,12 +29,48 @@ import geopandas as gpd
 import pandas as pd
 import pyspark.pandas as pspd
 import sedona.spark.geopandas as sgpd
+from shapely.geometry.base import BaseGeometry
+from packaging.version import parse as parse_version
+from pyproj import CRS
 from pyspark.pandas import Series as PandasOnSparkSeries
 from pyspark.pandas.frame import DataFrame as PandasOnSparkDataFrame
+from pyspark.pandas.internal import (
+    InternalField,
+    InternalFrame,
+    NATURAL_ORDER_COLUMN_NAME,
+    SPARK_INDEX_NAME_FORMAT,
+)
+from pyspark.pandas.utils import scol_for
+from pyspark.sql.column import Column
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    BinaryType,
+    BooleanType,
+    ByteType,
+    DataType,
+    DoubleType,
+    FloatType,
+    IntegerType,
+    LongType,
+    NullType,
+    NumericType,
+    ShortType,
+    StringType,
+)
 from pyspark.pandas.utils import log_advice
 
+from sedona.spark.geopandas._crs import (
+    copy_crs_metadata,
+    read_crs_metadata,
+    with_crs_metadata,
+)
+from sedona.spark.geopandas._explode import expand_geometry_column
 from sedona.spark.geopandas._typing import Label
 from sedona.spark.geopandas.base import GeoFrame
+from sedona.spark.sql import st_aggregates as sta
+from sedona.spark.sql import st_constructors as stc
+from sedona.spark.sql import st_functions as stf
+from sedona.spark.sql.types import GeometryType
 
 from pandas.api.extensions import register_extension_dtype
 from geopandas.geodataframe import crs_mismatch_error
@@ -118,6 +156,401 @@ def _not_implemented_error(method_name: str, additional_info: str = "") -> str:
     return base_message + workaround
 
 
+def _support_legacy_set_crs_positionals(method):
+    """Preserve the former ``(crs, inplace, allow_override)`` positional form."""
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if len(args) >= 2 and isinstance(args[1], bool):
+            if len(args) > 3:
+                raise TypeError(
+                    "GeoDataFrame.set_crs() accepts at most 3 legacy arguments"
+                )
+            if "epsg" in kwargs or "inplace" in kwargs:
+                raise TypeError(
+                    "GeoDataFrame.set_crs() received duplicate positional and keyword arguments"
+                )
+            if len(args) == 3 and "allow_override" in kwargs:
+                raise TypeError(
+                    "GeoDataFrame.set_crs() got multiple values for 'allow_override'"
+                )
+
+            legacy_allow_override = (
+                args[2] if len(args) == 3 else kwargs.pop("allow_override", True)
+            )
+            warnings.warn(
+                "Passing 'inplace' and 'allow_override' positionally follows "
+                "Sedona's former GeoDataFrame.set_crs signature and is "
+                "deprecated. Use keyword arguments instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            return method(
+                self,
+                crs=args[0],
+                inplace=args[1],
+                allow_override=legacy_allow_override,
+                **kwargs,
+            )
+
+        return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+def _normalize_dissolve_aggfunc(aggfunc):
+    """Translate explicitly supported callables to native aggregate names."""
+
+    supported_names = {
+        "count",
+        "first",
+        "last",
+        "max",
+        "mean",
+        "median",
+        "min",
+        "nunique",
+        "std",
+        "sum",
+        "var",
+    }
+    callable_names = (
+        (builtins.max, "max"),
+        (builtins.min, "min"),
+        (builtins.sum, "sum"),
+        (np.amax, "max"),
+        (np.amin, "min"),
+        (np.max, "max"),
+        (np.mean, "mean"),
+        (np.median, "median"),
+        (np.min, "min"),
+        (np.std, "std"),
+        (np.sum, "sum"),
+        (np.var, "var"),
+    )
+
+    def normalize_one(value):
+        if isinstance(value, str):
+            if value in {"prod", "product"}:
+                raise NotImplementedError(
+                    "Sedona dissolve does not support the prod aggregation."
+                )
+            if value not in supported_names:
+                raise NotImplementedError(
+                    f"Sedona dissolve does not support the {value!r} aggregation."
+                )
+            return value
+        for known_callable, name in callable_names:
+            if value is known_callable:
+                return name
+        if value is np.prod:
+            raise NotImplementedError(
+                "Sedona dissolve does not support the prod aggregation."
+            )
+        raise NotImplementedError(
+            "Sedona dissolve only supports documented aggregation names and "
+            "known built-in or NumPy aggregation callables."
+        )
+
+    if isinstance(aggfunc, dict):
+        return {
+            key: (
+                [normalize_one(value) for value in values]
+                if isinstance(values, (list, tuple))
+                else normalize_one(values)
+            )
+            for key, values in aggfunc.items()
+        }
+    if isinstance(aggfunc, (list, tuple)):
+        return [normalize_one(value) for value in aggfunc]
+    return normalize_one(aggfunc)
+
+
+class _DissolveGroupers(typing.NamedTuple):
+    expressions: list
+    fields: list
+    index_names: list
+    column_labels: list
+
+
+def _resolve_dissolve_groupers(
+    frame,
+    internal,
+    geometry_label,
+    by,
+    level,
+    observed,
+):
+    """Resolve dissolve groupers without constructing the aggregation plan."""
+
+    group_expressions = []
+    group_fields = []
+    group_index_names = []
+    grouped_column_labels = []
+
+    if level is not None:
+        levels = list(level) if isinstance(level, (list, tuple)) else [level]
+        index_names = list(internal.index_names)
+
+        def level_position(value):
+            if isinstance(value, (int, np.integer)):
+                position = int(value)
+                if position < 0:
+                    position += len(index_names)
+                if position < 0 or position >= len(index_names):
+                    raise IndexError(
+                        f"Too many levels: Index has only {len(index_names)} levels"
+                    )
+                return position
+
+            wanted = value if isinstance(value, tuple) else (value,)
+            matches = [
+                position for position, name in enumerate(index_names) if name == wanted
+            ]
+            if not matches:
+                raise KeyError(f"Level {value} not found")
+            if len(matches) > 1:
+                raise ValueError(
+                    f"The name {value} occurs multiple times, use a level number"
+                )
+            return matches[0]
+
+        positions = [level_position(value) for value in levels]
+        for position in positions:
+            group_expressions.append(internal.index_spark_columns[position])
+            group_fields.append(internal.index_fields[position])
+            group_index_names.append(internal.index_names[position])
+    elif by is None:
+        group_expressions.append(F.lit(0).cast("long"))
+        group_fields.append(None)
+        group_index_names.append(None)
+    else:
+        groupers_are_column_labels = True
+        if isinstance(by, PandasOnSparkSeries):
+            groupers = [by]
+            groupers_are_column_labels = False
+            if by._psdf is not frame:
+                raise NotImplementedError(
+                    "Sedona dissolve requires Series groupers to come from "
+                    "the GeoDataFrame being dissolved."
+                )
+        else:
+            try:
+                candidate = frame[by]
+            except (KeyError, TypeError):
+                candidate = None
+
+            if isinstance(candidate, PandasOnSparkSeries):
+                groupers = [candidate]
+            elif isinstance(by, list):
+                groupers = []
+                for key in by:
+                    try:
+                        grouper = frame[key]
+                    except (KeyError, TypeError) as exc:
+                        raise NotImplementedError(
+                            "Sedona dissolve supports column labels, not "
+                            "driver-side grouping vectors."
+                        ) from exc
+                    if not isinstance(grouper, PandasOnSparkSeries):
+                        raise ValueError(f"Grouper for '{key}' is not 1-dimensional")
+                    groupers.append(grouper)
+            else:
+                raise NotImplementedError(
+                    "Sedona dissolve supports column labels, not driver-side "
+                    "grouping vectors."
+                )
+
+        for grouper in groupers:
+            if grouper._column_label == geometry_label:
+                raise NotImplementedError(
+                    "Grouping by the active geometry column is not supported."
+                )
+            group_expressions.append(internal.spark_column_for(grouper._column_label))
+            group_fields.append(internal.field_for(grouper._column_label))
+            group_index_names.append(grouper._column_label)
+            if groupers_are_column_labels:
+                grouped_column_labels.append(grouper._column_label)
+
+    if not group_expressions:
+        raise ValueError("No group keys passed")
+
+    if not observed:
+        categorical_groupers = [
+            field
+            for field in group_fields
+            if field is not None and isinstance(field.dtype, pd.CategoricalDtype)
+        ]
+        if categorical_groupers:
+            raise NotImplementedError(
+                "Sedona dissolve cannot materialize unobserved categorical "
+                "groups; pass observed=True."
+            )
+
+    return _DissolveGroupers(
+        group_expressions,
+        group_fields,
+        group_index_names,
+        grouped_column_labels,
+    )
+
+
+class _DissolveResultLabels(typing.NamedTuple):
+    geometry_label: Label
+    attribute_labels: list
+    order_label: Label
+    geometry_name: Label
+    order_name: Label
+    column_label_names: list
+
+
+def _build_dissolve_result_labels(
+    internal,
+    geometry_label,
+    aggregation_specs,
+    result_column_levels,
+):
+    """Build non-colliding output labels for a dissolve result."""
+
+    result_geometry_label = geometry_label + ("",) * (
+        result_column_levels - len(geometry_label)
+    )
+    result_attribute_labels = [spec[3] for spec in aggregation_specs]
+    result_order_label_name = "__dissolve_group_order__"
+    result_order_label = (result_order_label_name,) + ("",) * (result_column_levels - 1)
+    result_labels = {result_geometry_label, *result_attribute_labels}
+    result_order_suffix = 0
+    while result_order_label in result_labels:
+        result_order_suffix += 1
+        result_order_label_name = f"__dissolve_group_order_{result_order_suffix}__"
+        result_order_label = (result_order_label_name,) + ("",) * (
+            result_column_levels - 1
+        )
+
+    result_geometry_name = (
+        result_geometry_label[0]
+        if len(result_geometry_label) == 1
+        else result_geometry_label
+    )
+    result_order_name = (
+        result_order_label[0] if len(result_order_label) == 1 else result_order_label
+    )
+    result_column_label_names = [
+        internal.column_label_names[0],
+        *([None] * (result_column_levels - 1)),
+    ]
+    return _DissolveResultLabels(
+        result_geometry_label,
+        result_attribute_labels,
+        result_order_label,
+        result_geometry_name,
+        result_order_name,
+        result_column_label_names,
+    )
+
+
+def _as_geodataframe_with_geometry(frame, geometry_name):
+    """Wrap a pandas-on-Spark result and restore its active geometry label."""
+
+    result = GeoDataFrame(frame)
+    result._geometry_column_name = geometry_name
+    return result
+
+
+def _dissolve_aggregation_expression(
+    column,
+    field,
+    aggregation,
+    natural_order,
+    column_label,
+):
+    """Build a validated native Spark aggregation for one attribute column."""
+
+    spark_type = field.spark_type
+    is_categorical = isinstance(field.dtype, pd.CategoricalDtype)
+    is_boolean = isinstance(spark_type, BooleanType)
+    is_numeric = isinstance(spark_type, NumericType)
+    is_float = isinstance(spark_type, (FloatType, DoubleType))
+    dtype_name = str(field.dtype) if is_categorical else spark_type.simpleString()
+
+    clean_column = (
+        F.when(F.isnan(column), F.lit(None)).otherwise(column) if is_float else column
+    )
+
+    if aggregation == "first":
+        return F.min_by(
+            clean_column,
+            F.when(clean_column.isNotNull(), natural_order),
+        )
+    if aggregation == "last":
+        return F.max_by(
+            clean_column,
+            F.when(clean_column.isNotNull(), natural_order),
+        )
+    if aggregation == "count":
+        return F.count(clean_column)
+    if aggregation == "nunique":
+        if is_categorical or not (
+            is_numeric or is_boolean or isinstance(spark_type, StringType)
+        ):
+            raise NotImplementedError(
+                "Sedona dissolve does not support aggregation "
+                f"{aggregation!r} for column {column_label!r} with data "
+                f"type {dtype_name!r}."
+            )
+        return F.countDistinct(clean_column)
+
+    if is_categorical or not (is_numeric or is_boolean):
+        raise NotImplementedError(
+            "Sedona dissolve supports aggregation "
+            f"{aggregation!r} only for numeric or boolean columns; "
+            f"column {column_label!r} has data type {dtype_name!r}."
+        )
+
+    numeric_column = clean_column.cast("double") if is_boolean else clean_column
+
+    if aggregation == "sum":
+        if is_boolean or isinstance(
+            spark_type,
+            (ByteType, ShortType, IntegerType, LongType),
+        ):
+            result = F.sum(numeric_column.cast("long")).cast("long")
+            identity = F.lit(0).cast("long")
+        elif isinstance(spark_type, FloatType):
+            result = F.sum(numeric_column).cast("float")
+            identity = F.lit(0).cast("float")
+        elif isinstance(spark_type, DoubleType):
+            result = F.sum(numeric_column).cast("double")
+            identity = F.lit(0).cast("double")
+        else:
+            result = F.sum(numeric_column)
+            identity = F.lit(0).cast(spark_type)
+        return F.coalesce(result, identity)
+
+    if aggregation == "mean":
+        result = F.avg(numeric_column)
+    elif aggregation == "median":
+        result = F.median(numeric_column)
+    elif aggregation == "std":
+        result = F.stddev_samp(numeric_column)
+    elif aggregation == "var":
+        result = F.var_samp(numeric_column)
+    elif aggregation == "min":
+        if is_boolean:
+            return F.min(clean_column.cast("integer")).cast("boolean")
+        return F.min(clean_column)
+    elif aggregation == "max":
+        if is_boolean:
+            return F.max(clean_column.cast("integer")).cast("boolean")
+        return F.max(clean_column)
+    else:
+        raise AssertionError(f"Unexpected dissolve aggregation: {aggregation}")
+
+    if isinstance(spark_type, FloatType):
+        return result.cast("float")
+    return result
+
+
 class GeoDataFrame(GeoFrame, pspd.DataFrame):
     """
     A pandas-on-Spark DataFrame for geospatial data with geometry columns.
@@ -140,6 +573,14 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         Column labels to use for the resulting frame.
     index : Index or array-like, optional
         Index to use for the resulting frame.
+    dtype : dtype, optional
+        Data type to force, passed to the pandas-on-Spark ``DataFrame``
+        constructor. If None, the data types are inferred.
+    copy : bool, default False
+        Whether to copy the input data, passed to the pandas-on-Spark
+        ``DataFrame`` constructor.
+    **kwargs
+        Accepted for compatibility with GeoPandas and ignored.
 
     Examples
     --------
@@ -242,15 +683,17 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         item = pspd.DataFrame.__getitem__(self, key)
 
         if isinstance(item, pspd.DataFrame):
-            # Don't specify crs=self.crs here because it might not include the geometry column.
-            # If it does include the geometry column, we don't need to set crs anyways.
-            return GeoDataFrame(item)
+            result = GeoDataFrame(item)
+            if self._geometry_column_name in result.columns:
+                result._geometry_column_name = self._geometry_column_name
+            return result
         elif isinstance(item, pspd.Series):
             ps_series: pspd.Series = item
             try:
-                return sgpd.GeoSeries(ps_series)
+                result = sgpd.GeoSeries(ps_series)
             except TypeError:
                 return ps_series
+            return result
         else:
             raise Exception(f"Logical Error: Unexpected type: {type(item)}")
 
@@ -279,8 +722,32 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         from sedona.spark.geopandas import GeoSeries
         from pyspark.sql import DataFrame as SparkDataFrame
 
+        local_geometry_crs: dict[int, Any | None] = {}
+
+        # Data built from a Python-native structure (dict, list of records,
+        # pandas/geopandas DataFrame, ...) is locally owned: we can safely
+        # record an authoritative "no CRS" state for its geometry column
+        # below when the caller didn't pass one. Wrapping an existing Sedona
+        # or raw distributed structure instead inherits whatever CRS state it
+        # already had.
+        is_locally_owned = not isinstance(
+            data,
+            (
+                GeoDataFrame,
+                GeoSeries,
+                PandasOnSparkDataFrame,
+                SparkDataFrame,
+                PandasOnSparkSeries,
+            ),
+        )
+        geometry_input = geometry
+        distributed_geometry = isinstance(
+            geometry,
+            (GeoSeries, PandasOnSparkSeries),
+        )
+
         if isinstance(data, (GeoDataFrame, GeoSeries)):
-            if crs:
+            if crs is not None:
                 data.crs = crs
 
             # For each of these super().__init__() calls, we let pyspark decide which inputs are valid or not
@@ -304,11 +771,11 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
             if isinstance(data, gpd.GeoDataFrame):
                 # We can use GeoDataFrame.active_geometry_name once we drop support for geopandas < 1.0.0.
                 # Below is the equivalent, since active_geometry_name simply calls _geometry_column_name.
-                if data._geometry_column_name:
+                if data._geometry_column_name is not None:
                     # GeoPandas stores CRS as metadata instead of inside shapely objects, so we must save it and set it manually later.
-                    if not crs:
+                    if crs is None:
                         crs = data.crs
-                    if not geometry:
+                    if geometry is None:
                         geometry = data.geometry.name
 
             pd_df = pd.DataFrame(
@@ -321,6 +788,18 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
 
             # Spark complains if it's left as a geometry type.
             geom_type_cols = pd_df.select_dtypes(include=["geometry"]).columns
+            # GeoPandas stores one CRS on each GeometryArray. Converting those
+            # arrays to object dtype below is required for Spark, but would
+            # discard that per-column state unless it is captured first.
+            local_geometry_crs = {
+                position: getattr(pd_df.iloc[:, position].array, "crs", None)
+                for position, column_dtype in enumerate(pd_df.dtypes)
+                if isinstance(column_dtype, GeometryDtype)
+            }
+            if not copy and len(geom_type_cols):
+                # pandas 1.5 may share geometry blocks with caller-owned
+                # inputs. Detach before casting so they cannot be mutated.
+                pd_df = pd_df.copy()
             pd_df[geom_type_cols] = pd_df[geom_type_cols].astype(object)
 
             # Initialize the parent class pyspark DataFrame with the pandas DataFrame.
@@ -337,8 +816,46 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
             if crs is not None and data.crs != crs:
                 raise ValueError(crs_mismatch_error)
 
-        if geometry:
-            self.set_geometry(geometry, inplace=True, crs=crs)
+        if geometry is not None:
+            existing_geometry = None
+            if crs is not None and pd.api.types.is_hashable(geometry):
+                try:
+                    candidate = self[geometry]
+                except (KeyError, TypeError, ValueError):
+                    pass
+                else:
+                    if isinstance(candidate, sgpd.GeoSeries):
+                        existing_geometry = candidate
+
+            if existing_geometry is None:
+                self.set_geometry(geometry, inplace=True, crs=crs)
+            else:
+                # Updating the existing Spark column directly avoids index
+                # alignment, which would multiply rows for duplicate indexes.
+                normalized_crs = CRS.from_user_input(crs)
+                new_epsg = normalized_crs.to_epsg() or 0
+                geometry_field = with_crs_metadata(
+                    existing_geometry._internal.data_fields[0],
+                    normalized_crs,
+                )
+                geometry_column_name = (
+                    existing_geometry._internal.data_spark_column_names[0]
+                )
+                geometry_field = geometry_field.copy(name=geometry_column_name)
+                self._update_internal_frame(
+                    self._internal.with_new_spark_column(
+                        existing_geometry._column_label,
+                        stf.ST_SetSRID(
+                            existing_geometry.spark.column,
+                            new_epsg,
+                        ).alias(
+                            geometry_column_name,
+                            metadata=geometry_field.metadata,
+                        ),
+                        field=geometry_field,
+                    )
+                )
+                self._geometry_column_name = geometry
 
         if geometry is None and "geometry" in self.columns:
 
@@ -356,11 +873,47 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
             # No need to call set_geometry() here since it's already part of the df, just set the name.
             self._geometry_column_name = "geometry"
 
-        if geometry is None and crs:
+        if geometry is None and crs is not None:
             raise ValueError(
                 "Assigning CRS to a GeoDataFrame without a geometry column is not "
                 "supported. Supply geometry using the 'geometry=' keyword argument, "
                 "or by providing a DataFrame with column name 'geometry'",
+            )
+
+        if is_locally_owned:
+            active_position = self._active_geometry_position()
+            if active_position is not None:
+                active_field = self._internal.data_fields[active_position]
+
+                # An explicitly supplied CRS applies to the active geometry.
+                # For an array-like geometry argument, set_geometry() has
+                # already normalized and copied its own CRS metadata, so that
+                # state takes precedence over a column it may have replaced.
+                if crs is not None:
+                    local_geometry_crs[active_position] = crs
+                elif geometry_input is not None and not pd.api.types.is_hashable(
+                    geometry_input
+                ):
+                    has_metadata, active_crs = read_crs_metadata(active_field)
+                    if has_metadata:
+                        local_geometry_crs[active_position] = active_crs
+                elif (
+                    isinstance(active_field.spark_type, NullType)
+                    and not distributed_geometry
+                ):
+                    # A local active all-null column cannot be recognized as a
+                    # GeometryType by Spark, but its role as the active
+                    # geometry still makes its no-CRS state authoritative.
+                    local_geometry_crs.setdefault(active_position, None)
+
+            unknown_positions = (
+                {active_position}
+                if distributed_geometry and active_position is not None
+                else set()
+            )
+            self._set_local_geometry_crs_metadata(
+                local_geometry_crs,
+                unknown_positions=unknown_positions,
             )
 
     # ============================================================================
@@ -509,7 +1062,8 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         else:
             frame = self.copy()
 
-        geo_column_name = self._geometry_column_name
+        previous_geometry_name = self._geometry_column_name
+        geo_column_name = previous_geometry_name
         new_series = False
 
         if geo_column_name is None:
@@ -532,7 +1086,11 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
                 else:
                     level = col.rename(geo_column_name)
             else:
-                level = pspd.Series(col, name=geo_column_name)
+                # Construct directly from the local array-like data (rather than
+                # pre-wrapping into a bare pspd.Series) so GeoSeries.__init__ can
+                # tell this is locally owned data and record authoritative
+                # no-CRS metadata below when 'crs' isn't given.
+                level = sgpd.GeoSeries(col, name=geo_column_name)
 
             if not isinstance(level, sgpd.GeoSeries):
                 # Set the crs later, so we can allow_override=True
@@ -583,14 +1141,38 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
 
         # This operation throws a warning to the user asking them to set pspd.set_option('compute.ops_on_diff_frames', True)
         # to allow operations on different frames. We pass these warnings on to the user so they must manually set it themselves.
-        if crs:
+        if crs is not None:
             level.set_crs(crs, inplace=True, allow_override=True)
             new_series = True
 
         frame._geometry_column_name = geo_column_name
         if new_series:
-            # Note: This casts GeoSeries back into pspd.Series, so we lose any metadata that's not serialized.
+            # Assignment casts GeoSeries back into pspd.Series and can drop
+            # custom field metadata. Restore only the CRS marker from the
+            # normalized source Series on the assigned column.
             frame[geo_column_name] = level
+            assigned_geometry = frame[geo_column_name]
+            if isinstance(assigned_geometry, sgpd.GeoSeries):
+                frame._update_geometry_field(
+                    assigned_geometry,
+                    copy_crs_metadata(
+                        level._internal.data_fields[0],
+                        assigned_geometry._internal.data_fields[0],
+                    ),
+                )
+        elif isinstance(level, sgpd.GeoSeries) and isinstance(
+            level.spark.data_type, NullType
+        ):
+            # An all-null selected column has no geometry bytes from which an
+            # SRID could be inferred. Once selected as geometry, missing CRS
+            # metadata therefore means authoritative no-CRS.
+            level_field = level._internal.data_fields[0]
+            has_crs_metadata, _ = read_crs_metadata(level_field)
+            if not has_crs_metadata:
+                frame._update_geometry_field(
+                    level,
+                    with_crs_metadata(level_field, None),
+                )
 
         if not inplace:
             return frame
@@ -618,7 +1200,8 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
 
         Parameters
         ----------
-        col : new geometry column label
+        col : str
+            New name for the geometry column.
         inplace : boolean, default False
             Modify the GeoDataFrame in place (without creating a new object)
 
@@ -710,7 +1293,14 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
             else:
                 pd_df[col_name] = series._to_pandas()
 
-        return gpd.GeoDataFrame(pd_df, geometry=self._geometry_column_name)
+        result = gpd.GeoDataFrame(
+            pd_df,
+            geometry=self._geometry_column_name,
+            crs=self.crs if self._geometry_column_name is not None else None,
+        )
+        if self._geometry_column_name is None:
+            result._geometry_column_name = None
+        return result
 
     def to_spark_pandas(self) -> pspd.DataFrame:
         """
@@ -744,9 +1334,10 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         0  POINT (1 1)       2       3
         """
         # Note: The deep parameter is a dummy parameter just as it is in PySpark pandas.
-        return GeoDataFrame(
+        result = GeoDataFrame(
             pspd.DataFrame(self._internal.copy()), geometry=self.active_geometry_name
         )
+        return result
 
     def _safe_get_crs(self):
         """
@@ -768,14 +1359,40 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
 
     @property
     def crs(self):
+        """
+        The Coordinate Reference System (CRS) of the active geometry column.
+
+        Setting this property assigns the CRS to the active geometry column,
+        replacing any existing CRS, without transforming the coordinates. The
+        value can be anything accepted by
+        :meth:`pyproj.CRS.from_user_input() <pyproj.crs.CRS.from_user_input>`,
+        such as an authority string (eg "EPSG:4326") or a WKT string.
+
+        Returns
+        -------
+        pyproj.CRS or None
+            The CRS of the active geometry column, or None if it has no CRS.
+
+        See Also
+        --------
+        GeoDataFrame.set_crs : assign CRS
+        GeoDataFrame.to_crs : re-project to another CRS
+        """
         return self.geometry.crs
 
     @crs.setter
     def crs(self, value):
         # Since PySpark DataFrames are immutable, we can't modify in place, so we create the new GeoSeries and replace it.
-        self.geometry = self.geometry.set_crs(value)
+        self.geometry = self.geometry.set_crs(value, allow_override=True)
 
-    def set_crs(self, crs, inplace=False, allow_override=True):
+    @_support_legacy_set_crs_positionals
+    def set_crs(
+        self,
+        crs: Any | None = None,
+        epsg: int | None = None,
+        inplace: bool = False,
+        allow_override: bool = False,
+    ) -> GeoDataFrame:
         """
         Set the Coordinate Reference System (CRS) of the ``GeoDataFrame``.
 
@@ -789,6 +1406,10 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         The underlying geometries are not transformed to this CRS. To
         transform the geometries to a new CRS, use the ``to_crs`` method.
 
+        A boolean second positional argument is interpreted as ``inplace``
+        for compatibility with the former Sedona signature. This form is
+        deprecated; use keyword arguments instead.
+
         Parameters
         ----------
         crs : pyproj.CRS | None, optional
@@ -801,11 +1422,17 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
             If True, the CRS of the GeoDataFrame will be changed in place
             (while still returning the result) instead of making a copy of
             the GeoDataFrame.
-        allow_override : bool, default True
+        allow_override : bool, default False
             If the GeoDataFrame already has a CRS, allow to replace the
-            existing CRS, even when both are not equal. In Sedona, setting this to True
-            will lead to eager evaluation instead of lazy evaluation. Unlike Geopandas,
-            True is the default value in Sedona for performance reasons.
+            existing CRS, even when both are not equal. Validation uses column
+            metadata when available. Without it, validation performs a
+            distributed lookup of the first non-null geometry's SRID.
+
+        Returns
+        -------
+        GeoDataFrame
+            A new GeoDataFrame unless ``inplace=True``, in which case the
+            mutated original is returned.
 
         Examples
         --------
@@ -851,14 +1478,13 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         --------
         GeoDataFrame.to_crs : re-project to another CRS
         """
-        # Since PySpark DataFrames are immutable, we can't modify in place, so we create the new GeoSeries and replace it.
-        new_geometry = self.geometry.set_crs(crs, allow_override=allow_override)
-        if inplace:
-            self.geometry = new_geometry
-        else:
-            df = self.copy()
-            df.geometry = new_geometry
-            return df
+        df = self if inplace else self.copy()
+        df.geometry = df.geometry.set_crs(
+            crs=crs,
+            epsg=epsg,
+            allow_override=allow_override,
+        )
+        return df
 
     def to_crs(
         self,
@@ -952,6 +1578,35 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
             df.geometry = new_geometry
             return df
 
+    def estimate_utm_crs(self, datum_name: str = "WGS 84") -> CRS:
+        """Return the estimated UTM CRS based on the bounds of the dataset.
+
+        .. versionadded:: 2.0.0
+
+        Parameters
+        ----------
+        datum_name : str, optional
+            The name of the datum to use in the query. Default is ``"WGS 84"``.
+
+        Returns
+        -------
+        pyproj.CRS
+            The UTM coordinate reference system covering the center of the
+            active geometry column's bounds.
+
+        Notes
+        -----
+        Bounds are computed with one distributed aggregation. Only its four
+        aggregate values are materialized on the driver; geometry rows are not
+        collected.
+
+        See Also
+        --------
+        GeoDataFrame.to_crs
+        GeoSeries.estimate_utm_crs
+        """
+        return self.geometry.estimate_utm_crs(datum_name=datum_name)
+
     @classmethod
     def from_dict(
         cls,
@@ -960,13 +1615,195 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         crs: Any | None = None,
         **kwargs,
     ) -> GeoDataFrame:
-        raise NotImplementedError("from_dict() is not implemented yet.")
+        """Construct a GeoDataFrame from a dictionary.
+
+        .. versionadded:: 2.0.0
+
+        Parameters
+        ----------
+        data : dict
+            Dictionary of the form ``{field: array-like}`` or
+            ``{field: dict}``.
+        geometry : str or array-like, optional
+            If a string, the column to use as the active geometry. If an
+            array-like, it is added as the ``"geometry"`` column.
+        crs : str, dict, pyproj.CRS, optional
+            Coordinate reference system to assign to the resulting frame. The
+            coordinates are not transformed.
+        **kwargs
+            Additional arguments passed to :meth:`pandas.DataFrame.from_dict`,
+            such as ``orient`` or ``columns``.
+
+        Returns
+        -------
+        GeoDataFrame
+
+        Notes
+        -----
+        This constructor first materializes the dictionary in a local
+        GeoPandas GeoDataFrame on the driver, then distributes it with Spark.
+        It is intended for small in-memory inputs. For large datasets, create
+        a Spark DataFrame or use a distributed Sedona data source instead.
+
+        Once distributed, dictionary values follow Spark schema inference.
+        Each column must contain values that Spark can represent with one
+        compatible type.
+
+        Examples
+        --------
+        >>> from shapely.geometry import Point
+        >>> from sedona.spark.geopandas import GeoDataFrame
+        >>> data = {
+        ...     "name": ["first", "second"],
+        ...     "geometry": [Point(1, 2), Point(2, 1)],
+        ... }
+        >>> GeoDataFrame.from_dict(data, crs="EPSG:4326")
+             name     geometry
+        0   first  POINT (1 2)
+        1  second  POINT (2 1)
+        """
+        local = gpd.GeoDataFrame.from_dict(
+            data,
+            geometry=geometry,
+            crs=crs,
+            **kwargs,
+        )
+        return cls._from_local_geopandas(local)
+
+    @classmethod
+    def _from_local_geopandas(cls, local: gpd.GeoDataFrame) -> GeoDataFrame:
+        """Distribute a locally constructed GeoPandas frame safely."""
+        geometry_name = local._geometry_column_name
+        restore_order_column = None
+
+        # Spark 3 pandas-on-Spark only checks the first object value when
+        # looking for a user-defined type. Give every geometry column that has
+        # a value a representative in a temporary first row, then remove it
+        # and restore the original positional order.
+        if len(local) > 0:
+            inference_values = {}
+            for position, dtype in enumerate(local.dtypes):
+                if not isinstance(
+                    dtype, GeometryDtype
+                ) and not pd.api.types.is_object_dtype(dtype):
+                    continue
+                missing = local.iloc[:, position].isna().to_numpy()
+                non_missing = np.flatnonzero(~missing)
+                if missing[0] and len(non_missing) > 0:
+                    value = local.iloc[non_missing[0], position]
+                    if isinstance(dtype, GeometryDtype) or isinstance(
+                        value, BaseGeometry
+                    ):
+                        inference_values[position] = value
+
+            if inference_values:
+                local = local.copy()
+
+                base_name = "__sedona_local_row_order__"
+                suffix = 0
+                while True:
+                    name = base_name if suffix == 0 else f"{base_name}_{suffix}"
+                    if isinstance(local.columns, pd.MultiIndex):
+                        candidate = (name,) + ("",) * (local.columns.nlevels - 1)
+                    else:
+                        candidate = name
+                    if candidate not in local.columns:
+                        restore_order_column = candidate
+                        break
+                    suffix += 1
+
+                local[restore_order_column] = np.arange(len(local))
+                inference_row = local.iloc[[0]].copy()
+                inference_row[restore_order_column] = -1
+                for position, value in inference_values.items():
+                    inference_row.iat[0, position] = value
+                local = pd.concat([inference_row, local])
+
+        # Avoid pandas 1.5 sharing geometry blocks with the local GeoDataFrame;
+        # the constructor casts those blocks to object dtype for Spark.
+        result = cls(local, copy=True)
+        if restore_order_column is not None:
+            result = result[result[restore_order_column] >= 0]
+            result.sort_values(restore_order_column, inplace=True)
+            result = cls(result.drop(columns=[restore_order_column]))
+            result._geometry_column_name = geometry_name
+        return result
 
     @classmethod
     def from_features(
-        cls, features, crs: Any | None = None, columns: Iterable[str] | None = None
+        cls,
+        features,
+        crs: Any | None = None,
+        columns: typing.Iterable[str] | None = None,
     ) -> GeoDataFrame:
-        raise NotImplementedError("from_features() is not implemented yet.")
+        """Construct a GeoDataFrame from GeoJSON-like features.
+
+        .. versionadded:: 2.0.0
+
+        Parameters
+        ----------
+        features
+            An iterable of feature mappings or objects implementing
+            ``__geo_interface__``; a FeatureCollection dictionary; or an object
+            whose ``__geo_interface__`` is a FeatureCollection.
+        crs : str, dict, pyproj.CRS, optional
+            Coordinate reference system to assign to the resulting frame. The
+            coordinates are not transformed.
+        columns : iterable of str, optional
+            Column names to include and their order in the resulting frame.
+
+        Returns
+        -------
+        GeoDataFrame
+
+        Notes
+        -----
+        This constructor first materializes all features in a local GeoPandas
+        GeoDataFrame on the driver. It is intended for small in-memory feature
+        collections. For large datasets, use Sedona's distributed GeoJSON or
+        GeoParquet Spark data source instead.
+
+        GeoPandas controls feature parsing and column selection; feature ``id``,
+        ``bbox``, and collection metadata are not added as columns. Once the
+        result is distributed, property values follow Spark schema inference:
+        nested mappings become structs, and columns with incompatible mixed
+        types are not supported.
+
+        Examples
+        --------
+        >>> from sedona.spark.geopandas import GeoDataFrame
+        >>> feature_collection = {
+        ...     "type": "FeatureCollection",
+        ...     "features": [
+        ...         {
+        ...             "type": "Feature",
+        ...             "properties": {"name": "first"},
+        ...             "geometry": {
+        ...                 "type": "Point",
+        ...                 "coordinates": (1.0, 2.0),
+        ...             },
+        ...         },
+        ...         {
+        ...             "type": "Feature",
+        ...             "properties": {"name": "second"},
+        ...             "geometry": {
+        ...                 "type": "Point",
+        ...                 "coordinates": (2.0, 1.0),
+        ...             },
+        ...         },
+        ...     ],
+        ... }
+        >>> GeoDataFrame.from_features(feature_collection)
+              geometry    name
+        0  POINT (1 2)   first
+        1  POINT (2 1)  second
+        """
+        local = gpd.GeoDataFrame.from_features(
+            features,
+            crs=crs,
+            columns=columns,
+        )
+        return cls._from_local_geopandas(local)
 
     @classmethod
     def from_postgis(
@@ -1016,7 +1853,8 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
             columns. This can be used to control the behavior of the conversion of the
             non-geometry columns to a pandas DataFrame. For example, you can use this
             to control the dtype conversion of the columns. By default, the `to_pandas`
-            method is called with no additional arguments.
+            method is called with no additional arguments. Requires GeoPandas 1.1 or
+            newer when provided.
 
         Returns
         -------
@@ -1045,12 +1883,13 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         1    POLYGON ((0 0, 1 1, 0 1, 0 0))    2      b
         2      LINESTRING (0 0, -1 1, 0 -1)    3      c
         """
-        if to_pandas_kwargs is None:
-            to_pandas_kwargs = {}
+        kwargs: dict[str, Any] = {"geometry": geometry}
+        if to_pandas_kwargs is not None:
+            if parse_version(gpd.__version__) < parse_version("1.1.0"):
+                raise NotImplementedError("to_pandas_kwargs requires GeoPandas >= 1.1")
+            kwargs["to_pandas_kwargs"] = to_pandas_kwargs
 
-        gpd_df = gpd.GeoDataFrame.from_arrow(
-            table, geometry=geometry, **to_pandas_kwargs
-        )
+        gpd_df = gpd.GeoDataFrame.from_arrow(table, **kwargs)
         return GeoDataFrame(gpd_df)
 
     def to_json(
@@ -1132,11 +1971,286 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
     ) -> dict:
         raise NotImplementedError("to_geo_dict() is not implemented yet.")
 
-    def to_wkb(self, hex: bool = False, **kwargs) -> pd.DataFrame:
-        raise NotImplementedError("to_wkb() is not implemented yet.")
+    def _serialize_geometry_columns(
+        self,
+        serializer: Callable[[Column], Column],
+        output_type: DataType,
+    ) -> pspd.DataFrame:
+        """Apply a native serializer to every geometry-typed column."""
+        # Resolve pending index/data expressions onto one Spark frame before
+        # building the serializer projection.
+        internal = self._internal.resolved_copy
+        serialized_columns = []
+        geometry_columns = []
 
-    def to_wkt(self, **kwargs) -> pd.DataFrame:
-        raise NotImplementedError("to_wkt() is not implemented yet.")
+        # Build one projection for the whole frame. Sequential assignment would
+        # align each replacement Series and can multiply duplicate-index rows.
+        for spark_column, spark_name, field in zip(
+            internal.data_spark_columns,
+            internal.data_spark_column_names,
+            internal.data_fields,
+        ):
+            is_geometry = isinstance(field.spark_type, GeometryType)
+            geometry_columns.append(is_geometry)
+            serialized_columns.append(
+                serializer(spark_column).alias(spark_name)
+                if is_geometry
+                else spark_column
+            )
+
+        output_sdf = internal.spark_frame.select(
+            *[
+                scol_for(internal.spark_frame, name)
+                for name in internal.index_spark_column_names
+            ],
+            *serialized_columns,
+            scol_for(internal.spark_frame, NATURAL_ORDER_COLUMN_NAME),
+        )
+        output_schema = output_sdf.schema
+        output_fields = [
+            (
+                field.copy(
+                    dtype=np.dtype("object"),
+                    spark_type=output_type,
+                    nullable=output_schema[spark_name].nullable,
+                    metadata={},
+                )
+                if is_geometry
+                else field
+            )
+            for spark_name, field, is_geometry in zip(
+                internal.data_spark_column_names,
+                internal.data_fields,
+                geometry_columns,
+            )
+        ]
+        result_internal = internal.copy(
+            spark_frame=output_sdf,
+            index_spark_columns=[
+                scol_for(output_sdf, name) for name in internal.index_spark_column_names
+            ],
+            data_spark_columns=[
+                scol_for(output_sdf, name) for name in internal.data_spark_column_names
+            ],
+            data_fields=output_fields,
+        )
+        return PandasOnSparkDataFrame(result_internal)
+
+    def _active_geometry_position(self) -> int | None:
+        """Return the active geometry's physical data-column position."""
+        if self._geometry_column_name is None:
+            return None
+
+        try:
+            active_spark_name = self.geometry._internal.data_spark_column_names[0]
+        except (KeyError, MissingGeometryColumnError):
+            return None
+
+        try:
+            return self._internal.data_spark_column_names.index(active_spark_name)
+        except ValueError:
+            return None
+
+    def _update_geometry_field(
+        self,
+        geometry: sgpd.GeoSeries,
+        field: InternalField,
+        geometry_column: Column | None = None,
+    ) -> None:
+        """Replace one geometry field while preserving its public identity."""
+        geometry_column_name = geometry._internal.data_spark_column_names[0]
+        field = field.copy(name=geometry_column_name)
+        if geometry_column is None:
+            geometry_column = geometry.spark.column
+        self._update_internal_frame(
+            self._internal.with_new_spark_column(
+                geometry._column_label,
+                geometry_column.alias(
+                    geometry_column_name,
+                    metadata=field.metadata,
+                ),
+                field=field,
+            )
+        )
+
+    def _set_local_geometry_crs_metadata(
+        self,
+        column_crs: dict[int, Any | None],
+        *,
+        unknown_positions: set[int],
+    ) -> None:
+        """Restore authoritative per-column CRS state for local inputs.
+
+        ``column_crs`` is keyed by physical position because public labels can
+        be duplicated or multi-level. Membership records geometry provenance;
+        a value of ``None`` is therefore distinct from a non-geometry column.
+
+        All changes are made in one projection. Updating separately projected
+        Series would cross pandas-on-Spark anchors and could align on duplicate
+        indexes, multiplying rows.
+        """
+        internal = self._internal.resolved_copy
+
+        needs_update = False
+        output_columns = []
+        output_fields = []
+        for position, (spark_column, spark_name, field) in enumerate(
+            zip(
+                internal.data_spark_columns,
+                internal.data_spark_column_names,
+                internal.data_fields,
+            )
+        ):
+            has_crs_metadata, _ = read_crs_metadata(field)
+            if position in unknown_positions:
+                target_crs = None
+                should_update = False
+            elif position in column_crs:
+                target_crs = column_crs[position]
+                should_update = True
+            elif isinstance(field.spark_type, GeometryType) and not has_crs_metadata:
+                # GeometryType columns inferred from local Python objects have
+                # authoritative no-CRS provenance even without a GeometryArray.
+                target_crs = None
+                should_update = True
+            else:
+                target_crs = None
+                should_update = False
+
+            if should_update:
+                needs_update = True
+                if target_crs is not None:
+                    normalized_crs = CRS.from_user_input(target_crs)
+                    spark_column = stf.ST_SetSRID(
+                        spark_column,
+                        normalized_crs.to_epsg() or 0,
+                    )
+                field = with_crs_metadata(field, target_crs).copy(name=spark_name)
+                spark_column = spark_column.alias(spark_name, metadata=field.metadata)
+            output_columns.append(spark_column)
+            output_fields.append(field)
+
+        if not needs_update:
+            return
+
+        output_sdf = internal.spark_frame.select(
+            *[
+                scol_for(internal.spark_frame, name)
+                for name in internal.index_spark_column_names
+            ],
+            *output_columns,
+            scol_for(internal.spark_frame, NATURAL_ORDER_COLUMN_NAME),
+        )
+        output_schema = output_sdf.schema
+        output_fields = [
+            field.copy(
+                spark_type=output_schema[spark_name].dataType,
+                nullable=output_schema[spark_name].nullable,
+            )
+            for spark_name, field in zip(
+                internal.data_spark_column_names,
+                output_fields,
+            )
+        ]
+        result_internal = internal.copy(
+            spark_frame=output_sdf,
+            index_spark_columns=[
+                scol_for(output_sdf, name) for name in internal.index_spark_column_names
+            ],
+            data_spark_columns=[
+                scol_for(output_sdf, name) for name in internal.data_spark_column_names
+            ],
+            data_fields=output_fields,
+        )
+        self._update_internal_frame(result_internal)
+
+    @staticmethod
+    def _validate_serialization_kwargs(method_name: str, kwargs: dict) -> None:
+        if kwargs:
+            names = ", ".join(sorted(kwargs))
+            raise NotImplementedError(
+                f"GeoDataFrame.{method_name}() does not support Shapely keyword "
+                f"arguments in distributed execution: {names}"
+            )
+
+    def to_wkb(self, hex: bool = False, **kwargs) -> pspd.DataFrame:
+        """
+        Encode all geometry columns in the GeoDataFrame to WKB.
+
+        Parameters
+        ----------
+        hex : bool, default False
+            If True, export WKB values as hexadecimal strings. By default,
+            values are returned as binary objects.
+        **kwargs
+            Shapely-specific serialization options are not supported by the
+            distributed implementation and raise ``NotImplementedError``.
+
+        Returns
+        -------
+        pyspark.pandas.DataFrame
+            A distributed DataFrame with every geometry-typed column encoded
+            as WKB and all other columns unchanged.
+
+        Notes
+        -----
+        Duplicate column labels remain subject to pandas-on-Spark's DataFrame
+        construction restrictions.
+
+        Unlike GeoPandas, this method returns a lazy pandas-on-Spark DataFrame.
+        Call ``to_pandas()`` on the result to materialize a local pandas
+        DataFrame.
+
+        See Also
+        --------
+        GeoDataFrame.to_wkt
+        GeoSeries.to_wkb
+        """
+        self._validate_serialization_kwargs("to_wkb", kwargs)
+        serializer, output_type = (
+            (lambda geometry: F.hex(stf.ST_AsBinary(geometry)), StringType())
+            if hex
+            else (stf.ST_AsBinary, BinaryType())
+        )
+        return self._serialize_geometry_columns(serializer, output_type)
+
+    def to_wkt(self, **kwargs) -> pspd.DataFrame:
+        """
+        Encode all geometry columns in the GeoDataFrame to WKT.
+
+        Parameters
+        ----------
+        **kwargs
+            Shapely-specific serialization options are not supported by the
+            distributed implementation and raise ``NotImplementedError``.
+
+        Returns
+        -------
+        pyspark.pandas.DataFrame
+            A distributed DataFrame with every geometry-typed column encoded
+            as WKT and all other columns unchanged.
+
+        Notes
+        -----
+        Duplicate column labels remain subject to pandas-on-Spark's DataFrame
+        construction restrictions.
+
+        Unlike GeoPandas, this method returns a lazy pandas-on-Spark DataFrame.
+        Call ``to_pandas()`` on the result to materialize a local pandas
+        DataFrame.
+
+        Sedona's native WKT writer preserves stored coordinate precision.
+        GeoPandas delegates to Shapely, whose default writer rounds coordinates
+        to six decimal places. Shapely-specific formatting keyword arguments
+        are not supported here.
+
+        See Also
+        --------
+        GeoDataFrame.to_wkb
+        GeoSeries.to_wkt
+        """
+        self._validate_serialization_kwargs("to_wkt", kwargs)
+        return self._serialize_geometry_columns(stf.ST_AsText, StringType())
 
     def to_arrow(
         self,
@@ -1147,27 +2261,24 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         include_z: bool | None = None,
     ):
         """Encode a GeoDataFrame to GeoArrow format.
-        See https://geoarrow.org/ for details on the GeoArrow specification.
-        This function returns a generic Arrow data object implementing
-        the `Arrow PyCapsule Protocol`_ (i.e. having an ``__arrow_c_stream__``
-        method). This object can then be consumed by your Arrow implementation
-        of choice that supports this protocol.
-        .. _Arrow PyCapsule Protocol: https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html
 
-        Note: Requires geopandas versions >= 1.0.0 to use with Sedona.
+        See https://geoarrow.org/ for details on the GeoArrow specification.
+        This function returns a generic Arrow data object implementing the
+        `Arrow PyCapsule Protocol <https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html>`_
+        (i.e. having an ``__arrow_c_stream__`` method). This object can then be
+        consumed by your Arrow implementation of choice that supports this protocol.
+
+        Requires GeoPandas 1.0.0 or later.
 
         Parameters
         ----------
         index : bool, default None
             If ``True``, always include the dataframe's index(es) as columns
-            in the file output.
-            If ``False``, the index(es) will not be written to the file.
-            If ``None``, the index(ex) will be included as columns in the file
-            output except `RangeIndex` which is stored as metadata only.
-
-            Note: Unlike in geopandas, ``None`` will include the index in the column because Sedona always
-            converts `RangeIndex` into a general `Index`.
-
+            in the output.
+            If ``False``, the index(es) will not be included.
+            If ``None``, the index(es) are included as columns. Unlike GeoPandas,
+            this also applies to a ``RangeIndex``, because Sedona always converts
+            it into a general ``Index``.
         geometry_encoding : {'WKB', 'geoarrow' }, default 'WKB'
             The GeoArrow encoding to use for the data conversion.
         interleaved : bool, default True
@@ -1234,7 +2345,62 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         schema_version=None,
         **kwargs,
     ):
-        raise NotImplementedError("to_feather() is not implemented yet.")
+        """Write a GeoDataFrame to the Feather format.
+
+        Any geometry columns present are serialized to WKB format in the file.
+
+        Feather is a single-file format with no distributed writer, so this
+        collects the entire GeoDataFrame to the driver and delegates to GeoPandas.
+        It should only be used if the resulting GeoDataFrame is expected to be small.
+
+        Requires 'pyarrow' >= 0.17.
+
+        Parameters
+        ----------
+        path : str, path object
+            Local file path to write to.
+        index : bool, default None
+            If ``True``, always include the dataframe's index(es) as columns
+            in the file output.
+            If ``False``, the index(es) will not be written to the file.
+            If ``None``, the index(es) are written as columns. Unlike GeoPandas,
+            this also applies to a ``RangeIndex``, because Sedona always converts
+            it into a general ``Index``.
+        compression : {'zstd', 'lz4', 'uncompressed'}, optional
+            Name of the compression to use. Use ``"uncompressed"`` for no
+            compression. By default uses LZ4 if available, otherwise uncompressed.
+        schema_version : {'0.1.0', '0.4.0', '1.0.0', '1.1.0', None}
+            GeoParquet specification version; if not provided will default to
+            latest supported stable version.
+        **kwargs
+            Additional keyword arguments passed to
+            :func:`pyarrow.feather.write_feather`.
+
+        Examples
+        --------
+        >>> from sedona.spark.geopandas import GeoDataFrame
+        >>> from shapely.geometry import Point
+        >>> gdf = GeoDataFrame({"geometry": [Point(0, 0), Point(1, 1)], "value": [1, 2]})
+        >>> gdf.to_feather("data.feather")  # doctest: +SKIP
+
+        See Also
+        --------
+        GeoDataFrame.to_parquet : write GeoDataFrame to parquet
+        GeoDataFrame.to_file : write GeoDataFrame to file
+        """
+        # Feather has no distributed writer, so we rely on GeoPandas's implementation,
+        # the same way to_arrow() does. This also gets us all of GeoPandas's kwargs for free.
+        log_advice(
+            "`to_feather` loads all data into the driver's memory. "
+            "It should only be used if the resulting geopandas GeoDataFrame is expected to be small."
+        )
+        self.to_geopandas().to_feather(
+            path,
+            index=index,
+            compression=compression,
+            schema_version=schema_version,
+            **kwargs,
+        )
 
     @property
     def type(self):
@@ -1252,6 +2418,9 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
 
         Parameters
         ----------
+        *args
+            Positional arguments passed to :meth:`geopandas.GeoDataFrame.plot`,
+            in the order of the options below.
         column : str, np.array, pd.Series, pd.Index (default None)
             The name of the dataframe column, np.array, pd.Series, or pd.Index
             to be plotted. If np.array, pd.Series, or pd.Index are used then it
@@ -1350,6 +2519,9 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
             Style options to be passed on to the actual plot function, such
             as ``edgecolor``, ``facecolor``, ``linewidth``, ``markersize``,
             ``alpha``.
+        **kwargs
+            Keyword arguments passed to :meth:`geopandas.GeoDataFrame.plot`,
+            including the options above.
 
         Returns
         -------
@@ -1372,9 +2544,597 @@ class GeoDataFrame(GeoFrame, pspd.DataFrame):
         """
         return self.to_geopandas().plot(*args, **kwargs)
 
+    def explode(
+        self,
+        column=None,
+        ignore_index: bool = False,
+        index_parts: bool = False,
+        **kwargs,
+    ) -> GeoDataFrame:
+        """Explode multi-part geometries into separate rows.
+
+        Attribute columns remain alongside every geometry part. The operation
+        uses Sedona's native ``ST_Dump`` expression and remains distributed.
+        Preserving row and part order while rebuilding the distributed index
+        requires a global sort and shuffle.
+
+        Parameters
+        ----------
+        column : column label, default None
+            Column to explode. ``None`` selects the active geometry column. As
+            in GeoPandas, selecting any geometry-typed column explodes the
+            active geometry column; selecting a non-geometry column delegates
+            to pandas-on-Spark.
+        ignore_index : bool, default False
+            If True, label the result index 0, 1, ..., n - 1 and ignore
+            ``index_parts``.
+        index_parts : bool, default False
+            If True, append a zero-based index level identifying each geometry
+            produced from an input row. Ignored when exploding a non-geometry
+            column, matching GeoPandas.
+        **kwargs
+            Additional keyword arguments are forwarded when exploding a
+            non-geometry column.
+
+        Returns
+        -------
+        GeoDataFrame
+            A distributed GeoDataFrame with one row per geometry part.
+
+        Examples
+        --------
+        >>> from sedona.spark.geopandas import GeoDataFrame
+        >>> from shapely.geometry import MultiPoint
+        >>> gdf = GeoDataFrame(
+        ...     {
+        ...         "name": ["a", "b"],
+        ...         "geometry": [
+        ...             MultiPoint([(0, 0), (1, 1)]),
+        ...             MultiPoint([(2, 2), (3, 3)]),
+        ...         ],
+        ...     }
+        ... )
+        >>> gdf.explode(index_parts=True)
+            name     geometry
+        0 0    a  POINT (0 0)
+          1    a  POINT (1 1)
+        1 0    b  POINT (2 2)
+          1    b  POINT (3 3)
+        """
+        if column is None:
+            column = self.geometry.name
+
+        selected = self[column]
+        if not isinstance(selected, sgpd.GeoSeries):
+            exploded = super().explode(
+                column,
+                ignore_index=ignore_index,
+                **kwargs,
+            )
+            return _as_geodataframe_with_geometry(
+                exploded,
+                self._geometry_column_name,
+            )
+
+        # GeoPandas explodes the active geometry even when ``column`` names a
+        # different geometry-typed column. Preserve that compatibility quirk.
+        geometry_label = self.geometry._column_label
+        geometry_position = self._internal.column_labels.index(geometry_label)
+        result_internal = expand_geometry_column(
+            self._internal,
+            geometry_position=geometry_position,
+            array_builder=stf.ST_Dump,
+            ignore_index=ignore_index,
+            index_parts=index_parts,
+            temp_prefix="frame_explode",
+        )
+        # GeoPandas rebuilds a geometry explode by dropping the active column
+        # and adding it back after the attributes, so keep that output order.
+        data_order = [
+            position
+            for position in range(len(result_internal.column_labels))
+            if position != geometry_position
+        ] + [geometry_position]
+        result_internal = result_internal.copy(
+            column_labels=[result_internal.column_labels[i] for i in data_order],
+            data_spark_columns=[
+                result_internal.data_spark_columns[i] for i in data_order
+            ],
+            data_fields=[result_internal.data_fields[i] for i in data_order],
+        )
+        return _as_geodataframe_with_geometry(
+            PandasOnSparkDataFrame(result_internal),
+            self._geometry_column_name,
+        )
+
+    def dissolve(
+        self,
+        by=None,
+        aggfunc="first",
+        as_index: bool = True,
+        level=None,
+        sort: bool = True,
+        observed: bool = False,
+        dropna: bool = True,
+        method: Literal["unary", "coverage", "disjoint_subset"] = "unary",
+        grid_size=None,
+        **kwargs,
+    ) -> GeoDataFrame:
+        """Dissolve geometries within groups using distributed aggregation.
+
+        Geometry unions are evaluated by Sedona's ``ST_Union_Aggr`` aggregate.
+        Attribute columns use validated native Spark aggregate expressions and
+        therefore remain distributed as well.
+
+        Parameters
+        ----------
+        by : column label or list of column labels, default None
+            Columns defining the groups. ``None`` dissolves all rows into one
+            group. Arbitrary driver-side grouping vectors are not supported.
+        aggfunc : str, callable, list, or dict, default "first"
+            Aggregation(s) for non-geometry columns. ``first``, ``last``, and
+            ``count`` support every Spark data type. ``nunique`` supports
+            numeric, boolean, and string columns. ``min``, ``max``, ``sum``,
+            ``mean``, ``median``, ``std``, and ``var`` support numeric and
+            boolean columns. String ``sum`` and every ``prod`` aggregation are
+            not supported.
+        as_index : bool, default True
+            Place grouping columns in the result index.
+        level : int, name, or sequence, default None
+            Group by one or more input index levels. When supplied, ``level``
+            takes precedence over ``by``, matching pandas.
+        sort : bool, default True
+            Sort group keys. With ``False``, groups follow first occurrence.
+            Preserving that order still requires a distributed sort by each
+            group's first source-row position.
+        observed : bool, default False
+            For categorical groupers, ``True`` returns observed groups.
+            Materializing unobserved categorical combinations is unsupported.
+        dropna : bool, default True
+            Drop null grouping keys when true.
+        method : {"unary"}, default "unary"
+            Union algorithm. Sedona currently supports only the robust unary
+            union for this API.
+        grid_size : None, default None
+            Fixed-precision union is not currently supported.
+        **kwargs
+            ``numeric_only`` is supported for non-dict aggregations.
+
+        Returns
+        -------
+        GeoDataFrame
+            A distributed GeoDataFrame with one row per group.
+
+        Examples
+        --------
+        >>> from sedona.spark.geopandas import GeoDataFrame
+        >>> from shapely.geometry import Point
+        >>> gdf = GeoDataFrame(
+        ...     {
+        ...         "zone": ["a", "a", "b"],
+        ...         "value": [1, 2, 3],
+        ...         "geometry": [Point(0, 0), Point(1, 1), Point(5, 5)],
+        ...     },
+        ...     crs="EPSG:4326",
+        ... )
+        >>> gdf.dissolve("zone", aggfunc="sum").sort_index()
+                                  geometry  value
+        zone
+        a     MULTIPOINT ((0 0), (1 1))      3
+        b                   POINT (5 5)      3
+
+        Notes
+        -----
+        Python row UDFs are not used. Callable aliases are limited to built-in
+        ``min``, ``max``, and ``sum``, plus NumPy ``amin``, ``amax``, ``min``,
+        ``max``, ``sum``, ``mean``, ``median``, ``std``, and ``var``.
+        ``first`` and ``last`` follow source row order and skip null and NaN
+        values. Numeric and boolean ``sum`` use pandas' zero identity for an
+        all-null group; boolean sums are returned as integers and boolean
+        statistical aggregations as floating-point values.
+
+        GeoPandas flattens multiple aggregation labels into a one-level object
+        index containing tuples. pandas-on-Spark cannot represent tuple-valued
+        labels in a one-level column index, so Sedona keeps those results as a
+        two-level ``MultiIndex`` and uses ``(geometry_name, "")`` for the
+        active geometry label.
+        """
+        if method != "unary":
+            raise NotImplementedError(
+                "Sedona dissolve currently supports only method='unary'."
+            )
+        if grid_size is not None:
+            raise NotImplementedError(
+                "Sedona dissolve does not support the grid_size argument."
+            )
+
+        unsupported_kwargs = set(kwargs) - {"numeric_only"}
+        if unsupported_kwargs:
+            unsupported = ", ".join(sorted(unsupported_kwargs))
+            raise NotImplementedError(
+                f"Sedona dissolve does not support aggregation keyword(s): {unsupported}."
+            )
+        numeric_only = kwargs.get("numeric_only", False)
+        if not isinstance(numeric_only, (bool, np.bool_)):
+            raise TypeError("numeric_only must be a boolean")
+        if isinstance(aggfunc, dict) and "numeric_only" in kwargs:
+            raise NotImplementedError(
+                "Sedona dissolve supports numeric_only only with non-dict "
+                "aggregations."
+            )
+
+        internal = self._internal.resolved_copy
+        if internal.column_labels_level != 1:
+            raise NotImplementedError(
+                "Sedona dissolve does not yet support MultiIndex columns."
+            )
+
+        geometry_label = self.geometry._column_label
+
+        groupers = _resolve_dissolve_groupers(
+            self,
+            internal,
+            geometry_label,
+            by,
+            level,
+            observed,
+        )
+        group_expressions = groupers.expressions
+        group_fields = groupers.fields
+        group_index_names = groupers.index_names
+        grouped_column_labels = groupers.column_labels
+
+        normalized_aggfunc = _normalize_dissolve_aggfunc(aggfunc)
+        available_attribute_labels = [
+            label for label in internal.column_labels if label != geometry_label
+        ]
+        if isinstance(normalized_aggfunc, dict):
+            if not normalized_aggfunc:
+                raise ValueError("No objects to concatenate")
+            missing_keys = [
+                key
+                for key in normalized_aggfunc
+                if (key,) not in available_attribute_labels
+            ]
+            if missing_keys:
+                missing = ", ".join(repr(key) for key in missing_keys)
+                raise KeyError(f"Column(s) [{missing}] do not exist")
+            # A grouping column is excluded from a normal aggregation, but a
+            # dict can request it explicitly, as pandas GroupBy.agg allows.
+            attribute_labels = available_attribute_labels
+        else:
+            attribute_labels = [
+                label
+                for label in available_attribute_labels
+                if label not in grouped_column_labels
+            ]
+        if numeric_only and not isinstance(aggfunc, dict):
+            attribute_labels = [
+                label
+                for label in attribute_labels
+                if pd.api.types.is_numeric_dtype(internal.field_for(label).dtype)
+            ]
+
+        aggregation_specs = []
+        if isinstance(normalized_aggfunc, dict):
+            result_column_levels = (
+                2
+                if any(
+                    isinstance(functions, list)
+                    for functions in normalized_aggfunc.values()
+                )
+                else 1
+            )
+            for key, functions in normalized_aggfunc.items():
+                source_label = (key,)
+                field = internal.field_for(source_label)
+                function_names = (
+                    functions if isinstance(functions, list) else [functions]
+                )
+                for function_name in function_names:
+                    result_label = (
+                        (key, function_name)
+                        if result_column_levels == 2
+                        else source_label
+                    )
+                    aggregation_specs.append(
+                        (source_label, field, function_name, result_label)
+                    )
+        else:
+            function_names = (
+                normalized_aggfunc
+                if isinstance(normalized_aggfunc, list)
+                else [normalized_aggfunc]
+            )
+            if not function_names:
+                raise ValueError("No objects to concatenate")
+            result_column_levels = 2 if isinstance(normalized_aggfunc, list) else 1
+            for source_label in attribute_labels:
+                field = internal.field_for(source_label)
+                for function_name in function_names:
+                    result_label = (
+                        (source_label[0], function_name)
+                        if result_column_levels == 2
+                        else source_label
+                    )
+                    aggregation_specs.append(
+                        (source_label, field, function_name, result_label)
+                    )
+
+        if isinstance(normalized_aggfunc, list) and not aggregation_specs:
+            raise ValueError("No objects to concatenate")
+        if isinstance(normalized_aggfunc, dict) and not aggregation_specs:
+            # GeoPandas treats a non-empty dict containing only empty
+            # function lists as a geometry-only aggregation.
+            result_column_levels = 1
+
+        source_sdf = internal.spark_frame
+        group_column_names = [
+            SPARK_INDEX_NAME_FORMAT(position)
+            for position in range(len(group_expressions))
+        ]
+        geometry_input_name = "__dissolve_geometry_input__"
+        order_input_name = "__dissolve_order_input__"
+        geometry_output_name = "__dissolve_geometry_output__"
+        order_output_spark_name = "__dissolve_group_order__"
+
+        attribute_input_names = {}
+        attribute_input_columns = []
+        for source_label, _, _, _ in aggregation_specs:
+            if source_label not in attribute_input_names:
+                input_name = (
+                    f"__dissolve_attribute_input_{len(attribute_input_names)}__"
+                )
+                attribute_input_names[source_label] = input_name
+                attribute_input_columns.append(
+                    internal.spark_column_for(source_label).alias(input_name)
+                )
+
+        aggregation_input = source_sdf.select(
+            *[
+                expression.alias(group_name)
+                for expression, group_name in zip(
+                    group_expressions,
+                    group_column_names,
+                )
+            ],
+            internal.spark_column_for(geometry_label).alias(geometry_input_name),
+            scol_for(source_sdf, NATURAL_ORDER_COLUMN_NAME).alias(order_input_name),
+            *attribute_input_columns,
+        )
+
+        attribute_output_names = [
+            f"__dissolve_attribute_{position}__"
+            for position in range(len(aggregation_specs))
+        ]
+        attribute_aggregations = [
+            _dissolve_aggregation_expression(
+                F.col(attribute_input_names[source_label]),
+                field,
+                function_name,
+                F.col(order_input_name),
+                source_label[0],
+            ).alias(output_name)
+            for (
+                source_label,
+                field,
+                function_name,
+                _,
+            ), output_name in zip(aggregation_specs, attribute_output_names)
+        ]
+
+        # CRS lookup is eager. Keep it after all aggregation validation so
+        # unsupported function/dtype combinations fail before Spark executes.
+        crs = self.crs
+        srid = crs.to_epsg() if crs is not None else 0
+        geometry_union = sta.ST_Union_Aggr(F.col(geometry_input_name))
+        if hasattr(gpd.GeoSeries, "union_all"):
+            # GeoPandas 1.0 changed an all-null union from None to an empty
+            # GeometryCollection. Preserve its CRS in that representation.
+            empty_geometry = stc.ST_GeomFromWKT(
+                F.lit("GEOMETRYCOLLECTION EMPTY"),
+                srid or 0,
+            )
+            geometry_union = F.coalesce(geometry_union, empty_geometry)
+        aggregated_sdf = aggregation_input.groupBy(*group_column_names).agg(
+            geometry_union.alias(geometry_output_name),
+            F.min(F.col(order_input_name)).alias(order_output_spark_name),
+            *attribute_aggregations,
+        )
+        if dropna:
+            aggregated_sdf = aggregated_sdf.dropna(subset=group_column_names)
+
+        result_labels = _build_dissolve_result_labels(
+            internal,
+            geometry_label,
+            aggregation_specs,
+            result_column_levels,
+        )
+
+        result_internal = InternalFrame(
+            spark_frame=aggregated_sdf,
+            index_spark_columns=[
+                scol_for(aggregated_sdf, name) for name in group_column_names
+            ],
+            index_names=group_index_names,
+            index_fields=[
+                (
+                    field.copy(name=name)
+                    if field is not None
+                    else InternalField.from_struct_field(aggregated_sdf.schema[name])
+                )
+                for field, name in zip(group_fields, group_column_names)
+            ],
+            column_labels=[
+                result_labels.geometry_label,
+                result_labels.order_label,
+                *result_labels.attribute_labels,
+            ],
+            data_spark_columns=[
+                scol_for(aggregated_sdf, geometry_output_name),
+                scol_for(aggregated_sdf, order_output_spark_name),
+                *[scol_for(aggregated_sdf, name) for name in attribute_output_names],
+            ],
+            data_fields=[
+                copy_crs_metadata(
+                    self.geometry._internal.data_fields[0],
+                    InternalField(
+                        np.dtype("object"),
+                        aggregated_sdf.schema[geometry_output_name],
+                    ),
+                ),
+                InternalField.from_struct_field(
+                    aggregated_sdf.schema[order_output_spark_name]
+                ),
+                *[
+                    (
+                        InternalField(field.dtype, aggregated_sdf.schema[name])
+                        if function_name in {"first", "last", "min", "max"}
+                        else InternalField.from_struct_field(
+                            aggregated_sdf.schema[name]
+                        )
+                    )
+                    for (
+                        _,
+                        field,
+                        function_name,
+                        _,
+                    ), name in zip(aggregation_specs, attribute_output_names)
+                ],
+            ],
+            column_label_names=result_labels.column_label_names,
+        )
+        aggregated = _as_geodataframe_with_geometry(
+            PandasOnSparkDataFrame(result_internal),
+            result_labels.geometry_name,
+        )
+
+        if sort:
+            aggregated = _as_geodataframe_with_geometry(
+                aggregated.sort_index(na_position="last"),
+                result_labels.geometry_name,
+            )
+        else:
+            aggregated = _as_geodataframe_with_geometry(
+                aggregated.sort_values(result_labels.order_name),
+                result_labels.geometry_name,
+            )
+
+        aggregated = _as_geodataframe_with_geometry(
+            aggregated.drop(columns=[result_labels.order_name]),
+            result_labels.geometry_name,
+        )
+
+        if not as_index:
+            aggregated = _as_geodataframe_with_geometry(
+                aggregated.reset_index(),
+                result_labels.geometry_name,
+            )
+
+        return aggregated
+
     # ============================================================================
     # SPATIAL OPERATIONS
     # ============================================================================
+
+    def overlay(
+        self,
+        right,
+        how="intersection",
+        keep_geom_type=None,
+        make_valid=True,
+    ):
+        """Perform a distributed spatial overlay with another GeoDataFrame.
+
+        Parameters
+        ----------
+        right : GeoDataFrame
+            The GeoDataFrame overlaid with this frame.
+        how : {"intersection", "union", "identity", "symmetric_difference", "difference"}
+            Overlay operation to perform.
+        keep_geom_type : bool, default None
+            Keep only geometries in the family of this frame. ``None`` filters
+            like ``True`` without eagerly evaluating the result to emit
+            GeoPandas' conditional dropped-geometry warning.
+        make_valid : bool, default True
+            Repair invalid polygon inputs before overlay.
+
+        Returns
+        -------
+        GeoDataFrame
+            Distributed overlay result. Constructing it eagerly runs one
+            distributed validation and metadata aggregation over both inputs;
+            overlay geometry rows remain lazily evaluated.
+
+        See Also
+        --------
+        sedona.spark.geopandas.overlay
+        """
+        from sedona.spark.geopandas.tools.overlay import overlay
+
+        return overlay(
+            self,
+            right,
+            how=how,
+            keep_geom_type=keep_geom_type,
+            make_valid=make_valid,
+        )
+
+    def sjoin_nearest(
+        self,
+        right,
+        how="inner",
+        max_distance=None,
+        lsuffix="left",
+        rsuffix="right",
+        distance_col=None,
+        exclusive=False,
+    ):
+        """Join points to their nearest neighbors using Sedona KNN semantics.
+
+        Supports inner joins, default suffixes, ``exclusive=False``, an optional
+        positive ``max_distance`` result filter, and a new ``distance_col``.
+        Ties follow ``spark.sedona.join.knn.includeTieBreakers``; all GeoPandas
+        equidistant rows are not guaranteed. See
+        :func:`sedona.spark.geopandas.sjoin_nearest` for the full restrictions.
+
+        Parameters
+        ----------
+        right : GeoDataFrame
+            Distributed point frame searched for the nearest neighbor of each row.
+        how : str, default 'inner'
+            Only inner joins are supported.
+        max_distance : float, optional
+            Positive finite distance in CRS units. Filters nearest results; it
+            does not reduce the KNN search radius.
+        lsuffix : str, default 'left'
+            Suffix for overlapping column names from this frame. Only the
+            default is supported.
+        rsuffix : str, default 'right'
+            Suffix for overlapping column names from ``right``. Only the
+            default is supported.
+        distance_col : str, optional
+            New output column for the distance. Must not replace an input column.
+        exclusive : bool, default False
+            Only False is supported; equal points can match at distance zero.
+
+        Returns
+        -------
+        GeoDataFrame
+            Nearest matches, with no guaranteed row order.
+        """
+        from sedona.spark.geopandas.tools.sjoin_nearest import sjoin_nearest
+
+        return sjoin_nearest(
+            self,
+            right,
+            how=how,
+            max_distance=max_distance,
+            lsuffix=lsuffix,
+            rsuffix=rsuffix,
+            distance_col=distance_col,
+            exclusive=exclusive,
+        )
 
     def sjoin(
         self,

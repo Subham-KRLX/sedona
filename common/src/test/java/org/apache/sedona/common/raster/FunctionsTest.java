@@ -99,10 +99,11 @@ public class FunctionsTest extends RasterTestBase {
 
   @Test
   public void valueWithGridCoords() throws TransformException {
-    int insideX = 1;
-    int insideY = 0;
-    int outsideX = 4;
-    int outsideY = 4;
+    // Grid coordinates are 1-based, as in PostGIS ST_Value.
+    int insideX = 2;
+    int insideY = 1;
+    int outsideX = 5;
+    int outsideY = 5;
 
     Double insideValue = PixelFunctions.value(oneBandRaster, insideX, insideY, 1);
     assertNotNull("Value should not be null for points inside the envelope.", insideValue);
@@ -110,12 +111,16 @@ public class FunctionsTest extends RasterTestBase {
         "Points outside of the envelope should return null.",
         PixelFunctions.value(oneBandRaster, outsideX, outsideY, 1));
 
-    int noDataX = 0;
-    int noDataY = 0;
+    int noDataX = 1;
+    int noDataY = 1;
 
     assertNull(
         "Null should be returned for no data values.",
         PixelFunctions.value(oneBandRaster, noDataX, noDataY, 1));
+
+    assertNull(
+        "Column 0 is outside the 1-based grid.", PixelFunctions.value(oneBandRaster, 0, 2, 1));
+    assertNull("Row 0 is outside the 1-based grid.", PixelFunctions.value(oneBandRaster, 2, 0, 1));
   }
 
   @Test
@@ -123,8 +128,8 @@ public class FunctionsTest extends RasterTestBase {
     // Multiband raster
     assertEquals(9d, PixelFunctions.value(multiBandRaster, point(4.5d, 4.5d), 3), 0.1d);
     assertEquals(255d, PixelFunctions.value(multiBandRaster, point(4.5d, 4.5d), 4), 0.1d);
-    assertEquals(4d, PixelFunctions.value(multiBandRaster, 2, 2, 3), 0.1d);
-    assertEquals(255d, PixelFunctions.value(multiBandRaster, 3, 4, 4), 0.1d);
+    assertEquals(4d, PixelFunctions.value(multiBandRaster, 3, 3, 3), 0.1d);
+    assertEquals(255d, PixelFunctions.value(multiBandRaster, 4, 5, 4), 0.1d);
   }
 
   @Test
@@ -237,14 +242,42 @@ public class FunctionsTest extends RasterTestBase {
   }
 
   @Test
-  public void testPixelAsPointOutOfBounds() throws FactoryException {
+  public void testPixelAsPointOutOfBounds() throws FactoryException, TransformException {
+    // Out of the grid the coordinate extrapolates along the geotransform rather
+    // than raising, matching getPixelAsCentroid and getPixelAsPolygon. The
+    // anchor is the sibling itself: the point is the upper-left corner of the
+    // footprint getPixelAsPolygon already returns for the same coordinate, so
+    // the three cannot drift apart again without this failing.
     GridCoverage2D emptyRaster = RasterConstructors.makeEmptyRaster(2, 5, 10, 123, -230, 8);
-    Exception e =
-        assertThrows(
-            IndexOutOfBoundsException.class,
-            () -> PixelFunctions.getPixelAsPoint(emptyRaster, 6, 1));
-    String expectedMessage = "Specified pixel coordinates (6, 1) do not lie in the raster";
-    assertEquals(expectedMessage, e.getMessage());
+    Geometry actualPoint = PixelFunctions.getPixelAsPoint(emptyRaster, 6, 1);
+    Coordinate actual = actualPoint.getCoordinate();
+
+    Coordinate polygonCorner =
+        PixelFunctions.getPixelAsPolygon(emptyRaster, 6, 1).getCoordinates()[0];
+    assertEquals(polygonCorner.x, actual.x, 1e-9);
+    assertEquals(polygonCorner.y, actual.y, 1e-9);
+
+    // Column 6 is the first column past the 5-pixel width; its upper-left corner
+    // lies on the right edge (123 + 5 * 8), while the y stays on the top row.
+    assertEquals(163, actual.x, 1e-9);
+    assertEquals(-230, actual.y, 1e-9);
+  }
+
+  @Test
+  public void testPixelAsPointAtIntegerMinValue() throws FactoryException, TransformException {
+    // colX - 1 must not wrap Integer.MIN_VALUE to Integer.MAX_VALUE, which would
+    // put the point on the wrong side of the raster. Grid coordinate -2147483649
+    // times the pixel size 8 is exact in double.
+    GridCoverage2D emptyRaster = RasterConstructors.makeEmptyRaster(2, 5, 10, 123, -230, 8);
+    Coordinate col =
+        PixelFunctions.getPixelAsPoint(emptyRaster, Integer.MIN_VALUE, 1).getCoordinate();
+    assertEquals(123 - 2147483649.0 * 8, col.x, 0);
+    assertEquals(-230, col.y, 0);
+
+    Coordinate row =
+        PixelFunctions.getPixelAsPoint(emptyRaster, 1, Integer.MIN_VALUE).getCoordinate();
+    assertEquals(123, row.x, 0);
+    assertEquals(-230 + 2147483649.0 * 8, row.y, 0);
   }
 
   @Test
@@ -394,8 +427,8 @@ public class FunctionsTest extends RasterTestBase {
 
   @Test
   public void valuesWithGridCoords() throws TransformException {
-    int[] xCoordinates = {1, 0};
-    int[] yCoordinates = {0, 1};
+    int[] xCoordinates = {2, 1};
+    int[] yCoordinates = {1, 2};
 
     List<Double> values = PixelFunctions.values(oneBandRaster, xCoordinates, yCoordinates, 1);
     assertEquals(2, values.size());

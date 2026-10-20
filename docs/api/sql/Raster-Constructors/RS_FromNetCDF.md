@@ -25,11 +25,36 @@ Since the netCDF format has many variants, the reader might not work for your te
 
 This API has been tested for netCDF classic (NetCDF 1, 2, 5) and netCDF4/HDF5 files.
 
+Compressed netCDF4/HDF5 variables are supported for the deflate (zlib), shuffle, fletcher32, and zstd HDF5 filters. Reading zstd-compressed variables requires `com.github.luben:zstd-jni`, which Spark already includes. Files that use other filters, such as bzip2 or blosc, fail with `Unknown filter`. You can rewrite those files without compression first, for example with `nccopy -F none input.nc output.nc`.
+
 This API requires the name of the record variable. It is assumed that a variable of the given name exists, and its last 2 dimensions are 'lat' and 'lon' dimensions *respectively*.
 
 If this assumption does not hold true for your case, you can choose to pass the lonDimensionName and latDimensionName explicitly.
 
 You can use [RS_NetCDFInfo](RS_NetCDFInfo.md) to get the details of the passed netCDF file (variables and its dimensions).
+
+## Coordinate and value handling
+
+For a plain coordinate name, the loader searches the record variable's group and its
+ancestors through the dimension's local apex, then searches downward from that apex
+width-wise, level by level. A candidate must be a one-dimensional numeric variable over
+the exact dimension used by the record variable. A coordinate supplied as a group path is
+also validated against that dimension. This keeps sibling-group coordinates available
+without confusing identically named dimensions in unrelated groups.
+
+Coordinate, band-dimension, and raster values use the attributes of their owning variable.
+Integer values declared with `_Unsigned` are widened, then `scale_factor` and `add_offset`
+are applied. The output raster is normalized to west-to-east, north-up order: columns are
+reversed for a decreasing X axis and rows are reversed for an increasing Y axis.
+
+For raster values, `_FillValue`, every value in `missing_value`, and the limits declared by
+`valid_range` (or `valid_min` and `valid_max`) are evaluated in the packed storage domain
+before scale and offset are applied. Invalid cells become raster no-data. When the file's
+declared value cannot safely represent no-data in the decoded raster — including packed,
+64-bit integer, range-only, and non-finite missing-value cases — Sedona chooses a finite
+decoded-domain sentinel that does not collide with a valid sample. Consequently,
+`RS_BandNoDataValue` can intentionally differ from the file's `_FillValue` or
+`missing_value` attribute.
 
 Format 1: `RS_FromNetCDF(netCDF: ARRAY[Byte], recordVariableName: String)`
 

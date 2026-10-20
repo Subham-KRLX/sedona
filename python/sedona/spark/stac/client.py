@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
 from typing import Union, Optional, Iterator, List
 
 from sedona.spark.stac.collection_client import CollectionClient
@@ -168,15 +169,18 @@ class Client:
         :param datetime: A single datetime, RFC 3339-compliant timestamp,
             or a list of date-time ranges for filtering the items. The datetime can be specified in various formats:
 
-            - "YYYY" expands to ["YYYY-01-01T00:00:00Z", "YYYY-12-31T23:59:59Z"]
-            - "YYYY-mm" expands to ["YYYY-mm-01T00:00:00Z", "YYYY-mm-<last_day>T23:59:59Z"]
-            - "YYYY-mm-dd" expands to ["YYYY-mm-ddT00:00:00Z", "YYYY-mm-ddT23:59:59Z"]
+            - "YYYY" expands to ["YYYY-01-01T00:00:00Z", "YYYY-12-31T23:59:59.999999Z"]
+            - "YYYY-mm" expands to ["YYYY-mm-01T00:00:00Z", "YYYY-mm-<last_day>T23:59:59.999999Z"]
+            - "YYYY-mm-dd" expands to ["YYYY-mm-ddT00:00:00Z", "YYYY-mm-ddT23:59:59.999999Z"]
             - "YYYY-mm-ddTHH:MM:SSZ" remains as ["YYYY-mm-ddTHH:MM:SSZ", "YYYY-mm-ddTHH:MM:SSZ"]
             - A list of date-time ranges can be provided for multiple intervals.
 
             Example: "2020-01-01T00:00:00Z" or python_datetime.datetime(2020, 1, 1) or [["2020-01-01T00:00:00Z", "2021-01-01T00:00:00Z"]]
-        :param max_items: The maximum number of items to return from the search, even if there are more matching results.
-            Example: 100
+        :param max_items: The maximum number of STAC API results to return. Supported
+            single-collection bbox/datetime searches follow pystac-client semantics and
+            trust the API's matching behavior. Multiple bboxes are queried independently,
+            unioned, and deduplicated before the final result limit; extended Spark-side
+            filters are applied before that limit. Example: 100
         :param return_dataframe: If True, return the result as a Spark DataFrame instead of an iterator of PyStacItem objects.
             Example: True
         :return: An iterator of PyStacItem objects or a Spark DataFrame that match the specified filters.

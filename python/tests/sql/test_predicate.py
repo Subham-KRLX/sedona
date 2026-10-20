@@ -26,7 +26,7 @@ from tests.test_base import TestBase
 
 class TestPredicate(TestBase):
 
-    def test_st_box_intersects_and_contains(self):
+    def test_st_intersects_and_contains_on_box2d(self):
         df = self.spark.sql("""
             WITH t AS (
               SELECT
@@ -36,11 +36,11 @@ class TestPredicate(TestBase):
                 ST_Box2D(ST_GeomFromText('POLYGON((11 11, 11 12, 12 12, 12 11, 11 11))')) AS disjoint
             )
             SELECT
-              ST_BoxIntersects(a, inside)   AS i_inside,
-              ST_BoxIntersects(a, overlap)  AS i_overlap,
-              ST_BoxIntersects(a, disjoint) AS i_disjoint,
-              ST_BoxContains(a, inside)     AS c_inside,
-              ST_BoxContains(a, overlap)    AS c_overlap
+              ST_Intersects(a, inside)   AS i_inside,
+              ST_Intersects(a, overlap)  AS i_overlap,
+              ST_Intersects(a, disjoint) AS i_disjoint,
+              ST_Contains(a, inside)     AS c_inside,
+              ST_Contains(a, overlap)    AS c_overlap
             FROM t
             """)
         row = df.first()
@@ -308,6 +308,23 @@ class TestPredicate(TestBase):
         assert order_equals.take(1)[0][0]
         assert not not_order_equals_diff_geom.take(1)[0][0]
         assert not not_order_equals_diff_order.take(1)[0][0]
+
+    def test_st_equals_exact(self):
+        result = self.spark.sql("""
+            SELECT
+                ST_EqualsExact(ST_Point(0.0, 0.0), ST_Point(0.03, 0.04), 0.051),
+                ST_EqualsExact(ST_Point(0.0, 0.0), ST_Point(0.03, 0.04), 0.049),
+                ST_EqualsExact(
+                    ST_GeomFromWKT('LINESTRING(0 0, 1 1)'),
+                    ST_GeomFromWKT('LINESTRING(1 1, 0 0)'),
+                    0.0
+                ),
+                ST_EqualsExact(NULL, ST_Point(0.0, 0.0), 0.0)
+            """).first()
+        assert result[0] is True
+        assert result[1] is False
+        assert result[2] is False
+        assert result[3] is None
 
     def test_st_dwithin(self):
         test_table = self.spark.sql(

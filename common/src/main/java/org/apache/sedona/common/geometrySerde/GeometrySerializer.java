@@ -18,6 +18,8 @@
  */
 package org.apache.sedona.common.geometrySerde;
 
+import org.datasyslab.jts.geom.impl.DeclaredCoordinateSequence;
+import org.datasyslab.jts.geom.impl.DeclaredCoordinateSequenceFactory;
 import org.locationtech.jts.geom.Coordinate;
 import org.locationtech.jts.geom.CoordinateSequence;
 import org.locationtech.jts.geom.Geometry;
@@ -113,10 +115,10 @@ public class GeometrySerializer {
 
   private static GeometryBuffer serializePoint(Point point) {
     Coordinate coordinate = point.getCoordinate();
+    CoordinateType coordType = getCoordinateType(point);
     if (coordinate == null) {
-      return createGeometryBuffer(WKBConstants.wkbPoint, CoordinateType.XY, point.getSRID(), 8, 0);
+      return createGeometryBuffer(WKBConstants.wkbPoint, coordType, point.getSRID(), 8, 0);
     }
-    CoordinateType coordType = getCoordinateType(coordinate);
     int bufferSize = 8 + coordType.bytes;
     GeometryBuffer buffer =
         createGeometryBuffer(WKBConstants.wkbPoint, coordType, point.getSRID(), bufferSize, 1);
@@ -129,7 +131,7 @@ public class GeometrySerializer {
     int numCoordinates = getBoundedInt(buffer, 4);
     Point point;
     if (numCoordinates == 0) {
-      point = factory.createPoint();
+      point = factory.createPoint(buffer.getCoordinates(8, 0));
       buffer.mark(8);
     } else {
       int bufferSize = 8 + coordType.bytes;
@@ -175,7 +177,7 @@ public class GeometrySerializer {
       CoordinateSequence coordinates = buffer.getCoordinate(8 + i * coordType.bytes);
       Coordinate coordinate = coordinates.getCoordinate(0);
       if (Double.isNaN(coordinate.x)) {
-        points[i] = factory.createPoint();
+        points[i] = factory.createPoint(buffer.getCoordinates(8 + i * coordType.bytes, 0));
       } else {
         points[i] = factory.createPoint(coordinates);
       }
@@ -187,11 +189,7 @@ public class GeometrySerializer {
   private static GeometryBuffer serializeLineString(LineString lineString) {
     CoordinateSequence coordinates = lineString.getCoordinateSequence();
     int numCoordinates = coordinates.size();
-    if (numCoordinates == 0) {
-      return createGeometryBuffer(
-          WKBConstants.wkbLineString, CoordinateType.XY, lineString.getSRID(), 8, 0);
-    }
-    CoordinateType coordType = getCoordinateType(coordinates.getCoordinate(0));
+    CoordinateType coordType = getCoordinateType(lineString);
     int bufferSize = 8 + numCoordinates * coordType.bytes;
     GeometryBuffer buffer =
         createGeometryBuffer(
@@ -260,12 +258,10 @@ public class GeometrySerializer {
 
   private static GeometryBuffer serializePolygon(Polygon polygon) {
     LinearRing exteriorRing = polygon.getExteriorRing();
+    CoordinateType coordType = getCoordinateType(polygon);
     if (exteriorRing == null || exteriorRing.isEmpty()) {
-      return createGeometryBuffer(
-          WKBConstants.wkbPolygon, CoordinateType.XY, polygon.getSRID(), 8, 0);
+      return createGeometryBuffer(WKBConstants.wkbPolygon, coordType, polygon.getSRID(), 8, 0);
     }
-    CoordinateSequence coordinates = exteriorRing.getCoordinateSequence();
-    CoordinateType coordType = getCoordinateType(coordinates.getCoordinate(0));
     int numCoordinates = polygon.getNumPoints();
     int numInteriorRings = polygon.getNumInteriorRing();
     int coordsOffset = 8;
@@ -286,7 +282,7 @@ public class GeometrySerializer {
     int numCoordinates = getBoundedInt(buffer, 4);
     if (numCoordinates == 0) {
       buffer.mark(8);
-      return factory.createPolygon();
+      return createEmptyPolygon(buffer, 8, factory);
     }
     int coordsOffset = 8;
     int numRingsOffset = 8 + numCoordinates * coordType.bytes;
@@ -441,31 +437,76 @@ public class GeometrySerializer {
     return value;
   }
 
-  private static CoordinateType getCoordinateType(Coordinate coordinate) {
-    boolean hasZ = !Double.isNaN(coordinate.getZ());
-    boolean hasM = !Double.isNaN(coordinate.getM());
-    return getCoordinateType(hasZ, hasM);
+  /**
+   * The coordinate layout that {@link #serialize} stores for {@code geometry}. Measures are
+   * explicit sequence metadata. A Z ordinate counts when the sequence declares it or holds a
+   * non-NaN Z value, because JTS's default sequences represent ordinary XY coordinates with a NaN
+   * Z. All parts of a point, line string, polygon or multi geometry share one layout, while the
+   * members of a GeometryCollection are stored with their own layouts, so ask for each member
+   * instead.
+   *
+   * @throws IllegalArgumentException if the serializer cannot encode the geometry's layout
+   */
+  public static CoordinateType getCoordinateType(Geometry geometry) {
+    CoordinateDimensions dimensions = new CoordinateDimensions();
+    collectCoordinateDimensions(geometry, dimensions);
+    return dimensions.coordinateType == null ? CoordinateType.XY : dimensions.coordinateType;
   }
 
-  private static CoordinateType getCoordinateType(Geometry geometry) {
-    Coordinate coord = geometry.getCoordinate();
-    if (coord != null) {
-      return getCoordinateType(coord);
-    } else {
-      return CoordinateType.XY;
+  private static void collectCoordinateDimensions(
+      Geometry geometry, CoordinateDimensions dimensions) {
+    if (geometry instanceof Point) {
+      collectCoordinateDimensions(((Point) geometry).getCoordinateSequence(), dimensions);
+    } else if (geometry instanceof LineString) {
+      collectCoordinateDimensions(((LineString) geometry).getCoordinateSequence(), dimensions);
+    } else if (geometry instanceof Polygon) {
+      Polygon polygon = (Polygon) geometry;
+      collectCoordinateDimensions(polygon.getExteriorRing().getCoordinateSequence(), dimensions);
+      for (int i = 0; i < polygon.getNumInteriorRing(); i++) {
+        collectCoordinateDimensions(
+            polygon.getInteriorRingN(i).getCoordinateSequence(), dimensions);
+      }
+    } else if (geometry instanceof GeometryCollection) {
+      GeometryCollection collection = (GeometryCollection) geometry;
+      for (int i = 0; i < collection.getNumGeometries(); i++) {
+        collectCoordinateDimensions(collection.getGeometryN(i), dimensions);
+      }
     }
   }
 
-  private static CoordinateType getCoordinateType(boolean hasZ, boolean hasM) {
-    if (hasZ && hasM) {
-      return CoordinateType.XYZM;
-    } else if (hasZ) {
-      return CoordinateType.XYZ;
-    } else if (hasM) {
-      return CoordinateType.XYM;
-    } else {
-      return CoordinateType.XY;
+  private static void collectCoordinateDimensions(
+      CoordinateSequence coordinates, CoordinateDimensions dimensions) {
+    int measures = coordinates.getMeasures();
+    int spatialDimensions = coordinates.getDimension() - measures;
+    if (measures < 0 || measures > 1 || spatialDimensions < 2 || spatialDimensions > 3) {
+      throw new IllegalArgumentException(
+          "Unsupported coordinate sequence layout: dimension="
+              + coordinates.getDimension()
+              + ", measures="
+              + measures);
     }
+
+    // Measures are explicit CoordinateSequence metadata. A Z dimension is not always explicit:
+    // JTS's default sequence factory represents ordinary XY coordinates as dimension 3 with NaN Z.
+    // Trusted binary layouts and XYZM are unambiguous. Unmarked XYZ is recoverable only when at
+    // least one Z value is non-NaN. An ambiguous sequence does not constrain a multipart geometry
+    // whose other members establish the shared layout.
+    CoordinateType coordinateType = null;
+    if (measures > 0) {
+      coordinateType = spatialDimensions > 2 ? CoordinateType.XYZM : CoordinateType.XYM;
+    } else if (coordinates instanceof DeclaredCoordinateSequence && spatialDimensions == 3) {
+      coordinateType = CoordinateType.XYZ;
+    } else if (spatialDimensions == 2) {
+      coordinateType = CoordinateType.XY;
+    } else {
+      for (int i = 0; i < coordinates.size(); i++) {
+        if (!Double.isNaN(coordinates.getZ(i))) {
+          coordinateType = CoordinateType.XYZ;
+          break;
+        }
+      }
+    }
+    dimensions.add(coordinateType);
   }
 
   private static int alignedOffset(int offset) {
@@ -473,7 +514,30 @@ public class GeometrySerializer {
   }
 
   private static GeometryFactory createGeometryFactory(int srid) {
-    return new GeometryFactory(PRECISION_MODEL, srid);
+    return new GeometryFactory(PRECISION_MODEL, srid, DeclaredCoordinateSequenceFactory.instance());
+  }
+
+  private static Polygon createEmptyPolygon(
+      GeometryBuffer buffer, int coordinatesOffset, GeometryFactory factory) {
+    CoordinateSequence coordinates = buffer.getCoordinates(coordinatesOffset, 0);
+    return factory.createPolygon(factory.createLinearRing(coordinates));
+  }
+
+  private static class CoordinateDimensions {
+    CoordinateType coordinateType;
+
+    void add(CoordinateType candidate) {
+      if (candidate == null) {
+        return;
+      }
+      if (coordinateType == null) {
+        coordinateType = candidate;
+      } else if (coordinateType != candidate) {
+        throw new IllegalArgumentException(
+            "GeometrySerializer cannot encode heterogeneous dimensional layouts in one Polygon "
+                + "or multipart geometry. Use homogeneous components or a GeometryCollection.");
+      }
+    }
   }
 
   static class GeomPartSerializer {
@@ -505,7 +569,7 @@ public class GeometrySerializer {
     Polygon readPolygon() {
       int numRings = checkedReadBoundedInt();
       if (numRings == 0) {
-        return factory.createPolygon();
+        return createEmptyPolygon(buffer, coordsOffset, factory);
       }
       checkRemainingIntsAtLeast(numRings);
       int numInteriorRings = numRings - 1;

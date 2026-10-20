@@ -67,6 +67,10 @@ somewhere/
 
 Sedona 会并行写出多个 Parquet 文件，比写单一文件快得多。
 
+写出 GeoParquet 时，Sedona 会保留空 `Point`、`LineString` 和 `Polygon` 几何对象声明的 XY 或 XYZ 坐标布局。即使 Z 坐标值为 `NaN`，XYZ 几何对象也会保留 Z 维度。
+
+[GeoParquet 1.1](https://geoparquet.org/releases/v1.1.0/#wkb) 不支持 M 坐标。Sedona 在写出 GeoParquet 时会丢弃 M：XYM 转换为 XY，XYZM 转换为 XYZ。如果需要保留 M 值，请在写出前将其单独存储。
+
 ## 使用 Spark 将 GeoParquet 读入 Sedona DataFrame
 
 将 GeoParquet 文件读入 Sedona DataFrame：
@@ -87,6 +91,8 @@ df.show(truncate=False)
 |c  |LINESTRING (1 3, 3 1)|
 +---+---------------------+
 ```
+
+自 Sedona 2.0.0 起，读取时会保留声明的 Z/M 维度，即使点、线或多边形为空，或坐标值为 `NaN`。这也适用于包含 M 坐标的 WKB 输入，但此类输入不符合 GeoParquet 1.1 规范。如果收集不同坐标布局的几何对象时出现布局不一致的错误，请参阅 [ST_Collect](../../api/sql/Geometry-Editors/ST_Collect.md)。
 
 Sedona 在底层执行该查询的过程大致如下：
 
@@ -207,7 +213,10 @@ df.write.format("geoparquet")
 * 若同一列中的几何对象 SRID 不一致，`crs` 字段默认置为 `null`。
 * 若显式提供了 `geoparquet.crs` 或 `geoparquet.crs.<column_name>` 选项，则始终优先于 SRID 推导出的 CRS。
 
-Sedona 的 GeoParquet 读写器**不会**校验坐标轴顺序（lon/lat 还是 lat/lon），假定使用者在读写时自行处理。可以使用 [`ST_FlipCoordinates`](../../api/sql/Geometry-Editors/ST_FlipCoordinates.md) 来交换几何对象的坐标轴顺序。
+GeoParquet 以 `(x, y)` 顺序存储 WKB 坐标。根据 GeoParquet 1.1 规范，此顺序会覆盖 CRS
+中声明的坐标轴顺序。因此，Sedona 会保留权威的 CRS 坐标轴元数据，并且在读写 GeoParquet
+时不会重新排列几何坐标。如果坐标本身需要交换，可以使用
+[`ST_FlipCoordinates`](../../api/sql/Geometry-Editors/ST_FlipCoordinates.md)。
 
 ## 写出带 covering 元数据的 GeoParquet
 
